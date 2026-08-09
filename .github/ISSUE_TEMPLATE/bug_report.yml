@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible Cadenza problem using synthetic data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not attach recordings, transcripts, credentials, or private meeting data.
+        Security vulnerabilities belong in the private process described in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Cadenza version or commit
+      placeholder: 1.0.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: macOS and Mac model
+      placeholder: macOS 26.x, Apple silicon or Intel
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use fictional or redacted data only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Additional diagnostics
+      description: Remove names, meeting content, paths, keys, and tokens before sharing logs.

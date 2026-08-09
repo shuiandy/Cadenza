@@ -1,0 +1,26 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="87.04" y1="87.04" x2="936.96" y2="936.96" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFD6E8"/>
+      <stop offset="1" stop-color="#F0B8D0"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="211.13" y1="211.13" x2="812.87" y2="812.87" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF4F8"/>
+      <stop offset="1" stop-color="#EFDFE8"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="227.28" y1="227.28" x2="642.97" y2="642.97" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="87.04" y="87.04" width="849.92" height="849.92" rx="177.63" fill="url(#bg)"/>
+  <circle cx="309.72" cy="279.97" r="163.18" fill="#EEA1C1" fill-opacity="0.09"/>
+  <circle cx="734.68" cy="761.88" r="200.58" fill="#F08D67" fill-opacity="0.08"/>
+
+  <rect x="211.13" y="211.13" width="601.74" height="601.74" rx="163.18" fill="url(#plate)"/>
+  <rect x="227.28" y="227.28" width="569.45" height="569.45" rx="146.19" stroke="url(#shine)" stroke-width="17"/>
+
+  <path d="M606.34 342.71 A 195.48 195.48 0 1 0 606.34 681.29" stroke="#593847" stroke-width="135.99" stroke-linecap="round"/>
+  <circle cx="659.89" cy="512" r="47.6" fill="#D86451"/>
+</svg>

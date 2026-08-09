@@ -1,0 +1,29 @@
+<svg width="820" height="320" viewBox="0 0 820 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Cadenza</title>
+  <defs>
+    <linearGradient id="bg" x1="32" y1="28" x2="228" y2="236" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#142B33"/>
+      <stop offset="1" stop-color="#315159"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="61.5" y1="53" x2="196.5" y2="205.5" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF4DD"/>
+      <stop offset="1" stop-color="#F0DFC1"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="58" y1="52" x2="169" y2="166.5" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(16 16)">
+    <rect x="0" y="0" width="256" height="256" rx="58" fill="url(#bg)"/>
+    <circle cx="48" cy="38" r="55" fill="#7FCDBE" fill-opacity="0.09"/>
+    <circle cx="222" cy="228" r="70" fill="#F18A59" fill-opacity="0.1"/>
+    <rect x="32" y="32" width="192" height="192" rx="54" fill="url(#plate)"/>
+    <rect x="37" y="37" width="182" height="182" rx="49" stroke="url(#shine)" stroke-width="6"/>
+    <path d="M158 75.5 A57 57 0 1 0 158 180.5" stroke="#21424A" stroke-width="41" stroke-linecap="round"/>
+    <circle cx="170.5" cy="128" r="14.5" fill="#F1794A"/>
+  </g>
+
+  <text x="330" y="192" fill="#21424A" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', Inter, sans-serif" font-size="118" font-weight="650" letter-spacing="-4">Cadenza</text>
+</svg>

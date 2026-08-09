@@ -1,0 +1,59 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+
+# macOS
+.DS_Store
+*.dSYM
+*.dSYM.zip
+
+# IDE
+.idea/
+*.swp
+*~
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# Profiling and local build logs
+*.profraw
+.derived-data-log-*
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Git worktrees
+.worktrees/
+
+# Local AI assistant state and instructions. These are machine/user-specific
+# process artifacts, not project documentation.
+.claude/
+.agents/
+.planning/
+.codex/
+.superpowers/
+.github/workflows/claude*.yml
+docs/plans/
+docs/superpowers/
+docs/project-memory-implementation-brief.md
+AGENTS.md
+CLAUDE.md
+CODEX.md
+RTK.md
+MEMORY.md
+PLAN.md
+task_plan.md
+findings.md
+progress.md

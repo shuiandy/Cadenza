@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>$(APP_BUNDLE_DISPLAY_NAME)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(APP_BUNDLE_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.shuiandy.Cadenza.oauth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.shuiandy.cadenza</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Cadenza captures system audio from meeting apps to create recordings, transcripts, and summaries.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Cadenza reads your calendar to detect upcoming meetings and can start recording automatically when you enable auto-recording.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Cadenza needs microphone access to record your voice during meetings.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Cadenza uses Screen Recording access to read meeting window information for reliable automatic meeting detection.</string>
+</dict>
+</plist>

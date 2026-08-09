@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodebuild -version
+          xcodegen --version
+          test "$(xcodegen --version)" = "Version: 2.46.0"
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          git diff --exit-code -- Cadenza.xcodeproj/project.pbxproj
+
+      - name: Validate localization catalog
+        run: |
+          python3 scripts/check_repository_hygiene.py
+          python3 -m json.tool Cadenza/Resources/Localizable.xcstrings >/dev/null
+          python3 -m json.tool Cadenza/Resources/InfoPlist.xcstrings >/dev/null
+          python3 scripts/validate_string_catalog.py
+          python3 -m unittest discover -s scripts/tests
+
+      - name: Build and run tests
+        run: |
+          xcodebuild test \
+            -project Cadenza.xcodeproj \
+            -scheme Cadenza \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Run static analyzer
+        run: |
+          xcodebuild analyze \
+            -project Cadenza.xcodeproj \
+            -scheme Cadenza \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Archive unsigned release candidate
+        run: |
+          xcodebuild archive \
+            -project Cadenza.xcodeproj \
+            -scheme Cadenza \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Cadenza.xcarchive" \
+            ARCHS='arm64 x86_64' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Verify archived third-party notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/Cadenza.xcarchive/Products/Applications/Cadenza.app"
+          resources="$app/Contents/Resources"
+          architectures="$(lipo -archs "$app/Contents/MacOS/Cadenza")"
+          [[ " $architectures " == *" arm64 "* ]]
+          [[ " $architectures " == *" x86_64 "* ]]
+          test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "26.0"
+          test -s LICENSE
+          test -s THIRD_PARTY_NOTICES.md
+          found_notice=0
+          while IFS= read -r source; do
+            found_notice=1
+            test -s "$resources/${source##*/}"
+          done < <(find Cadenza/Resources/ThirdPartyLicenses -maxdepth 1 -type f | sort)
+          test "$found_notice" -eq 1

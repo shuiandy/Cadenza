@@ -1,0 +1,21 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="126" y1="98" x2="904" y2="930" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#102631"/>
+      <stop offset="1" stop-color="#24424E"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="176" y1="142" x2="854" y2="886" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="64" y="64" width="896" height="896" rx="214" fill="url(#bg)"/>
+  <rect x="76" y="76" width="872" height="872" rx="202" stroke="url(#rim)" stroke-width="24"/>
+
+  <circle cx="234" cy="214" r="214" fill="#8DD7C7" fill-opacity="0.1"/>
+  <circle cx="826" cy="812" r="266" fill="#EC8556" fill-opacity="0.09"/>
+
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M702 242C547.361 242 422 367.361 422 522C422 676.639 547.361 802 702 802C743.859 802 783.571 792.806 819.234 776.343V626.251C790.769 650.309 749.961 666 702 666C622.471 666 558 601.529 558 522C558 442.471 622.471 378 702 378C749.961 378 790.769 393.691 819.234 417.749V267.657C783.571 251.194 743.859 242 702 242Z" fill="#F5E3BC"/>
+  <circle cx="760" cy="522" r="58" fill="#F27A4B"/>
+</svg>

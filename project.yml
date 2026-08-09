@@ -1,0 +1,131 @@
+name: Cadenza
+options:
+  bundleIdPrefix: com.shuiandy
+  deploymentTarget:
+    macOS: "26.0"
+  xcodeVersion: "26.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+  developmentLanguage: en
+  knownRegions:
+    - en
+    - zh-Hans
+    - ja
+    - ko
+    - fr
+    - de
+    - es
+
+configs:
+  Debug: debug
+  Test Debug: debug
+  Release: release
+
+packages:
+  KeychainAccess:
+    url: https://github.com/kishikawakatsumi/KeychainAccess.git
+    from: "4.2.2"
+  WhisperKit:
+    url: https://github.com/shuiandy/WhisperKit.git
+    revision: 969a385e1ae9731bd052b4a6334c58a6c54edeab
+
+targets:
+  Cadenza:
+    type: application
+    platform: macOS
+    sources:
+      - path: Cadenza
+        excludes:
+          - Resources/placeholder.txt
+    resources:
+      - path: Cadenza/Resources
+        excludes:
+          - placeholder.txt
+    dependencies:
+      - package: KeychainAccess
+      - package: WhisperKit
+      - package: WhisperKit
+        product: SpeakerKit
+    settings:
+      base:
+        PRODUCT_NAME: Cadenza
+        PRODUCT_MODULE_NAME: Cadenza
+        PRODUCT_BUNDLE_IDENTIFIER: com.shuiandy.Cadenza
+        APP_BUNDLE_NAME: Cadenza
+        APP_BUNDLE_DISPLAY_NAME: Cadenza
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "6.0"
+        SWIFT_EMIT_LOC_STRINGS: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Cadenza/BridgingHeader.h
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        INFOPLIST_FILE: Cadenza/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: true
+        CODE_SIGN_ENTITLEMENTS: Cadenza/Cadenza.entitlements
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        Test Debug:
+          PRODUCT_NAME: CadenzaTestHost
+          PRODUCT_BUNDLE_IDENTIFIER: com.shuiandy.CadenzaTestHost
+          APP_BUNDLE_NAME: CadenzaTestHost
+          APP_BUNDLE_DISPLAY_NAME: Cadenza Test Host
+    info:
+      path: Cadenza/Info.plist
+      properties:
+        CFBundleName: $(APP_BUNDLE_NAME)
+        CFBundleDisplayName: $(APP_BUNDLE_DISPLAY_NAME)
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "26.0"
+        LSApplicationCategoryType: public.app-category.productivity
+        NSAudioCaptureUsageDescription: "Cadenza captures system audio from meeting apps to create recordings, transcripts, and summaries."
+        NSScreenCaptureUsageDescription: "Cadenza uses Screen Recording access to read meeting window information for reliable automatic meeting detection."
+        NSMicrophoneUsageDescription: "Cadenza needs microphone access to record your voice during meetings."
+        NSCalendarsFullAccessUsageDescription: "Cadenza reads your calendar to detect upcoming meetings and can start recording automatically when you enable auto-recording."
+        LSUIElement: false
+        CFBundleURLTypes:
+          - CFBundleURLName: com.shuiandy.Cadenza.oauth
+            CFBundleURLSchemes:
+              - com.shuiandy.cadenza
+
+    entitlements:
+      path: Cadenza/Cadenza.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.device.audio-input: true
+        com.apple.security.personal-information.calendars: true
+
+  CadenzaTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CadenzaTests
+    dependencies:
+      - target: Cadenza
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        GENERATE_INFOPLIST_FILE: YES
+      configs:
+        Test Debug:
+          TEST_HOST: "$(BUILT_PRODUCTS_DIR)/CadenzaTestHost.app/Contents/MacOS/CadenzaTestHost"
+
+schemes:
+  Cadenza:
+    build:
+      targets:
+        Cadenza: all
+    run:
+      config: Debug
+    test:
+      config: Test Debug
+      targets:
+        - CadenzaTests
+    analyze:
+      config: Debug
+    profile:
+      config: Release
+    archive:
+      config: Release

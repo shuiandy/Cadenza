@@ -1,0 +1,294 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "CFBundleDisplayName" : {
+      "comment" : "Bundle display name",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Cadenza"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        }
+      }
+    },
+    "CFBundleName" : {
+      "comment" : "Bundle name",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Cadenza"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza"
+          }
+        }
+      }
+    },
+    "NSAudioCaptureUsageDescription" : {
+      "comment" : "Explains why Cadenza requests access to record system audio.",
+      "extractionState" : "stale",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza erfasst Systemaudio aus Meeting-Apps, um Aufnahmen, Transkripte und Zusammenfassungen zu erstellen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza captures system audio from meeting apps to create recordings, transcripts, and summaries."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza captura el audio del sistema de las apps de reuniones para crear grabaciones, transcripciones y resúmenes."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza capture l’audio système des apps de réunion afin de créer des enregistrements, des transcriptions et des résumés."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenzaは会議アプリのシステムオーディオを収録し、録音、文字起こし、要約を作成します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza는 회의 앱의 시스템 오디오를 캡처하여 녹음, 전사 및 요약을 생성합니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza 会采集会议应用的系统音频，用于创建录音、转录和摘要。"
+          }
+        }
+      }
+    },
+    "NSCalendarsFullAccessUsageDescription" : {
+      "comment" : "Privacy - Calendars Full Access Usage Description",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza liest Ihren Kalender, um bevorstehende Besprechungen zu erkennen, und kann die Aufnahme automatisch starten, wenn Sie die automatische Aufnahme aktivieren."
+          }
+        },
+      "en" : {
+        "stringUnit" : {
+          "state" : "new",
+          "value" : "Cadenza reads your calendar to detect upcoming meetings and can start recording automatically when you enable auto-recording."
+        }
+      },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza lee tu calendario para detectar próximas reuniones y puede iniciar la grabación automáticamente cuando activas la grabación automática."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza lit votre calendrier pour détecter les réunions à venir et peut démarrer automatiquement l’enregistrement lorsque vous activez l’enregistrement automatique."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenzaはカレンダーを読み取り、今後の会議を検出し、自動録音を有効にした場合は録音を自動的に開始します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza는 예정된 회의를 감지하기 위해 캘린더를 읽고, 자동 녹음을 활성화한 경우 녹음을 자동으로 시작합니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza 会读取您的日历以检测即将开始的会议，并在您启用自动录制后自动开始录制。"
+          }
+        }
+      }
+    },
+    "NSMicrophoneUsageDescription" : {
+      "comment" : "Privacy - Microphone Usage Description",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza benötigt Zugriff auf das Mikrofon, um Ihre Stimme während Besprechungen aufzunehmen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Cadenza needs microphone access to record your voice during meetings."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza necesita acceso al micrófono para grabar tu voz durante las reuniones."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza a besoin d’accéder au microphone pour enregistrer votre voix pendant les réunions."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenzaは会議中にあなたの声を録音するために、マイクへのアクセスを必要とします。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza는 회의 중 사용자의 음성을 녹음하기 위해 마이크 접근 권한이 필요합니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza 需要访问麦克风，以便在会议期间录制您的声音。"
+          }
+        }
+      }
+    },
+    "NSScreenCaptureUsageDescription" : {
+      "comment" : "Explains why Cadenza requests Screen Recording access for meeting-window detection.",
+      "extractionState" : "stale",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza verwendet den Zugriff auf Bildschirmaufnahme, um Informationen zu Meeting-Fenstern zu lesen und Meetings zuverlässig automatisch zu erkennen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza uses Screen Recording access to read meeting window information for reliable automatic meeting detection."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza usa el acceso a Grabación de pantalla para leer la información de las ventanas de reuniones y detectarlas automáticamente de forma fiable."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza utilise l’accès à l’enregistrement de l’écran pour lire les informations des fenêtres de réunion et détecter automatiquement les réunions de façon fiable."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenzaは画面収録へのアクセスを使用して会議ウインドウの情報を読み取り、会議を確実に自動検出します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza는 화면 기록 접근 권한을 사용하여 회의 창 정보를 읽고 회의를 안정적으로 자동 감지합니다."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza 使用“屏幕录制”权限读取会议窗口信息，以便可靠地自动检测会议。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}
