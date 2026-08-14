@@ -1,6 +1,22 @@
 import Foundation
 import SpeakerKit
 import WhisperKit
+import os
+
+/// Diarization failures are swallowed by design — `PostProcessingCoordinator`
+/// treats them as non-fatal so a recording still keeps its transcript. That
+/// makes the log the only evidence there ever was, and `NSLog` provided none:
+/// it is not persisted at its default level on macOS 26, and its dynamic
+/// strings are redacted to `<private>` even in a live `log stream` (observed
+/// 2026-08-11, while diagnosing two recordings that silently lost every
+/// speaker label). The failure *type* is what separates the cases that matter
+/// — `CancellationError` means the external-access policy closed the gate,
+/// `SpeakerKitError` means the models did — so it is logged `.public`, while
+/// the message is not: it can embed the model path under the user's home.
+private let diarizerLog = Logger(
+    subsystem: "com.shuiandy.Cadenza",
+    category: "SpeakerDiarizer"
+)
 
 /// A cancellation-safe FIFO permit used to keep SpeakerKit inference single-flight.
 ///
@@ -200,12 +216,19 @@ final class SpeakerDiarizer {
     func probeModelAvailability(externalAccessEnabled: Bool = true) async {
         guard externalAccessEnabled, externalModelAccessAllowed() else {
             isReady = false
+            diarizerLog.error(
+                "probe skipped: external access closed (caller=\(externalAccessEnabled, privacy: .public))"
+            )
             return
         }
         do {
             isReady = try await modelProvider.probeAvailability()
+            diarizerLog.info("probe: isReady=\(self.isReady, privacy: .public)")
         } catch {
             isReady = false
+            diarizerLog.error(
+                "probe failed: \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+            )
         }
     }
 
@@ -215,6 +238,9 @@ final class SpeakerDiarizer {
         // Deepest network boundary: no provider or task is created when the
         // fixture/test process policy or its explicit caller policy is closed.
         guard externalAccessEnabled, externalModelAccessAllowed() else {
+            diarizerLog.error(
+                "prepare refused: external access closed (caller=\(externalAccessEnabled, privacy: .public))"
+            )
             throw CancellationError()
         }
 
@@ -241,10 +267,17 @@ final class SpeakerDiarizer {
             self.modelManager = prepared.manager
             self.isReady = true
             self.downloadProgress = 1.0
-            NSLog("[SpeakerDiarizer] ready")
+            diarizerLog.info("prepare: models ready")
         }
         prepareTask = task
-        try await task.value
+        do {
+            try await task.value
+        } catch {
+            diarizerLog.error(
+                "prepare failed: \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+            )
+            throw error
+        }
     }
 
     // MARK: - Diarization
@@ -254,18 +287,38 @@ final class SpeakerDiarizer {
             self.isProcessing = true
             defer { self.isProcessing = false }
 
-            if self.speakerKit == nil {
+            let neededPrepare = self.speakerKit == nil
+            diarizerLog.info(
+                "diarize: start (isReady=\(self.isReady, privacy: .public), neededPrepare=\(neededPrepare, privacy: .public))"
+            )
+            if neededPrepare {
                 try await self.prepare()
             }
             let sk = self.speakerKit!
 
-            let audioArray = try await Task.detached {
-                try AudioProcessor.loadAudioAsFloatArray(fromPath: audioURL.path)
-            }.value
+            let audioArray: [Float]
+            do {
+                audioArray = try await Task.detached {
+                    try AudioProcessor.loadAudioAsFloatArray(fromPath: audioURL.path)
+                }.value
+            } catch {
+                diarizerLog.error(
+                    "audio load failed: \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+                )
+                throw error
+            }
 
-            NSLog("[SpeakerDiarizer] diarizing %.1fs of audio", Float(audioArray.count) / 16000.0)
+            diarizerLog.info(
+                "diarize: \(Float(audioArray.count) / 16000.0, privacy: .public)s of audio"
+            )
             let result = try await sk.diarize(audioArray: audioArray)
-            NSLog("[SpeakerDiarizer] done: %d speakers, %d segments", result.speakerCount, result.segments.count)
+            // A zero-speaker result is not an error, but downstream it is
+            // indistinguishable from a failure: the cloud path applies it with
+            // `replaceExistingSpeakers: true`, so an empty result wipes the
+            // provider's own labels. Log the count so the two can be told apart.
+            diarizerLog.info(
+                "diarize: done — \(result.speakerCount, privacy: .public) speakers, \(result.segments.count, privacy: .public) segments"
+            )
             return result
         }
     }
@@ -290,7 +343,7 @@ final class SpeakerDiarizer {
         let speakerSegments = aligned.flatMap { $0 }
         if speakerSegments.isEmpty {
             // WhisperKit alignment produced no results — fall back to IoU
-            NSLog("[SpeakerDiarizer] addSpeakerInfo returned empty, falling back to IoU")
+            diarizerLog.error("addSpeakerInfo returned empty, falling back to IoU")
             applySpeakers(
                 diarization: diarization,
                 entries: &entries,
@@ -361,10 +414,11 @@ final class SpeakerDiarizer {
     ) {
         if let firstEntry = entries.first, let firstSeg = speakerSegments.first,
            let lastEntry = entries.last, let lastSeg = speakerSegments.last {
-            NSLog("[SpeakerDiarizer] entries time: %.1f-%.1f, speakerSegs time: %.1f-%.1f, segCount=%d",
-                  firstEntry.startTime, lastEntry.endTime,
-                  Double(firstSeg.startTime), Double(lastSeg.endTime),
-                  speakerSegments.count)
+            // Two timelines that do not overlap assign nothing while looking
+            // like a clean run, so both ranges are logged side by side.
+            diarizerLog.info(
+                "assign: entries \(firstEntry.startTime, privacy: .public)-\(lastEntry.endTime, privacy: .public)s, speakerSegs \(Double(firstSeg.startTime), privacy: .public)-\(Double(lastSeg.endTime), privacy: .public)s, segCount=\(speakerSegments.count, privacy: .public)"
+            )
         }
 
         let spans = speakerSegments.compactMap { segment -> SpeakerAssignmentSpan? in

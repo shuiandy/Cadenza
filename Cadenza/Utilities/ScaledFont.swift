@@ -34,6 +34,16 @@ extension EnvironmentValues {
 /// the existing font factory honor the system accessibility category without
 /// adding hundreds of per-font wrapper views.
 enum CadenzaTextScale {
+    static func isAccessibilitySize(_ size: DynamicTypeSize) -> Bool {
+        switch size {
+        case .accessibility1, .accessibility2, .accessibility3,
+             .accessibility4, .accessibility5:
+            true
+        default:
+            false
+        }
+    }
+
     static func factor(_ size: DynamicTypeSize) -> CGFloat {
         switch size {
         case .xSmall: 0.82

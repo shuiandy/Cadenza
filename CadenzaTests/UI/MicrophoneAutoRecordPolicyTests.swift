@@ -12,7 +12,26 @@ struct MicrophoneAutoRecordPolicyTests {
         #expect(MicrophoneAutoRecordPolicy.action(for: .notDetermined) == .request)
     }
 
-    @Test func deniedPermissionFailsClosed() {
-        #expect(MicrophoneAutoRecordPolicy.action(for: .denied) == .reject)
+    @Test func deniedPermissionSuspendsWithoutClearingIntent() {
+        #expect(MicrophoneAutoRecordPolicy.action(for: .denied) == .suspend)
+    }
+
+    @Test func permissionMessageShowsWhileEnabledIntentIsSuspended() {
+        #expect(MicrophoneAutoRecordPolicy.showsPermissionMessage(
+            autoRecordEnabled: true, status: .denied))
+        #expect(MicrophoneAutoRecordPolicy.showsPermissionMessage(
+            autoRecordEnabled: true, status: .notDetermined))
+    }
+
+    @Test func permissionMessageHidesOnceAccessReturns() {
+        #expect(!MicrophoneAutoRecordPolicy.showsPermissionMessage(
+            autoRecordEnabled: true, status: .granted))
+    }
+
+    @Test func permissionMessageNeverShowsWhileAutoRecordIsOff() {
+        for status in [PermissionStatus.granted, .notDetermined, .denied] {
+            #expect(!MicrophoneAutoRecordPolicy.showsPermissionMessage(
+                autoRecordEnabled: false, status: status))
+        }
     }
 }

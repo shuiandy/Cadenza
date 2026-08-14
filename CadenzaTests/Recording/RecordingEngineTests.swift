@@ -698,6 +698,41 @@ struct RecordingEngineProviderBoundaryTests {
         }
     }
 
+    /// The stored auto-record intent survives a permission outage; once TCC
+    /// reports granted again the next auto-start must proceed without any
+    /// prompt or settings round-trip.
+    @Test func autoStartedRecordingProceedsOnceMicrophonePermissionReturns() async throws {
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+        isolated.defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
+        isolated.defaults.set("en", forKey: "transcriptionLanguage")
+        isolated.defaults.set(false, forKey: "enableRealtimeTranscription")
+        SystemAudioCapturePreparation.markPrepared(defaults: isolated.defaults)
+
+        let spy = RecordingEngineBoundarySpy()
+        spy.microphoneStatus = .granted
+        let engine = RecordingEngine(dependencies: spy.dependencies(defaults: isolated.defaults))
+        engine._test_setSystemAudioPreparationDefaults(isolated.defaults)
+        try await attachIsolatedStore(to: engine, audioRoot: spy.storageRoot)
+        defer {
+            engine.forceReset()
+            try? FileManager.default.removeItem(at: spy.storageRoot)
+        }
+
+        try await engine.startRecording(
+            captureMicrophone: true,
+            skipPermissionPrompt: true,
+            isAutoStarted: true
+        )
+
+        #expect(spy.microphoneRequestCount == 0)
+        #expect(spy.captureRequests.count == 1)
+        #expect(spy.captureRequests.first?.captureMicrophone == true)
+        #expect(engine.recordingState == .recording)
+
+        await engine.stopRecordingAndWait()
+    }
+
     @Test func manualSystemAudioOnlyStartNeverRequestsMicrophonePermission() async throws {
         let isolated = makeDefaults()
         defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
@@ -725,7 +760,7 @@ struct RecordingEngineProviderBoundaryTests {
         await engine.stopRecordingAndWait()
     }
 
-    @Test func activePostProcessingBlocksManualAndAutomaticStartsBeforeAnyBoundary() async throws {
+    @Test func activePostProcessingDoesNotBlockManualOrAutomaticStarts() async throws {
         let isolated = makeDefaults()
         defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
         isolated.defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
@@ -778,34 +813,30 @@ struct RecordingEngineProviderBoundaryTests {
         let engine = RecordingEngine(dependencies: spy.dependencies(defaults: isolated.defaults))
         engine.store = store
         engine.coordinator = coordinator
+        engine._test_setSystemAudioPreparationDefaults(isolated.defaults)
+        SystemAudioCapturePreparation.markPrepared(defaults: isolated.defaults)
 
-        await #expect(throws: RecordingStartError.finalizationInProgress) {
-            try await engine.startRecording(captureMicrophone: false)
-        }
-        await #expect(throws: RecordingStartError.finalizationInProgress) {
-            try await engine.startRecording(
-                captureMicrophone: true,
-                skipPermissionPrompt: true,
-                isAutoStarted: true
-            )
-        }
+        try await engine.startRecording(captureMicrophone: false)
+        #expect(engine.recordingState == .recording)
+        #expect(spy.captureRequests.count == 1)
+        #expect(coordinator.isPostProcessing)
+        #expect(coordinator.recordingProcessingGate.hasRecordingLease)
+        #expect(coordinator.recordingProcessingGate.hasProcessingLeases)
+        engine.forceReset()
 
-        #expect(spy.keyLookups.isEmpty)
-        #expect(spy.appleLanguageLookups.isEmpty)
-        #expect(spy.microphoneRequestCount == 0)
-        #expect(spy.captureRequests.isEmpty)
-        #expect(spy.boundaryEvents.isEmpty)
-        #expect(engine.recordingState == .idle)
-        #expect(engine.currentRecordingID == nil)
-        let persistedIDs = await store.fetchRecordingDTOs(
-            sortKey: "dateNewest",
-            folderID: nil,
-            tagFilter: nil
-        ).map(\.id)
-        #expect(persistedIDs == [processingRecordingID])
+        try await engine.startRecording(
+            captureMicrophone: true,
+            skipPermissionPrompt: true,
+            isAutoStarted: true
+        )
+        #expect(engine.recordingState == .recording)
+        #expect(spy.captureRequests.count == 2)
+        #expect(coordinator.isPostProcessing)
+        engine.forceReset()
 
         coordinator.cancelCurrentJob()
         await processingGate.open()
+        #expect(await waitUntil { coordinator.recordingProcessingGate.isAllIdle })
     }
 
     private func verifyLateOldStopCannotAffectReplacement(
@@ -1457,6 +1488,102 @@ struct RecordingEngineProviderBoundaryTests {
         #expect(spy.stopRequests.count >= 2)
     }
 
+    @Test func provenHealthyStreamRefillsReconnectBudget() async throws {
+        struct StreamFailed: Error {}
+
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+        isolated.defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
+        isolated.defaults.set("en", forKey: "transcriptionLanguage")
+        isolated.defaults.set(AIProvider.openai.rawValue, forKey: "realtimeTranscriptionProvider")
+        isolated.defaults.set(true, forKey: "enableRealtimeTranscription")
+
+        let spy = RecordingEngineBoundarySpy()
+        spy.keys[.openai] = "openai-key"
+        let engine = RecordingEngine(dependencies: spy.dependencies(defaults: isolated.defaults))
+        try await attachIsolatedStore(to: engine, audioRoot: spy.storageRoot)
+        defer { engine.forceReset() }
+
+        try await engine.startRecording(captureMicrophone: false, skipPermissionPrompt: true)
+        #expect(await waitUntil { spy.realtimeRequests.count == 1 })
+
+        // Three terminal failures consume the whole reconnect budget.
+        for expected in 2...4 {
+            engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+            #expect(await waitUntil {
+                spy.realtimeRequests.count == expected && !engine._test_isReconnectingRealtime
+            })
+        }
+        #expect(engine._test_realtimeReconnectCount == 3)
+
+        // A content delta proves the stream healthy end to end; scattered
+        // faults across a long recording must not accumulate into the cap.
+        engine._test_triggerRealtimeStreamHealthy()
+        #expect(engine._test_realtimeReconnectCount == 0)
+
+        engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+        #expect(await waitUntil {
+            spy.realtimeRequests.count == 5 && !engine._test_isReconnectingRealtime
+        })
+        #expect(engine.realtimeHint == nil)
+        #expect(engine.recordingState == .recording)
+    }
+
+    @Test func speechResumeRearmsRealtimeAfterReconnectsExhausted() async throws {
+        struct StreamFailed: Error {}
+
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+        isolated.defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
+        isolated.defaults.set("en", forKey: "transcriptionLanguage")
+        isolated.defaults.set(AIProvider.openai.rawValue, forKey: "realtimeTranscriptionProvider")
+        isolated.defaults.set(true, forKey: "enableRealtimeTranscription")
+
+        let spy = RecordingEngineBoundarySpy()
+        spy.keys[.openai] = "openai-key"
+        let engine = RecordingEngine(dependencies: spy.dependencies(defaults: isolated.defaults))
+        try await attachIsolatedStore(to: engine, audioRoot: spy.storageRoot)
+        defer { engine.forceReset() }
+
+        try await engine.startRecording(captureMicrophone: false, skipPermissionPrompt: true)
+        #expect(await waitUntil { spy.realtimeRequests.count == 1 })
+
+        for expected in 2...4 {
+            engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+            #expect(await waitUntil {
+                spy.realtimeRequests.count == expected && !engine._test_isReconnectingRealtime
+            })
+        }
+
+        // Budget exhausted: the next failure gives up without dialing again,
+        // shows the interruption hint, and arms the speech retry.
+        engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+        #expect(engine.realtimeHint != nil)
+        #expect(engine._test_hasQueuedRealtimeSpeechRetry)
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(spy.realtimeRequests.count == 4)
+
+        // Resumed speech replays the saved failure and re-dials exactly once.
+        engine._test_simulateSpeechResumed()
+        #expect(await waitUntil {
+            spy.realtimeRequests.count == 5 && !engine._test_isReconnectingRealtime
+        })
+        let retried = try #require(spy.realtimeRequests.last)
+        #expect(retried.preserveSegments == true)
+        #expect(engine.realtimeHint == nil)
+        #expect(!engine._test_hasQueuedRealtimeSpeechRetry)
+        #expect(engine.recordingState == .recording)
+
+        // Another terminal failure re-queues, but the interval floor blocks an
+        // immediate second redial (the spy clock never advances).
+        engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+        #expect(engine._test_hasQueuedRealtimeSpeechRetry)
+        engine._test_simulateSpeechResumed()
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(spy.realtimeRequests.count == 5)
+        #expect(engine._test_hasQueuedRealtimeSpeechRetry)
+    }
+
     @Test func forceResetCancelsHungRealtimeStartup() async throws {
         let isolated = makeDefaults()
         defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
@@ -1762,7 +1889,9 @@ struct RecordingEngineProviderBoundaryTests {
         #expect(await waitUntil { coordinator.postProcessingPhase == "transcribing" })
         #expect(!engine._test_hasRecordingProcessingClaim)
         #expect(exclusionGate.hasProcessingLeases)
-        #expect(exclusionGate.claimRecording() == nil)
+        let concurrentRecordingLease = exclusionGate.claimRecording()
+        #expect(concurrentRecordingLease != nil)
+        exclusionGate.releaseRecording(concurrentRecordingLease)
         #expect(allIdleNotifications == 0)
 
         await processingRunnerGate.open()

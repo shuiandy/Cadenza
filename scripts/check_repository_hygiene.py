@@ -145,6 +145,98 @@ FORBIDDEN_CONTENT = (
     (re.compile(r"\bsk-(?:proj-)?[0-9A-Za-z_-]{20,}\b"), "OpenAI API key"),
 )
 
+# Source comments ship to the public mirror, so they stay in English. String
+# literals are exempt: localization fixtures legitimately carry CJK text.
+CJK_PATTERN = re.compile(
+    "["
+    "\u3000-\u303f"  # CJK punctuation
+    "\u3400-\u4dbf"  # CJK unified ideographs extension A
+    "\u4e00-\u9fff"  # CJK unified ideographs
+    "\uf900-\ufaff"  # CJK compatibility ideographs
+    "\uff01-\uff60"  # fullwidth forms
+    "]"
+)
+
+COMMENT_SCANNED_SUFFIXES = frozenset({".swift"})
+
+# Ratchet for the pre-existing Chinese comments. New files are gated
+# immediately; these are translated in batches and each cleaned file must be
+# deleted from this set. The check below fails on stale entries, so the list
+# can only shrink.
+LEGACY_COMMENT_FILES: frozenset[str] = frozenset(
+    {
+        "Cadenza/App/AppState.swift",
+        "Cadenza/Models/AgentArtifact.swift",
+        "Cadenza/Models/ArtifactTargetKey.swift",
+        "Cadenza/Models/MeetingEvent.swift",
+        "Cadenza/Models/NavigationDestination.swift",
+        "Cadenza/Services/AI/AIGenerationGate.swift",
+        "Cadenza/Services/AI/MeetingPrepContextBuilder.swift",
+        "Cadenza/Services/AI/MeetingPrepEligibility.swift",
+        "Cadenza/Services/AI/MeetingPrepFingerprint.swift",
+        "Cadenza/Services/AI/MeetingPrepGenerator.swift",
+        "Cadenza/Services/AI/MeetingPrepScheduleDecision.swift",
+        "Cadenza/Services/AI/MeetingPrepScheduler.swift",
+        "Cadenza/Services/AI/SummaryTranscriptFormatter.swift",
+        "Cadenza/Services/Cadenza/CadenzaAuthService.swift",
+        "Cadenza/Services/Calendar/GoogleEventParser.swift",
+        "Cadenza/Services/Export/BatchFileExporter.swift",
+        "Cadenza/Services/Export/ExportContentRenderer.swift",
+        "Cadenza/Services/Export/PortableArchive/PortableArchiveExporter.swift",
+        "Cadenza/Services/Export/PortableArchive/PortableArchiveSchema.swift",
+        "Cadenza/Services/Export/PortableArchive/PortableArchiveWriter.swift",
+        "Cadenza/Services/MCP/MCPToolRegistry.swift",
+        "Cadenza/Services/Meeting/CalendarEventMapping.swift",
+        "Cadenza/Services/Persistence/RecordingsStore+Archive.swift",
+        "Cadenza/Services/Persistence/RecordingsStore+Artifacts.swift",
+        "Cadenza/Services/Persistence/RecordingsStore.swift",
+        "Cadenza/Services/PostProcessing/PostProcessingCoordinator.swift",
+        "Cadenza/Services/Recording/RecordingEngine.swift",
+        "Cadenza/Shared/DTOs/MeetingEventDTO.swift",
+        "Cadenza/Utilities/CadenzaButtonStyle.swift",
+        "Cadenza/Utilities/ColorHex.swift",
+        "Cadenza/Utilities/PlatformCompatibility.swift",
+        "Cadenza/Utilities/ScaledFont.swift",
+        "Cadenza/Views/Calendar/EventDetailSheet.swift",
+        "Cadenza/Views/Calendar/MeetingPrepSection.swift",
+        "Cadenza/Views/Chat/FloatingAIChatButton.swift",
+        "Cadenza/Views/Components/ExportSavePanel.swift",
+        "Cadenza/Views/Components/Toast.swift",
+        "Cadenza/Views/Main/MainWindow.swift",
+        "Cadenza/Views/Main/RecordingOverlayPanel.swift",
+        "Cadenza/Views/Recordings/RecordingDetailView.swift",
+        "Cadenza/Views/Recordings/RecordingsContentView.swift",
+        "Cadenza/Views/TabBar/TabContentView.swift",
+        "CadenzaTests/AI/ChatHangReproTests.swift",
+        "CadenzaTests/AI/MeetingPrepContextBuilderTests.swift",
+        "CadenzaTests/AI/MeetingPrepGeneratorTests.swift",
+        "CadenzaTests/AI/MeetingPrepSchedulerTests.swift",
+        "CadenzaTests/AI/SummaryPromptTests.swift",
+        "CadenzaTests/Calendar/CalendarEventMappingTests.swift",
+        "CadenzaTests/Calendar/GoogleEventParserTests.swift",
+        "CadenzaTests/Export/BatchFileExporterTests.swift",
+        "CadenzaTests/Export/ExportContentRendererTests.swift",
+        "CadenzaTests/Export/PortableArchiveRestorer.swift",
+        "CadenzaTests/Export/PortableArchiveRoundTripTests.swift",
+        "CadenzaTests/Export/PortableArchiveValidator.swift",
+        "CadenzaTests/Export/PortableArchiveWriterTests.swift",
+        "CadenzaTests/MCP/MCPMeetingPrepToolsTests.swift",
+        "CadenzaTests/MCP/MCPToolsTests.swift",
+        "CadenzaTests/Persistence/ArtifactStoreTests.swift",
+        "CadenzaTests/Persistence/RecordingsStoreTagTests.swift",
+        "CadenzaTests/Persistence/RecordingsStoreTests.swift",
+        "CadenzaTests/Services/BulkExportCoordinatorTests.swift",
+        "CadenzaTests/Services/CraftExportLedgerTests.swift",
+        "CadenzaTests/Services/NotionExportedIDsTests.swift",
+        "CadenzaTests/Services/TagNormalizerTests.swift",
+        "CadenzaTests/UI/ButtonHitTestingTests.swift",
+        "CadenzaTests/UI/ExportLocalizationTests.swift",
+        "CadenzaTests/UI/NavigationReturnTests.swift",
+        "CadenzaTests/UI/ViewLayerLocalizationTests.swift",
+        "CadenzaTests/UI/WorkspacePanelSizingTests.swift",
+    }
+)
+
 
 def git_file_list(*arguments: str) -> list[str]:
     result = subprocess.run(
@@ -204,8 +296,122 @@ def decode_text(content: bytes) -> str | None:
         return None
 
 
+def skip_swift_string(text: str, index: int, hash_count: int) -> int:
+    """Return the index just past the Swift string literal starting at `index`."""
+    length = len(text)
+    closing_hashes = "#" * hash_count
+    escapes = "\\" + closing_hashes
+
+    if text.startswith('"""', index):
+        terminator = '"""' + closing_hashes
+        probe = index + 3
+        while probe < length:
+            if text.startswith(escapes, probe):
+                probe += len(escapes) + 1
+                continue
+            if text.startswith(terminator, probe):
+                return probe + len(terminator)
+            probe += 1
+        return length
+
+    terminator = '"' + closing_hashes
+    probe = index + 1
+    while probe < length:
+        if text.startswith(escapes, probe):
+            probe += len(escapes) + 1
+            continue
+        if text[probe] == "\n":
+            return probe
+        if text.startswith(terminator, probe):
+            return probe + len(terminator)
+        probe += 1
+    return length
+
+
+def swift_comment_mask(text: str) -> list[bool]:
+    """Mark every character that sits inside a Swift comment."""
+    mask = [False] * len(text)
+    length = len(text)
+    index = 0
+    block_depth = 0
+
+    while index < length:
+        if block_depth:
+            if text.startswith("/*", index):
+                block_depth += 1
+                mask[index] = mask[index + 1] = True
+                index += 2
+                continue
+            if text.startswith("*/", index):
+                block_depth -= 1
+                mask[index] = mask[index + 1] = True
+                index += 2
+                continue
+            mask[index] = True
+            index += 1
+            continue
+
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = length if end == -1 else end
+            for position in range(index, end):
+                mask[position] = True
+            index = end
+            continue
+
+        if text.startswith("/*", index):
+            block_depth = 1
+            mask[index] = mask[index + 1] = True
+            index += 2
+            continue
+
+        # Raw strings (#"..."#) disable backslash escaping, so the delimiter
+        # length has to be carried into the scan.
+        hash_count = 0
+        probe = index
+        while probe < length and text[probe] == "#":
+            hash_count += 1
+            probe += 1
+        if hash_count and probe < length and text[probe] == '"':
+            index = skip_swift_string(text, probe, hash_count)
+            continue
+
+        if text[index] == '"':
+            index = skip_swift_string(text, index, 0)
+            continue
+
+        index += 1
+
+    return mask
+
+
+def chinese_comment_lines(text: str) -> list[int]:
+    """Return 1-based line numbers whose comment portion contains CJK text."""
+    mask = swift_comment_mask(text)
+    findings: list[int] = []
+    line_number = 1
+    line_start = 0
+
+    for index in range(len(text) + 1):
+        if index != len(text) and text[index] != "\n":
+            continue
+        commented = "".join(
+            text[position]
+            for position in range(line_start, index)
+            if mask[position]
+        )
+        if CJK_PATTERN.search(commented):
+            findings.append(line_number)
+        line_number += 1
+        line_start = index + 1
+
+    return findings
+
+
 def main() -> int:
     failures: list[str] = []
+    scanned_for_comments: set[str] = set()
+    cleaned_legacy_files: set[str] = set()
 
     for relative_path, source in candidate_files():
         path = Path(relative_path)
@@ -239,6 +445,31 @@ def main() -> int:
         for pattern, description in FORBIDDEN_CONTENT:
             if pattern.search(text):
                 failures.append(f"{description} in {source}: {relative_path}")
+
+        if path.suffix.lower() in COMMENT_SCANNED_SUFFIXES:
+            scanned_for_comments.add(relative_path)
+            comment_lines = chinese_comment_lines(text)
+            if comment_lines and relative_path not in LEGACY_COMMENT_FILES:
+                shown = ", ".join(str(line) for line in comment_lines[:5])
+                if len(comment_lines) > 5:
+                    shown += f", +{len(comment_lines) - 5} more"
+                failures.append(
+                    f"non-English source comment in {source}: "
+                    f"{relative_path} (lines {shown})",
+                )
+            elif not comment_lines and relative_path in LEGACY_COMMENT_FILES:
+                cleaned_legacy_files.add(relative_path)
+
+    # Keep the ratchet honest: an exemption for a file that is already clean
+    # (or no longer exists) has to go, otherwise the list silently rots.
+    stale_exemptions = cleaned_legacy_files | (
+        LEGACY_COMMENT_FILES - scanned_for_comments
+    )
+    for relative_path in sorted(stale_exemptions):
+        failures.append(
+            f"stale comment exemption: remove {relative_path} from "
+            "LEGACY_COMMENT_FILES",
+        )
 
     if failures:
         print("Repository hygiene check failed:")

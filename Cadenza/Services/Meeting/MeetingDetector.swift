@@ -45,6 +45,7 @@ final class MeetingDetector {
     @ObservationIgnored private var detectedConfirmationWorkItem: DispatchWorkItem?
     @ObservationIgnored private var teamsAdHocStartConfirmationWorkItem: DispatchWorkItem?
     @ObservationIgnored private var workspaceObservers: [Any] = []
+    @ObservationIgnored private var isMonitoring = false
     @ObservationIgnored private var graceTimer: DispatchSourceTimer?
     @ObservationIgnored private var currentPollInterval: TimeInterval = 5
     @ObservationIgnored private let scoreThreshold: Int
@@ -97,6 +98,22 @@ final class MeetingDetector {
     /// as a safety net against a pathologically stuck `isRunningOutput` bit, not
     /// as the normal call-end mechanism (output dropping ends the call first).
     private static let teamsHelperOutputKeepAliveCap: TimeInterval = 4 * 60 * 60
+
+    /// First time the active session was sustained by system-wide mic occupancy
+    /// closing a one-point score gap (see `shouldUseSystemMicKeepAlive`). Covers
+    /// the silent-opening case: the user joins a scheduled call and waits muted,
+    /// the call window collapses to a non-call shape (win drops to 0), no
+    /// app-owned audio evidence ever appears because nobody has spoken, and the
+    /// raw score lands exactly one point below the threshold (calendar alone).
+    @ObservationIgnored private var systemMicKeepAliveSince: Date?
+
+    /// Hard cap on the system-mic keep-alive. The system-wide mic signal cannot
+    /// be attributed to the meeting app — Cadenza's own capture keeps it true
+    /// for the entire recording — so on its own it could pin a session forever.
+    /// The calendar match required by the one-point gap bounds it naturally
+    /// (the event ends), but a long event whose call actually ended silently
+    /// must not record until the calendar runs out; this caps that tail.
+    private static let systemMicKeepAliveCap: TimeInterval = 10 * 60
 
     /// Wall-clock instant the session most recently entered `.active`. Drives the
     /// minimum-active hold below. nil whenever the session is not active.
@@ -230,6 +247,9 @@ final class MeetingDetector {
     // MARK: - Start Monitoring
 
     func startMonitoring() {
+        guard !isMonitoring else { return }
+        isMonitoring = true
+
         // Initial scan via CGWindowList (sync, doesn't go through replayd).
         scanRunningApps()
 
@@ -292,6 +312,7 @@ final class MeetingDetector {
     }
 
     func stopMonitoring() {
+        isMonitoring = false
         appPollTimer?.cancel()
         appPollTimer = nil
         eventEvalWorkItem?.cancel()
@@ -321,6 +342,7 @@ final class MeetingDetector {
         teamsCallAssertionEverDetected = false
         teamsUncorroboratedKeepAliveSince = nil
         teamsHelperOutputKeepAliveSince = nil
+        systemMicKeepAliveSince = nil
         activeSince = nil
         teamsAdHocStartCandidateSince = nil
         teamsAdHocStartSuppressedUntilSignalsClear = false
@@ -672,8 +694,32 @@ final class MeetingDetector {
         let teamsHelperOutputKeepAliveActive = teamsHelperOutputKeepAliveCandidate
             && !teamsHelperOutputKeepAliveExpired
 
+        // System-mic keep-alive (change 4, silent-opening fix): weakest and
+        // last-resort flooring path, so it only arms when nothing stronger is
+        // already keeping the session alive — including helper output, which is
+        // genuine corroboration and should burn its own (much longer) cap first.
+        let systemMicKeepAliveCandidate = !otherFlooringActive
+            && !teamsHelperOutputKeepAliveActive
+            && shouldUseSystemMicKeepAlive(signals: signals, rawScore: rawScore)
+        if systemMicKeepAliveCandidate {
+            if systemMicKeepAliveSince == nil {
+                systemMicKeepAliveSince = now
+            }
+        } else {
+            systemMicKeepAliveSince = nil
+        }
+        let systemMicKeepAliveExpired: Bool
+        if let since = systemMicKeepAliveSince {
+            systemMicKeepAliveExpired = now.timeIntervalSince(since) > Self.systemMicKeepAliveCap
+        } else {
+            systemMicKeepAliveExpired = false
+        }
+        let systemMicKeepAliveActive = systemMicKeepAliveCandidate
+            && !systemMicKeepAliveExpired
+
         let scoreOverrideActive = otherFlooringActive
             || teamsHelperOutputKeepAliveActive
+            || systemMicKeepAliveActive
         let effectiveRawScore = scoreOverrideActive ? max(rawScore, scoreThreshold) : rawScore
 
         // Once observed, release of Teams' own call assertion is definitive and
@@ -704,7 +750,8 @@ final class MeetingDetector {
         //
         // All keepalive flooring otherwise flows through capped paths
         // (`teamsUncorroboratedKeepAliveActive` 10-min input cap;
-        // `teamsHelperOutputKeepAliveActive` 4-hour output cap) plus the bounded
+        // `teamsHelperOutputKeepAliveActive` 4-hour output cap;
+        // `systemMicKeepAliveActive` 10-min one-point-gap cap) plus the bounded
         // `minimumActiveHoldActive` (90s) window. There is intentionally no
         // second, *uncapped* `continuityAudioActive` flooring branch: that path
         // let a sticky Teams `modulehost` helper pin the meeting active forever
@@ -717,6 +764,7 @@ final class MeetingDetector {
             score = 0
         } else if teamsUncorroboratedKeepAliveActive
                     || teamsHelperOutputKeepAliveActive
+                    || systemMicKeepAliveActive
                     || minimumActiveHoldActive {
             score = max(effectiveRawScore, scoreThreshold)
         } else {
@@ -724,7 +772,7 @@ final class MeetingDetector {
         }
 
         writeMeetingDiagnostic(
-            "eval state=\(stateLabel(sessionState)) activeApp=\(activeMeetingApp?.rawValue ?? "nil") running=\(runningMeetingApps.map(\.id).joined(separator: ",")) score=\(score) raw=\(rawScore) thr=\(scoreThreshold) pmic=\(signals.processUsingMicInput ? 1 : 0) ever=\(perProcessMicEverDetected ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) toutExp=\(teamsHelperOutputKeepAliveExpired ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) screen=\(screenCaptureAvailable ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) windows=\(diagnosticWindowSummary(windows))"
+            "eval state=\(stateLabel(sessionState)) activeApp=\(activeMeetingApp?.rawValue ?? "nil") running=\(runningMeetingApps.map(\.id).joined(separator: ",")) score=\(score) raw=\(rawScore) thr=\(scoreThreshold) pmic=\(signals.processUsingMicInput ? 1 : 0) ever=\(perProcessMicEverDetected ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) toutExp=\(teamsHelperOutputKeepAliveExpired ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) screen=\(screenCaptureAvailable ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) windows=\(diagnosticWindowSummary(windows))"
         )
 
         let previousState = sessionState
@@ -746,7 +794,7 @@ final class MeetingDetector {
 
         // Log every evaluation during active/ending for diagnostics.
         if sessionState.isActive || sessionState.isEnding {
-            log.notice("tick: score=\(score, privacy: .public) thr=\(self.scoreThreshold, privacy: .public) pmic=\(signals.processUsingMicInput ? 1 : 0, privacy: .public)(ever=\(self.perProcessMicEverDetected ? 1 : 0, privacy: .public)) teamsAssert=\(teamsCallAssertionState.rawValue, privacy: .public)(ever=\(self.teamsCallAssertionEverDetected ? 1 : 0, privacy: .public)) cont=\(continuityAudioActive ? 1 : 0, privacy: .public) tout=\(teamsHelperOutputActive ? 1 : 0, privacy: .public) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0, privacy: .public) minHold=\(minimumActiveHoldActive ? 1 : 0, privacy: .public) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0, privacy: .public) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0, privacy: .public) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0, privacy: .public) smic=\(signals.systemMicActive ? 1 : 0, privacy: .public) cal=\(signals.calendarMatch ? 1 : 0, privacy: .public) win=\(signals.hasMeetingWindow ? 1 : 0, privacy: .public) state=\(self.stateLabel(self.sessionState), privacy: .public)")
+            log.notice("tick: score=\(score, privacy: .public) thr=\(self.scoreThreshold, privacy: .public) pmic=\(signals.processUsingMicInput ? 1 : 0, privacy: .public)(ever=\(self.perProcessMicEverDetected ? 1 : 0, privacy: .public)) teamsAssert=\(teamsCallAssertionState.rawValue, privacy: .public)(ever=\(self.teamsCallAssertionEverDetected ? 1 : 0, privacy: .public)) cont=\(continuityAudioActive ? 1 : 0, privacy: .public) tout=\(teamsHelperOutputActive ? 1 : 0, privacy: .public) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0, privacy: .public) minHold=\(minimumActiveHoldActive ? 1 : 0, privacy: .public) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0, privacy: .public) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0, privacy: .public) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0, privacy: .public) smic=\(signals.systemMicActive ? 1 : 0, privacy: .public) smicKeep=\(systemMicKeepAliveActive ? 1 : 0, privacy: .public) smicExp=\(systemMicKeepAliveExpired ? 1 : 0, privacy: .public) cal=\(signals.calendarMatch ? 1 : 0, privacy: .public) win=\(signals.hasMeetingWindow ? 1 : 0, privacy: .public) state=\(self.stateLabel(self.sessionState), privacy: .public)")
         }
 
         // Only write sessionState when the phase actually changes.
@@ -757,7 +805,7 @@ final class MeetingDetector {
 
             log.notice("evaluate: score=\(score, privacy: .public) pmic=\(signals.processUsingMicInput ? 1 : 0, privacy: .public) cont=\(continuityAudioActive ? 1 : 0, privacy: .public) tout=\(teamsHelperOutputActive ? 1 : 0, privacy: .public) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0, privacy: .public) minHold=\(minimumActiveHoldActive ? 1 : 0, privacy: .public) smic=\(signals.systemMicActive ? 1 : 0, privacy: .public) cal=\(signals.calendarMatch ? 1 : 0, privacy: .public) win=\(signals.hasMeetingWindow ? 1 : 0, privacy: .public) state=\(self.stateLabel(previousState), privacy: .public)->\(self.stateLabel(newState), privacy: .public)")
             writeMeetingDiagnostic(
-                "transition \(stateLabel(previousState))->\(stateLabel(newState)) score=\(score) raw=\(rawScore) pmic=\(signals.processUsingMicInput ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0)"
+                "transition \(stateLabel(previousState))->\(stateLabel(newState)) score=\(score) raw=\(rawScore) pmic=\(signals.processUsingMicInput ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0)"
             )
 
             maybeLogWindowDump(
@@ -889,6 +937,28 @@ final class MeetingDetector {
         guard runningMeetingApps.contains(where: { $0.app == .teams }) else { return false }
         guard rawScore < scoreThreshold else { return false }
         return teamsHelperOutputActive
+    }
+
+    /// System-mic keep-alive (change 4). Sustain-only and deliberately the
+    /// weakest flooring path: the system-wide mic signal cannot be attributed
+    /// to the meeting app (Cadenza's own capture keeps it true throughout a
+    /// recording), so it may only close a ONE-point score gap — standing in for
+    /// the lost `win` (+1) while stronger evidence (calendar) still carries the
+    /// rest. This keeps the silent-opening case alive (user joined a scheduled
+    /// call, waits muted, call window collapsed, no app-owned audio evidence
+    /// yet) without letting smic alone sustain a session whose score genuinely
+    /// collapsed — leaving a meeting for the chat tab drops the raw score to 0
+    /// and must still end (see `teamsMeetingChatAfterLeave` regression test).
+    /// Never participates in idle→detected: triggering stays smic-free.
+    private func shouldUseSystemMicKeepAlive(signals: MeetingSignals, rawScore: Int) -> Bool {
+        guard sessionState.isActive || sessionState.isEnding else { return false }
+        guard let sessionApp = sessionState.currentApp ?? activeMeetingApp,
+              runningMeetingApps.contains(where: { $0.app == sessionApp }) else {
+            return false
+        }
+        guard rawScore < scoreThreshold else { return false }
+        guard rawScore >= scoreThreshold - 1 else { return false }
+        return signals.systemMicActive
     }
 
     /// Minimum-active hold (change 3). True while the session has been active for
@@ -1151,6 +1221,7 @@ final class MeetingDetector {
             teamsCallAssertionEverDetected = false
             teamsUncorroboratedKeepAliveSince = nil
             teamsHelperOutputKeepAliveSince = nil
+            systemMicKeepAliveSince = nil
             activeSince = nil
             activeSessionCalendarMeeting = nil
             log.notice("meeting ENDED")
@@ -1219,6 +1290,7 @@ final class MeetingDetector {
         teamsCallAssertionEverDetected = false
         teamsUncorroboratedKeepAliveSince = nil
         teamsHelperOutputKeepAliveSince = nil
+        systemMicKeepAliveSince = nil
         activeSince = nil
         activeSessionCalendarMeeting = nil
         // Forget the last activation timestamp so the Teams ad-hoc start fallback
@@ -1258,6 +1330,7 @@ final class MeetingDetector {
             teamsCallAssertionEverDetected = false
             teamsUncorroboratedKeepAliveSince = nil
             teamsHelperOutputKeepAliveSince = nil
+            systemMicKeepAliveSince = nil
             activeSince = nil
             activeSessionCalendarMeeting = nil
             if wasFastPoll {
@@ -1707,6 +1780,9 @@ extension MeetingDetector {
     }
     func _test_setTeamsHelperOutputKeepAliveSince(_ date: Date?) {
         teamsHelperOutputKeepAliveSince = date
+    }
+    func _test_setSystemMicKeepAliveSince(_ date: Date?) {
+        systemMicKeepAliveSince = date
     }
     func _test_setActiveSince(_ date: Date?) { activeSince = date }
     func _test_setTeamsAdHocStartCandidateSince(_ date: Date?) { teamsAdHocStartCandidateSince = date }

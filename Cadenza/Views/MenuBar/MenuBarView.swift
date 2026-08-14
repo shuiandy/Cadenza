@@ -95,20 +95,10 @@ struct MenuBarView: View {
                     .onChange(of: enableMeetingDetection) { _, newValue in
                         appState.setMeetingDetectionEnabled(newValue)
                     }
-                if autoRecordMeetings {
-                    Toggle("Auto start recording", isOn: $autoRecordMeetings)
-                } else {
-                    Button("Auto-record meetings") {
-                        appState.openSettings(category: .recording)
-                        openWindow(id: "main")
-                        NSApp.activate(ignoringOtherApps: true)
-                    }
-                }
+                Toggle("Auto-record meetings", isOn: autoRecordBinding)
                 if !appState.hasPreparedSystemAudioCapture {
                     Button("Set Up System Audio Recording…") {
-                        appState.openSettings(category: .recording)
-                        openWindow(id: "main")
-                        NSApp.activate(ignoringOtherApps: true)
+                        openRecordingSettings()
                     }
                 }
             }
@@ -159,6 +149,44 @@ struct MenuBarView: View {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q", modifiers: .command)
+    }
+
+    /// Same suspend semantics as the Settings toggle: the stored intent is
+    /// only cleared by an explicit off, never by permission state. The menu
+    /// bar never issues the TCC request itself; when microphone access is
+    /// missing it keeps the intent and continues in Settings, which owns the
+    /// request flow and the suspended-state hint.
+    private var autoRecordBinding: Binding<Bool> {
+        Binding(
+            get: { autoRecordMeetings },
+            set: { requestedValue in
+                guard requestedValue else {
+                    autoRecordMeetings = false
+                    return
+                }
+                guard appState.startupPolicy.checksPermissions else { return }
+                guard enableMeetingDetection, appState.hasPreparedSystemAudioCapture else {
+                    // One-time prerequisites have no self-healing path, so a
+                    // stored intent could never take effect; finish setup in
+                    // Settings instead of flipping the toggle.
+                    openRecordingSettings()
+                    return
+                }
+
+                autoRecordMeetings = true
+                let status = RecordingMicrophonePermissionReader.live
+                    .status(for: appState.startupPolicy)
+                if MicrophoneAutoRecordPolicy.action(for: status) != .enable {
+                    openRecordingSettings()
+                }
+            }
+        )
+    }
+
+    private func openRecordingSettings() {
+        appState.openSettings(category: .recording)
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - Audio Devices

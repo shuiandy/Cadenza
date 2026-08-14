@@ -26,7 +26,6 @@ struct ProfileBootContext: Equatable {
     /// (after lock/missing fallback to Local). Set by the pipeline entry;
     /// nil outside profile mode and for the M1-only stage.
     var profile: Profile?
-
     init(
         mode: Mode,
         storeURL: URL?,
@@ -102,7 +101,8 @@ enum ProfileBootstrap {
             audioRoot: { StorageLocationManager.recordingsDirectory },
             audioDirectoryState: { operativeAudioDirectoryState() },
             scopedDefaults: ProfileScopedDefaults.standard(),
-            now: { Date() }
+            now: { Date() },
+            mcpCredentials: .standard()
         )
         let session = SessionMigrationDependencies(
             registry: registry,
@@ -371,6 +371,12 @@ enum ProfileBootstrap {
                 ) {
                     return .halted(reason: haltReason)
                 }
+                // The pre-profile install has just become a profile: this is the
+                // one boot where the MCP credentials still live at their global
+                // keys, so adoption has to happen here too. Reaching it only via
+                // the registry-present branch left every configured client
+                // answering 401 for the whole first session after upgrade.
+                reconcileCommittedState(document: document, dependencies: dependencies)
             } catch {
                 return .halted(reason: "registry unreadable after commit")
             }
@@ -637,6 +643,36 @@ enum ProfileBootstrap {
         )
     }
 
+    /// Read-only evidence probe used before bootstrap performs its first write.
+    /// The app root covers registries, migration journals, profile stores,
+    /// legacy stores and retired artifacts. The older `default.store` lived one
+    /// directory higher, so its complete SQLite trio is checked separately.
+    /// Unknown filesystem errors fail closed as prior-install evidence.
+    static func hasPriorInstallationEvidenceLive() -> Bool {
+        let paths = ProfilePaths.live()
+        return hasPriorInstallationEvidence(paths: paths) { url in
+            _ = try FileManager.default.attributesOfItem(atPath: url.path)
+        }
+    }
+
+    static func hasPriorInstallationEvidence(
+        paths: ProfilePaths,
+        probe: (URL) throws -> Void
+    ) -> Bool {
+        let preLegacy = StoreTrioURL(base: paths.preLegacyStoreURL)
+        for candidate in [paths.root, preLegacy.base, preLegacy.wal, preLegacy.shm] {
+            do {
+                try probe(candidate)
+                return true
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
+            } catch {
+                return true
+            }
+        }
+        return false
+    }
+
     private static func recordStoreMaterialized(
         profileID: UUID, registry: any ProfileRegistryProviding
     ) throws {
@@ -678,6 +714,11 @@ enum ProfileBootstrap {
     /// The audio directory is NOT mirrored from UserDefaults — the
     /// registry's per-profile record is the root authority; root changes
     /// write it through `StorageLocationManager`'s installed recorder.
+    ///
+    /// MCP credentials are adopted here too, and must stay ahead of
+    /// `AppState.setup()`: it starts the MCP server first thing, and a
+    /// server that reads the scoped keys before the copy lands would answer
+    /// every configured client with a 401.
     static func reconcileCommittedState(
         document: ProfileRegistryDocument,
         dependencies: M1StorageMigration.Dependencies
@@ -686,5 +727,6 @@ enum ProfileBootstrap {
         if !scoped.mappingComplete(for: document.activeProfileID) {
             scoped.copyGlobalValues(to: document.activeProfileID)
         }
+        dependencies.mcpCredentials?.adoptGlobalCredentials(into: document.activeProfileID)
     }
 }

@@ -1,5 +1,17 @@
 import Foundation
 import AVFoundation
+import os
+
+/// Diarization is non-fatal here by design, and a refused retry returns without
+/// touching the UI. Both outcomes are invisible to the user, so the log is the
+/// only account of them — and `NSLog` was not one: unpersisted at its default
+/// level on macOS 26, and redacted to `<private>` in a live stream. Only the
+/// shape of a failure is `.public`; messages can embed paths under the
+/// user's home. See the note on `diarizerLog` in `SpeakerDiarizer`.
+private let postProcessLog = Logger(
+    subsystem: "com.shuiandy.Cadenza",
+    category: "PostProcessingCoordinator"
+)
 
 // MARK: - Job Phase
 
@@ -1195,6 +1207,9 @@ final class PostProcessingCoordinator {
 
         // Step 1.5: Speaker diarization — per-entry skip logic handles partial labels
         let diarizationEnabled = SpeakerDiarizer.shared.isEnabled
+        postProcessLog.info(
+            "diarization gate: enabled=\(diarizationEnabled, privacy: .public), didFail=\(didFail, privacy: .public), entries=\((entries ?? []).count, privacy: .public), provider=\(String(describing: actualProvider), privacy: .public)"
+        )
         if diarizationEnabled, !didFail, !(entries ?? []).isEmpty {
             do {
                 let diarizer = SpeakerDiarizer.shared
@@ -1217,9 +1232,14 @@ final class PostProcessingCoordinator {
                 }
                 diarizer.mergeConsecutiveSpeakers(entries: &mutableEntries)
                 entries = mutableEntries
-                NSLog("[PostProcessCoord] diarization: %d speakers, %d entries after merge", diarizationResult.speakerCount, mutableEntries.count)
+                let withSpeaker = mutableEntries.filter { $0.speaker != nil }.count
+                postProcessLog.info(
+                    "diarization: \(diarizationResult.speakerCount, privacy: .public) speakers, \(withSpeaker, privacy: .public)/\(mutableEntries.count, privacy: .public) entries labelled after merge"
+                )
             } catch {
-                NSLog("[PostProcessCoord] diarization failed (non-fatal): %@", error.localizedDescription)
+                postProcessLog.error(
+                    "diarization failed (non-fatal): \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+                )
             }
         }
 
@@ -1614,11 +1634,18 @@ final class PostProcessingCoordinator {
         guard !isDeletionBlocked(recordingID),
               !isProcessing(recordingID: recordingID),
               !isRetryingTranscription else {
-            NSLog("[PostProcessCoord] retryTranscription: skipped (already processing or retrying)")
+            postProcessLog.error(
+                "retryTranscription skipped: already processing or retrying"
+            )
             return
         }
         guard let processingLease = recordingProcessingGate.claimProcessing() else {
-            NSLog("[PostProcessCoord] retryTranscription refused: recording is active")
+            // Also refuses on a mere recording *intent* — the detector arming
+            // for a meeting is enough. The button gives no feedback, so this
+            // line is the only way to tell a refusal from a silent no-op.
+            postProcessLog.error(
+                "retryTranscription refused: a recording is active or armed"
+            )
             return
         }
         defer { recordingProcessingGate.releaseProcessing(processingLease) }
@@ -1754,7 +1781,9 @@ final class PostProcessingCoordinator {
 
             // Speaker diarization
             let diarizationEnabled = SpeakerDiarizer.shared.isEnabled
-            NSLog("[PostProcessCoord] retryTranscription: diarizationEnabled=%d, entries=%d", diarizationEnabled ? 1 : 0, entries.count)
+            postProcessLog.info(
+                "retryTranscription diarization gate: enabled=\(diarizationEnabled, privacy: .public), entries=\(entries.count, privacy: .public), provider=\(String(describing: selection.provider), privacy: .public)"
+            )
             if diarizationEnabled, !entries.isEmpty {
                 do {
                     let diarizer = SpeakerDiarizer.shared
@@ -1775,9 +1804,13 @@ final class PostProcessingCoordinator {
                         )
                     }
                     let withSpeaker = entries.filter { $0.speaker != nil }.count
-                    NSLog("[PostProcessCoord] retryTranscription diarization: %d speakers, %d/%d entries", diarizationResult.speakerCount, withSpeaker, entries.count)
+                    postProcessLog.info(
+                        "retryTranscription diarization: \(diarizationResult.speakerCount, privacy: .public) speakers, \(withSpeaker, privacy: .public)/\(entries.count, privacy: .public) entries"
+                    )
                 } catch {
-                    NSLog("[PostProcessCoord] retryTranscription diarization failed (non-fatal): %@", error.localizedDescription)
+                    postProcessLog.error(
+                        "retryTranscription diarization failed (non-fatal): \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+                    )
                 }
             }
 

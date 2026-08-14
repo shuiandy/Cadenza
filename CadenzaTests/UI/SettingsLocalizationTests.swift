@@ -21,6 +21,7 @@ struct SettingsLocalizationTests {
         "When Launch at login is enabled, show the main window after sign in",
         "Required for reliable Teams auto-start and auto-stop.",
         "Window-based meeting detection is available.",
+        "Microphone access is required for automatic meeting recording. Auto-record stays on and will resume once access is granted.",
         "Deleted recordings move to Trash and are removed from the active library after the selected number of days. Cadenza-owned audio files and derived data are included; imported source files remain in their original location. Automatic recovery backups may retain copies until rotation or explicit deletion.",
         "AI chat searches",
         "How far back chat looks when your question doesn't name a time range. Asking e.g. \"last week\" always narrows to that period.",

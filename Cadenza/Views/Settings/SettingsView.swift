@@ -961,7 +961,9 @@ private struct GeneralSettingsSection: View {
                     isOn: $openMainWindowOnLaunch
                 )
             }
+
             if appState.startupPolicy.externalAccessEnabled {
+                UpdateSettingsSection()
                 DiagnosticsSection(store: appState.store, meetingDetector: appState.meetingDetector)
             }
         }
@@ -1171,7 +1173,7 @@ private struct RecordingSettingsSection: View {
                 )
 
                 if showMicrophonePermissionMessage {
-                    Text("Microphone access is required for automatic meeting recording. Grant access, then enable auto-record again.")
+                    Text("Microphone access is required for automatic meeting recording. Auto-record stays on and will resume once access is granted.")
                         .font(.cadenza(.caption, scale: uiScale))
                         .foregroundStyle(.red)
                         .accessibilityIdentifier("recording.autoRecord.microphoneRequired")
@@ -1193,6 +1195,10 @@ private struct RecordingSettingsSection: View {
                 Divider()
 
                 ScreenRecordingPermissionRow()
+
+                Divider()
+
+                AccessibilityPermissionRow()
             }
             .disabled(!appState.startupPolicy.checksPermissions)
 
@@ -1212,7 +1218,7 @@ private struct RecordingSettingsSection: View {
                 MicrophonePermissionRow(
                     status: microphoneStatus,
                     isRequesting: isRequestingMicrophone,
-                    grantAccess: { requestMicrophoneAccess(enableAutoRecord: false) },
+                    grantAccess: { requestMicrophoneAccess() },
                     openSettings: {
                         guard appState.startupPolicy.checksPermissions else { return }
                         Permissions.openMicrophoneSettings()
@@ -1254,34 +1260,33 @@ private struct RecordingSettingsSection: View {
         Binding(
             get: { autoRecordMeetings },
             set: { requestedValue in
-                guard appState.startupPolicy.checksPermissions else {
-                    autoRecordMeetings = false
-                    return
-                }
                 guard requestedValue else {
+                    // Turning the toggle off is the only path that clears the
+                    // stored intent. Missing permission never rewrites it;
+                    // RecordingEngine fails closed at auto-start time instead.
                     autoRecordMeetings = false
                     showMicrophonePermissionMessage = false
                     return
                 }
+                guard appState.startupPolicy.checksPermissions else { return }
 
+                autoRecordMeetings = true
                 let status = permissionReader.status(for: appState.startupPolicy)
                 switch MicrophoneAutoRecordPolicy.action(for: status) {
                 case .enable:
                     microphoneStatus = .granted
-                    autoRecordMeetings = true
                     showMicrophonePermissionMessage = false
                 case .request:
-                    requestMicrophoneAccess(enableAutoRecord: true)
-                case .reject:
+                    requestMicrophoneAccess()
+                case .suspend:
                     microphoneStatus = .denied
-                    autoRecordMeetings = false
                     showMicrophonePermissionMessage = true
                 }
             }
         )
     }
 
-    private func requestMicrophoneAccess(enableAutoRecord: Bool) {
+    private func requestMicrophoneAccess() {
         guard appState.startupPolicy.allowsHardwareCapture else { return }
         guard appState.startupPolicy.checksPermissions else { return }
         guard !isRequestingMicrophone else { return }
@@ -1293,33 +1298,24 @@ private struct RecordingSettingsSection: View {
                 return
             }
             _ = await Permissions.requestMicrophone()
-            microphoneStatus = permissionReader.status(for: appState.startupPolicy)
             await appState.checkPermissions()
             isRequestingMicrophone = false
-
-            if microphoneStatus == .granted {
-                if enableAutoRecord {
-                    autoRecordMeetings = true
-                }
-                showMicrophonePermissionMessage = false
-            } else {
-                autoRecordMeetings = false
-                showMicrophonePermissionMessage = true
-            }
+            refreshMicrophonePermission()
         }
     }
 
     private func refreshMicrophonePermission() {
         microphoneStatus = permissionReader.status(for: appState.startupPolicy)
-        if autoRecordMeetings, microphoneStatus != .granted {
-            autoRecordMeetings = false
-            showMicrophonePermissionMessage = true
-        }
+        showMicrophonePermissionMessage = MicrophoneAutoRecordPolicy.showsPermissionMessage(
+            autoRecordEnabled: autoRecordMeetings,
+            status: microphoneStatus
+        )
     }
 }
 
 private struct MicrophonePermissionRow: View {
     @Environment(\.uiScale) private var uiScale: CGFloat
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let status: PermissionStatus
     let isRequesting: Bool
@@ -1327,7 +1323,7 @@ private struct MicrophonePermissionRow: View {
     let openSettings: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        SettingsPermissionRowLayout {
             // Status icon trails so the text aligns with sibling toggle rows.
             VStack(alignment: .leading, spacing: 3) {
                 Text("Microphone")
@@ -1336,13 +1332,12 @@ private struct MicrophonePermissionRow: View {
                     .font(.cadenza(.subheadline, scale: uiScale))
                     .foregroundStyle(.secondary)
             }
-            .accessibilityHidden(true)
-
-            Spacer(minLength: 12)
-
+            .accessibilityElement(children: .combine)
+        } controls: {
             Image(systemName: status == .granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                 .font(.cadenza(13, weight: .semibold, scale: uiScale))
                 .foregroundStyle(status == .granted ? .green : .orange)
+                .accessibilityHidden(true)
 
             switch status {
             case .granted:
@@ -1361,7 +1356,8 @@ private struct MicrophonePermissionRow: View {
                     }
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.small)
+                .controlSize(usesAccessibleLayout ? .regular : .small)
+                .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .disabled(isRequesting)
                 .accessibilityLabel("Grant microphone access")
             case .denied:
@@ -1369,12 +1365,17 @@ private struct MicrophonePermissionRow: View {
                     Label("Open Settings", systemImage: "gearshape")
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.small)
+                .controlSize(usesAccessibleLayout ? .regular : .small)
+                .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .accessibilityLabel("Open microphone settings")
             }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .contain)
+    }
+
+    private var usesAccessibleLayout: Bool {
+        CadenzaTextScale.isAccessibilitySize(dynamicTypeSize)
     }
 
     private var permissionDescription: LocalizedStringKey {
@@ -1390,54 +1391,142 @@ private struct MicrophonePermissionRow: View {
 }
 
 private struct ScreenRecordingPermissionRow: View {
+    private static let table = "Onboarding"
+
     @Environment(\.uiScale) private var uiScale: CGFloat
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(AppState.self) private var appState
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        SettingsPermissionRowLayout {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Screen Recording")
+                Text(text("Screen Recording"))
                     .font(.cadenza(14, scale: uiScale))
-                Text(appState.hasScreenRecordingPermission
-                     ? "Window-based meeting detection is available."
-                     : "Required for reliable Teams auto-start and auto-stop.")
+                Text(text("Lets Cadenza read meeting window information for more reliable Teams start and stop detection. No screen image is recorded."))
                     .font(.cadenza(.subheadline, scale: uiScale))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-
-            Spacer(minLength: 12)
-
+            .accessibilityElement(children: .combine)
+        } controls: {
             Image(systemName: appState.hasScreenRecordingPermission ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                 .font(.cadenza(13, weight: .semibold, scale: uiScale))
                 .foregroundStyle(appState.hasScreenRecordingPermission ? .green : .orange)
+                .accessibilityHidden(true)
 
             if appState.hasScreenRecordingPermission {
-                Text("Granted")
+                Text(text("Granted"))
                     .font(.cadenza(12, weight: .medium, scale: uiScale))
                     .foregroundStyle(.secondary)
+                    .accessibilityLabel(text("Screen Recording"))
+                    .accessibilityValue(text("Granted"))
             } else {
                 Button {
                     guard appState.startupPolicy.allowsHardwareCapture else { return }
                     _ = Permissions.requestScreenRecording()
                     Task { await appState.checkPermissions() }
                 } label: {
-                    Label("Open Settings", systemImage: "gearshape")
+                    Label(text("Open Settings"), systemImage: "gearshape")
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.small)
+                .controlSize(usesAccessibleLayout ? .regular : .small)
+                .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .disabled(!appState.startupPolicy.allowsHardwareCapture)
+                .accessibilityLabel(text("Open Settings"))
             }
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var usesAccessibleLayout: Bool {
+        CadenzaTextScale.isAccessibilitySize(dynamicTypeSize)
+    }
+
+    private func text(_ key: String.LocalizationValue) -> String {
+        String(localized: key, table: Self.table)
+    }
+}
+
+private struct AccessibilityPermissionRow: View {
+    private static let table = "Onboarding"
+
+    @Environment(\.uiScale) private var uiScale: CGFloat
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(AppState.self) private var appState
+    @State private var requestAttempted = false
+
+    var body: some View {
+        SettingsPermissionRowLayout {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(text("Accessibility"))
+                    .font(.cadenza(14, scale: uiScale))
+                Text(text("Allows global recording shortcuts to work while another app is active."))
+                    .font(.cadenza(.subheadline, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+        } controls: {
+            Image(
+                systemName: appState.hasAccessibilityPermission
+                    ? "checkmark.circle.fill"
+                    : "keyboard.badge.ellipsis"
+            )
+            .font(.cadenza(13, weight: .semibold, scale: uiScale))
+            .foregroundStyle(appState.hasAccessibilityPermission ? .green : .orange)
+            .accessibilityHidden(true)
+
+            if appState.hasAccessibilityPermission {
+                Text(text("Granted"))
+                    .font(.cadenza(12, weight: .medium, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(text("Accessibility"))
+                    .accessibilityValue(text("Granted"))
+            } else {
+                Button {
+                    guard appState.startupPolicy.checksPermissions else { return }
+                    if requestAttempted {
+                        Permissions.openAccessibilitySettings()
+                    } else {
+                        let granted = Permissions.requestAccessibility()
+                        requestAttempted = !granted
+                        Task { await appState.checkPermissions() }
+                    }
+                } label: {
+                    Label(
+                        requestAttempted ? text("Open Settings") : text("Allow"),
+                        systemImage: requestAttempted ? "gearshape" : "accessibility"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(usesAccessibleLayout ? .regular : .small)
+                .frame(minHeight: usesAccessibleLayout ? 44 : nil)
+                .accessibilityLabel(
+                    requestAttempted ? text("Open Settings") : text("Allow global shortcuts")
+                )
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var usesAccessibleLayout: Bool {
+        CadenzaTextScale.isAccessibilitySize(dynamicTypeSize)
+    }
+
+    private func text(_ key: String.LocalizationValue) -> String {
+        String(localized: key, table: Self.table)
     }
 }
 
 private struct SystemAudioCapturePreparationRow: View {
     @Environment(\.uiScale) private var uiScale: CGFloat
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(AppState.self) private var appState
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        SettingsPermissionRowLayout {
             VStack(alignment: .leading, spacing: 3) {
                 Text("System Audio Recording")
                     .font(.cadenza(14, scale: uiScale))
@@ -1448,10 +1537,10 @@ private struct SystemAudioCapturePreparationRow: View {
                 )
                 .font(.cadenza(.subheadline, scale: uiScale))
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
-
-            Spacer(minLength: 12)
-
+            .accessibilityElement(children: .combine)
+        } controls: {
             Image(
                 systemName: appState.hasPreparedSystemAudioCapture
                     ? "checkmark.circle.fill"
@@ -1459,6 +1548,7 @@ private struct SystemAudioCapturePreparationRow: View {
             )
             .font(.cadenza(13, weight: .semibold, scale: uiScale))
             .foregroundStyle(appState.hasPreparedSystemAudioCapture ? .green : .orange)
+            .accessibilityHidden(true)
 
             if appState.hasPreparedSystemAudioCapture {
                 Button {
@@ -1468,7 +1558,8 @@ private struct SystemAudioCapturePreparationRow: View {
                     Label("Open Settings", systemImage: "gearshape")
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.small)
+                .controlSize(usesAccessibleLayout ? .regular : .small)
+                .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .disabled(!appState.startupPolicy.allowsHardwareCapture)
             } else {
                 Button {
@@ -1486,7 +1577,8 @@ private struct SystemAudioCapturePreparationRow: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                .controlSize(usesAccessibleLayout ? .regular : .small)
+                .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .disabled(
                     !appState.startupPolicy.allowsHardwareCapture
                         || appState.isStartingRecording
@@ -1495,6 +1587,43 @@ private struct SystemAudioCapturePreparationRow: View {
             }
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var usesAccessibleLayout: Bool {
+        CadenzaTextScale.isAccessibilitySize(dynamicTypeSize)
+    }
+}
+
+private struct SettingsPermissionRowLayout<Information: View, Controls: View>: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let information: Information
+    let controls: Controls
+
+    init(
+        @ViewBuilder information: () -> Information,
+        @ViewBuilder controls: () -> Controls
+    ) {
+        self.information = information()
+        self.controls = controls()
+    }
+
+    var body: some View {
+        Group {
+            if CadenzaTextScale.isAccessibilitySize(dynamicTypeSize) {
+                VStack(alignment: .leading, spacing: 12) {
+                    information
+                    HStack(spacing: 10) { controls }
+                }
+            } else {
+                HStack(alignment: .top, spacing: 12) {
+                    information
+                    Spacer(minLength: 12)
+                    HStack(spacing: 10) { controls }
+                }
+            }
+        }
     }
 }
 

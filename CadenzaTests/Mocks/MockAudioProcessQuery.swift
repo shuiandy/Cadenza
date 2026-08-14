@@ -24,12 +24,16 @@ final class MockAudioProcessQuery: AudioProcessQuerying {
 final class MockAudioStateListener: AudioStateListening {
     var onAudioStateChanged: (() -> Void)?
     private(set) var isListening = false
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
 
     func startListening() {
+        startCount += 1
         isListening = true
     }
 
     func stopListening() {
+        stopCount += 1
         isListening = false
         onAudioStateChanged = nil
     }

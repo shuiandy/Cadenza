@@ -1,12 +1,18 @@
 import Foundation
 
-/// Bidirectional exclusion between audio capture and post-processing work.
+/// Asymmetric scheduling between audio capture and post-processing work.
 ///
 /// Recording owns one exclusive lease from the beginning of start-up through
-/// durable stop finalization. Post-processing owns one lease per automatic or
-/// manual operation; processing leases may overlap with each other, but never
-/// with recording. MainActor confinement makes every claim and the normal-stop
-/// recording-to-processing handoff a single, non-suspending state transition.
+/// durable stop finalization, and it is never refused because processing is
+/// running: live capture must be available the moment the next meeting
+/// starts, so a recording claim only competes with other recording claims and
+/// reserved intents. Post-processing owns one lease per automatic or manual
+/// operation; processing leases may overlap with each other and with a live
+/// recording, but no *new* processing claim is granted while a recording
+/// lease or reserved intent is present — heavy transcription work yields to
+/// capture and drains at the next all-idle edge. MainActor confinement makes
+/// every claim and the normal-stop recording-to-processing handoff a single,
+/// non-suspending state transition.
 @MainActor
 final class RecordingProcessingGate {
     struct RecordingIntent: Sendable, Equatable {
@@ -60,24 +66,25 @@ final class RecordingProcessingGate {
         return RecordingIntent(ownerID: id, id: intentID)
     }
 
-    /// Claims recording exclusively. Balance with `releaseRecording`, or use
+    /// Claims recording exclusively against other recordings and reserved
+    /// intents. Processing leases already in flight never refuse this claim.
+    /// Balance with `releaseRecording`, or use
     /// `transitionRecordingToProcessing` during a successful normal stop.
     func claimRecording() -> RecordingLease? {
         guard recordingIntentID == nil,
-              recordingLeaseID == nil,
-              processingLeaseIDs.isEmpty else { return nil }
+              recordingLeaseID == nil else { return nil }
         let leaseID = UUID()
         recordingLeaseID = leaseID
         return RecordingLease(ownerID: id, id: leaseID)
     }
 
     /// Atomically consumes a previously reserved recording intent and turns it
-    /// into the live recording lease. A stale or foreign intent cannot claim.
+    /// into the live recording lease. A stale or foreign intent cannot claim;
+    /// processing leases already in flight never refuse the consumption.
     func claimRecording(consuming intent: RecordingIntent) -> RecordingLease? {
         guard intent.ownerID == id,
               recordingIntentID == intent.id,
-              recordingLeaseID == nil,
-              processingLeaseIDs.isEmpty else { return nil }
+              recordingLeaseID == nil else { return nil }
         let leaseID = UUID()
         recordingIntentID = nil
         recordingLeaseID = leaseID
@@ -85,7 +92,9 @@ final class RecordingProcessingGate {
     }
 
     /// Claims one processing operation. Processing operations may run in
-    /// parallel, but a recording lease refuses every new processing claim.
+    /// parallel, but a live recording lease or reserved recording intent
+    /// refuses every new processing claim: transcription work yields to
+    /// capture and is deferred by the caller until the next all-idle edge.
     func claimProcessing() -> ProcessingLease? {
         guard recordingIntentID == nil, recordingLeaseID == nil else { return nil }
         let leaseID = UUID()

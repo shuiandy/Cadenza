@@ -1,4 +1,5 @@
 import AppKit
+@preconcurrency import ApplicationServices
 import AVFoundation
 import CoreGraphics
 import EventKit
@@ -13,6 +14,11 @@ enum CalendarPermissionRecoveryAction: Equatable, Sendable {
     case alreadyGranted
     case requestAccess
     case openSettings
+}
+
+enum AccessibilityPermissionAction: Equatable, Sendable {
+    case alreadyGranted
+    case requestAccess
 }
 
 enum Permissions {
@@ -33,8 +39,29 @@ enum Permissions {
 
     // MARK: - Screen Recording
 
+    /// CoreGraphics exposes only whether access is currently available.
+    /// A false result cannot distinguish a denial from a first-time request.
+    static var screenRecordingStatus: PermissionStatus {
+        screenRecordingStatus(hasAccess: CGPreflightScreenCaptureAccess())
+    }
+
+    static func screenRecordingStatus(hasAccess: Bool) -> PermissionStatus {
+        hasAccess ? .granted : .notDetermined
+    }
+
     static func checkScreenRecording() async -> Bool {
         CGPreflightScreenCaptureAccess()
+    }
+
+    /// Requests Screen Recording from an explicit foreground user action.
+    /// Background meeting detection continues to use the prompt-free preflight
+    /// above and must never call this API on its own.
+    @discardableResult
+    static func requestScreenRecordingAccess() -> Bool {
+        if CGPreflightScreenCaptureAccess() {
+            return true
+        }
+        return CGRequestScreenCaptureAccess()
     }
 
     /// Check screen recording permission. Opens System Settings if not granted.
@@ -46,6 +73,49 @@ enum Permissions {
         }
         openScreenRecordingSettings()
         return false
+    }
+
+    // MARK: - Accessibility
+
+    /// Accessibility does not expose separate denied and not-determined states.
+    /// Reading this value never displays the system authorization prompt.
+    static var accessibilityStatus: PermissionStatus {
+        accessibilityStatus(isTrusted: AXIsProcessTrusted())
+    }
+
+    static func accessibilityStatus(isTrusted: Bool) -> PermissionStatus {
+        isTrusted ? .granted : .notDetermined
+    }
+
+    static func accessibilityAction(
+        for status: PermissionStatus
+    ) -> AccessibilityPermissionAction {
+        status == .granted ? .alreadyGranted : .requestAccess
+    }
+
+    /// Requests Accessibility access only from an explicit user action.
+    /// The status getter above intentionally remains prompt-free.
+    @discardableResult
+    static func requestAccessibility() -> Bool {
+        requestAccessibility(currentStatus: accessibilityStatus) {
+            let options = [
+                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true,
+            ] as CFDictionary
+            return AXIsProcessTrustedWithOptions(options)
+        }
+    }
+
+    @discardableResult
+    static func requestAccessibility(
+        currentStatus: PermissionStatus,
+        prompt: () -> Bool
+    ) -> Bool {
+        switch accessibilityAction(for: currentStatus) {
+        case .alreadyGranted:
+            return true
+        case .requestAccess:
+            return prompt()
+        }
     }
 
     // MARK: - Calendar
@@ -121,12 +191,22 @@ enum Permissions {
         "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
     ]
 
+    static let accessibilitySettingsURLStrings = [
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+    ]
+
     static func openSystemAudioRecordingSettings() {
         openSettings(urlStrings: systemAudioRecordingSettingsURLStrings)
     }
 
     static func openScreenRecordingSettings() {
         openSettings(urlStrings: screenRecordingSettingsURLStrings)
+    }
+
+    static func openAccessibilitySettings() {
+        openSettings(urlStrings: accessibilitySettingsURLStrings)
     }
 
     private static func openSettings(urlStrings: [String]) {

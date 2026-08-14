@@ -901,4 +901,132 @@ struct TranscriptionManagerRealtimeOwnershipTests {
         let elapsed = startedAt.duration(to: clock.now)
         #expect(elapsed < .milliseconds(300))
     }
+
+    @Test func silentHealthyStreamSurvivesWatchdogWithoutFailure() async throws {
+        let service = ControlledRealtimeService()
+        let factory = RealtimeServiceFactorySpy([service])
+        let manager = TranscriptionManager(
+            realtimeServiceFactory: factory.makeFactory(),
+            realtimeWatchdogDelay: .milliseconds(40)
+        )
+
+        let start = Task { @MainActor in
+            try await manager.startRealtime(provider: .openai, apiKey: "fake")
+        }
+        #expect(await waitUntil { await service.startCount == 1 })
+        await service.completeHandshake()
+        try await start.value
+
+        var failures: [AIProvider] = []
+        manager.onRealtimeFailure = { _, provider, _ in failures.append(provider) }
+        manager.sendAudio(Data([0x01]))
+        #expect(await waitUntil { await service.sentAudio == [Data([0x01])] })
+
+        // Silence: audio flows but the provider emits no deltas. The watchdog
+        // must record a diagnostic and leave the healthy session alone.
+        #expect(await waitUntil { manager.realtimeError != nil })
+        try? await Task.sleep(for: .milliseconds(60))
+        #expect(failures.isEmpty)
+        #expect(manager.isTranscribing)
+
+        // First speech clears the diagnostic and keeps the same session.
+        await service.emit("HELLO")
+        #expect(await waitUntil { manager.fullText == "HELLO" })
+        #expect(manager.realtimeError == nil)
+        #expect(failures.isEmpty)
+        #expect(manager.isTranscribing)
+        await manager.stopRealtime(abandonStartup: true)
+    }
+
+    @Test func speechWithoutTextFailsTheWatchdog() async throws {
+        let service = ControlledRealtimeService()
+        let factory = RealtimeServiceFactorySpy([service])
+        let manager = TranscriptionManager(
+            realtimeServiceFactory: factory.makeFactory(),
+            realtimeWatchdogDelay: .milliseconds(40)
+        )
+
+        let start = Task { @MainActor in
+            try await manager.startRealtime(provider: .openai, apiKey: "fake")
+        }
+        #expect(await waitUntil { await service.startCount == 1 })
+        await service.completeHandshake()
+        try await start.value
+
+        var failures: [AIProvider] = []
+        manager.onRealtimeFailure = { _, provider, _ in failures.append(provider) }
+        // The capture side reports speech in the watchdog window. Zero deltas
+        // then means a half-open stream — the one failure mode that never
+        // produces its own error event — so the watchdog must report it
+        // instead of treating the quiet as silence.
+        manager.realtimeAudioIsSilent = { false }
+        manager.sendAudio(Data([0x01]))
+        #expect(await waitUntil { await service.sentAudio == [Data([0x01])] })
+
+        #expect(await waitUntil { failures == [.openai] })
+        #expect(manager.realtimeError != nil)
+        await manager.stopRealtime(abandonStartup: true)
+    }
+
+    @Test func firstContentDeltaReportsStreamHealthyExactlyOnce() async throws {
+        let service = ControlledRealtimeService()
+        let factory = RealtimeServiceFactorySpy([service])
+        let manager = TranscriptionManager(realtimeServiceFactory: factory.makeFactory())
+
+        let start = Task { @MainActor in
+            try await manager.startRealtime(provider: .openai, apiKey: "fake")
+        }
+        #expect(await waitUntil { await service.startCount == 1 })
+        await service.completeHandshake()
+        try await start.value
+
+        var healthySignals = 0
+        manager.onRealtimeStreamHealthy = { healthySignals += 1 }
+
+        // Empty deltas are not content and must not report health.
+        await service.emit("   ")
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(healthySignals == 0)
+
+        // An interim hypothesis is content too, but non-final deltas sit in
+        // the stream task's batch buffer until a final delta flushes them, so
+        // both arrive in one batch: FIRST reports health, FIRST-DONE must not.
+        await service.emit("FIRST", isFinal: false)
+        await service.emit("FIRST-DONE")
+        #expect(await waitUntil { manager.fullText.contains("FIRST-DONE") })
+        #expect(healthySignals == 1)
+
+        await service.emit("SECOND")
+        #expect(await waitUntil { manager.fullText.contains("SECOND") })
+        #expect(healthySignals == 1)
+        await manager.stopRealtime(abandonStartup: true)
+    }
+
+    @Test func watchdogFailureNoLongerTearsDownRealFaultReporting() async throws {
+        // A genuine stream fault after the silent watchdog window must still
+        // reach onRealtimeFailure through the stream task.
+        let service = ControlledRealtimeService()
+        let factory = RealtimeServiceFactorySpy([service])
+        let manager = TranscriptionManager(
+            realtimeServiceFactory: factory.makeFactory(),
+            realtimeWatchdogDelay: .milliseconds(40)
+        )
+
+        let start = Task { @MainActor in
+            try await manager.startRealtime(provider: .openai, apiKey: "fake")
+        }
+        #expect(await waitUntil { await service.startCount == 1 })
+        await service.completeHandshake()
+        try await start.value
+
+        var failures: [AIProvider] = []
+        manager.onRealtimeFailure = { _, provider, _ in failures.append(provider) }
+        manager.sendAudio(Data([0x01]))
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(failures.isEmpty)
+
+        await service.failStream()
+        #expect(await waitUntil { failures == [.openai] })
+        manager.reset()
+    }
 }

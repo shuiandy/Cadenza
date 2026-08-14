@@ -46,6 +46,13 @@ struct M1StorageMigration {
         let audioDirectoryState: () -> Profile.AudioDirectory
         let scopedDefaults: ProfileScopedDefaults
         let now: @Sendable () -> Date
+        /// Adopts pre-profile MCP credentials into the active profile. Defaults
+        /// to `nil` — no adoption — so a test that does not opt in can never
+        /// reach `UserDefaults.standard` or the live Keychain: the concrete
+        /// Keychain store only switches to its in-memory backend under an
+        /// isolated data root, which the normal test scheme does not set.
+        /// Production wires the real one in `ProfileBootstrap`.
+        var mcpCredentials: MCPCredentialMigration? = nil
     }
 
     enum Outcome: Equatable {

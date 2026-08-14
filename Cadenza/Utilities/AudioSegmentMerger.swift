@@ -294,12 +294,17 @@ enum AudioSegmentMerger {
                 deadline: deadline,
                 timeoutSeconds: timeoutSeconds
             )
-            guard durationsMatch(
+            let durationsAgree = durationsMatch(
                 outputDuration: outputDuration,
-                expectedDuration: cumulativeOffset.seconds
-            ), validationStart == validationEnd else {
+                expectedDuration: cumulativeOffset.seconds,
+                boundaries: max(0, segments.count - 1)
+            )
+            guard durationsAgree, validationStart == validationEnd else {
                 throw MergeError.exportFailed(
                     "created output changed or has incomplete duration"
+                    + " (output=\(outputDuration) expected=\(cumulativeOffset.seconds)"
+                    + " durationsAgree=\(durationsAgree)"
+                    + " stable=\(validationStart == validationEnd))"
                 )
             }
 
@@ -497,14 +502,34 @@ enum AudioSegmentMerger {
     /// a fully decodable prefix must never be accepted as a complete merge.
     static func durationsMatch(
         outputDuration: TimeInterval,
-        expectedDuration: TimeInterval
+        expectedDuration: TimeInterval,
+        boundaries: Int
     ) -> Bool {
-        let maximumAACContainerDrift: TimeInterval = 0.1
         return outputDuration.isFinite
             && expectedDuration.isFinite
             && outputDuration > 0
             && expectedDuration > 0
-            && abs(outputDuration - expectedDuration) <= maximumAACContainerDrift
+            && abs(outputDuration - expectedDuration) <= driftAllowance(boundaries: boundaries)
+    }
+
+    /// A fixed allowance cannot work: every segment boundary contributes its own
+    /// container rounding, so the error a correct merge accumulates grows with
+    /// the number of joins. The old flat 0.1 s rejected a valid 28.8-minute
+    /// two-track merge that was 0.76 s off (2026-08-10), stranding the
+    /// recording.
+    ///
+    /// The allowance is tied to the boundary count rather than to wall-clock
+    /// duration, because boundaries are what actually produce the error: a long
+    /// recording with few joins should stay strict, and scaling with duration
+    /// instead would quietly accept a multi-second tail truncation. Roughly two
+    /// AAC frames (1024 samples at 48 kHz ≈ 21 ms) per join.
+    ///
+    /// The ceiling keeps the guard meaningful: never tolerate half a segment, so
+    /// an export that dropped a whole segment is still caught at any length.
+    static func driftAllowance(boundaries: Int) -> TimeInterval {
+        let perBoundary: TimeInterval = 0.05
+        let scaled = max(0.1, TimeInterval(max(0, boundaries)) * perBoundary)
+        return min(SegmentedAudioFileWriter.segmentDuration / 2, scaled)
     }
 
     static func isCompletedWriterStatus(_ status: AVAssetWriter.Status) -> Bool {
