@@ -9,24 +9,28 @@
   </picture>
 </h1>
 
-**Turn meetings into useful knowledge without turning them into someone else’s data.**
+**AI meeting transcription for the Mac — and the transcript stays yours.**
 
-Cadenza is a privacy-first meeting workspace built for the Mac. It captures system audio,
-transcribes locally, remembers speakers, and turns conversations into searchable decisions
-and action items. On supported Macs, the complete path from recording to transcript,
-summary, chat, and export can run locally. No Cadenza account or hosted backend is required.
+Cadenza records your meetings, transcribes them with AI, tells the speakers apart, and turns
+the result into a searchable transcript with a structured summary, decisions, and action
+items. Choose the engine that fits the meeting: **Whisper** and **Apple Speech** transcribe
+entirely on-device, **OpenAI** and **Gemini** are there when you want a cloud model. On
+supported Macs the whole path — recording, transcription, summary, chat, export — runs
+locally, with no Cadenza account and no hosted backend.
 
-**Local-first when you want it. Provider choice when you need it. A self-hostable web path
-for the future.**
+**record → AI transcript → speaker labels → summary · decisions · action items → search & export**
 
 ![macOS 26+](https://img.shields.io/badge/macOS-26%2B-000000?style=flat-square&logo=apple)
+![AI transcription](https://img.shields.io/badge/AI-transcription%20%2B%20diarization-5856d6?style=flat-square)
+![On-device](https://img.shields.io/badge/on--device-Whisper%20%C2%B7%20Apple%20Speech-34c759?style=flat-square)
 ![Swift 6](https://img.shields.io/badge/Swift-6.0-F05138?style=flat-square&logo=swift&logoColor=white)
 ![SwiftUI](https://img.shields.io/badge/SwiftUI-SwiftData-0071e3?style=flat-square)
-![Local-first](https://img.shields.io/badge/local--first-privacy-34c759?style=flat-square)
 
 <br>
 
-<img src="docs/screenshots/01-library.jpg" alt="Cadenza library — recordings as cards with duration, date, and tags" width="100%">
+<img src="docs/screenshots/03-transcript.jpg" alt="Cadenza transcript view with speaker distribution and per-speaker timestamped segments" width="100%">
+
+<p align="center"><em>Speaker-attributed, timestamped transcript — produced on-device by default.</em></p>
 
 </div>
 
@@ -34,11 +38,13 @@ for the future.**
 
 ## Why
 
-Most meeting assistants begin with a hosted service. Cadenza begins with your Mac. It does
-not require a Cadenza account or a hosted backend to record, organize, transcribe, search,
-or export your meetings. When you enable meeting detection, it runs quietly in the
-background, decides when a meeting is actually happening, and produces the artifact you
-would have written by hand: an overview, decisions, and clear ownership of next steps.
+Meeting transcription usually means uploading the room's audio to someone else's service.
+Cadenza runs the same pipeline on your Mac: the AI that turns speech into text, the model
+that separates the speakers, and the model that writes the summary can all execute
+on-device, with no Cadenza account and no hosted backend. When you enable meeting
+detection, it runs quietly in the background, decides when a meeting is actually happening,
+and produces the artifact you would have written by hand: a full transcript, an overview,
+the decisions, and clear ownership of next steps.
 
 ### Privacy-first by design
 
@@ -57,33 +63,10 @@ would have written by hand: an overview, decisions, and clear ownership of next 
 
 ## Features
 
-### Optional automatic recording
+### AI transcription
 
-- **Confidence-scored meeting detection.** Once you enable detection, Cadenza scores
-  several signals — per-process microphone use, an active calendar event, meeting-window
-  structure, system microphone state — and, if automatic recording is enabled, starts
-  only when the combined score clears a threshold. Debounce, a grace period, and a minimum
-  active hold keep it from flapping on transient signals.
-- **System audio + microphone.** Captured through a Core Audio process tap, mixed into a
-  single track. The microphone is optional and off by default.
-- **Segmented writes.** After the recording has been durably registered, audio lands on disk
-  every 30 seconds and unmerged segments can be recovered on the next launch.
-- **Knows when to stop.** Auto-stop follows the same signals in reverse, with a silence
-  watchdog for the case where a call ends but nothing else changes. Trailing silence is
-  trimmed before the segments are merged.
-
-### Stay in the meeting
-
-The floating recording overlay keeps the essential controls in reach without pulling you
-back into the library. See capture status and elapsed time, switch the microphone, pause or
-stop, follow the live transcript, and ask what you missed while the conversation is still
-happening.
-
-<img src="docs/screenshots/05-recording-overlay.jpg" alt="Cadenza floating recording overlay with capture controls, live transcript status, and in-meeting questions" width="100%">
-
-<p align="center"><em>Capture controls, live context, and meeting-aware questions without leaving the conversation.</em></p>
-
-### Transcription
+Four interchangeable engines, two of which never leave the machine. Apple Speech is the
+default, so transcription is on-device until you choose otherwise:
 
 | Engine | Runs | Notes |
 | --- | --- | --- |
@@ -92,11 +75,13 @@ happening.
 | OpenAI | Cloud | Includes diarization-capable models |
 | Gemini | Cloud | Batch and realtime |
 
-Live transcription streams into the recording overlay while the meeting is still running.
-Speaker diarization runs on-device via SpeakerKit, and named speakers are remembered
-across meetings once you label them.
-
-<img src="docs/screenshots/03-transcript.jpg" alt="Transcript view with speaker distribution and per-speaker timestamped segments" width="100%">
+- **Live transcription.** Text streams into the recording overlay while the meeting is still
+  running, so you can read back the last minute without waiting for the file to finish.
+- **Speaker diarization on-device.** SpeakerKit separates the voices locally; once you name
+  a speaker, Cadenza recognizes them in later meetings and attributes their lines
+  automatically.
+- **A transcript you can work with.** Timestamped segments per speaker, speaker-time
+  distribution, full-text search across the library, and export to txt, SRT, or Markdown.
 
 ### Summaries and AI
 
@@ -121,11 +106,41 @@ across meetings once you label them.
 </tr>
 </table>
 
+### Stay in the meeting
+
+The floating recording overlay keeps the essential controls in reach without pulling you
+back into the library. See capture status and elapsed time, switch the microphone, pause or
+stop, follow the live transcript, and ask what you missed while the conversation is still
+happening.
+
+<img src="docs/screenshots/05-recording-overlay.jpg" alt="Cadenza floating recording overlay with capture controls, live transcript status, and in-meeting questions" width="100%">
+
+<p align="center"><em>Capture controls, live context, and meeting-aware questions without leaving the conversation.</em></p>
+
+### Optional automatic recording
+
+Transcription only helps if the recording actually started. Cadenza can decide that for you:
+
+- **Confidence-scored meeting detection.** Once you enable detection, Cadenza scores
+  several signals — per-process microphone use, an active calendar event, meeting-window
+  structure, system microphone state — and, if automatic recording is enabled, starts
+  only when the combined score clears a threshold. Debounce, a grace period, and a minimum
+  active hold keep it from flapping on transient signals.
+- **System audio + microphone.** Captured through a Core Audio process tap, mixed into a
+  single track. The microphone is optional and off by default.
+- **Segmented writes.** After the recording has been durably registered, audio lands on disk
+  every 30 seconds and unmerged segments can be recovered on the next launch.
+- **Knows when to stop.** Auto-stop follows the same signals in reverse, with a silence
+  watchdog for the case where a call ends but nothing else changes. Trailing silence is
+  trimmed before the segments are merged.
+
 ### Organization
 
 Projects and folders, smart folders, and automatic tagging. Tags are normalized through a
 shared canonicalization layer — case, separators, spelling variants, and English/Chinese
 equivalents fold together, so `1-on-1`, `1on1`, and `1:1` stay one tag instead of three.
+
+<img src="docs/screenshots/01-library.jpg" alt="Cadenza library — recordings as cards with duration, date, and tags" width="100%">
 
 ### Export and integrations
 
@@ -160,7 +175,7 @@ flowchart TB
     end
 
     subgraph post [Post-processing]
-        TR[Transcription]
+        TR[AI transcription<br/>on-device or cloud]
         SD[Speaker diarization<br/>on-device]
         SUM[Summary]
         TR --> SD --> SUM

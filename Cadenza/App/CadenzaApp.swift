@@ -140,6 +140,27 @@ struct CadenzaApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var runtime: AppRuntime = {
+        if !AppState.isRunningTests, case .inactive = DebugDataRoot.configuration {
+            let defaults = CadenzaApp.rootAppStorageDefaults
+            if FirstLaunchOnboarding.shouldRecordStartedVersion(
+                completedVersion: defaults.integer(
+                    forKey: FirstLaunchOnboarding.completionVersionKey
+                ),
+                startedVersion: defaults.integer(
+                    forKey: FirstLaunchOnboarding.startedVersionKey
+                ),
+                hasPriorInstallationEvidence: ProfileBootstrap
+                    .hasPriorInstallationEvidenceLive()
+            ) {
+                // Persist before bootstrap creates the registry. If launch is
+                // interrupted anywhere afterwards, setup resumes next time.
+                defaults.set(
+                    FirstLaunchOnboarding.currentVersion,
+                    forKey: FirstLaunchOnboarding.startedVersionKey
+                )
+            }
+        }
+
         // §5.3: the active ProfileContext is resolved before any session
         // or sync service exists. A halted boot constructs no AppState
         // and adds no writes of its own; the bootstrap or transfer that
@@ -380,6 +401,20 @@ struct CadenzaApp: App {
     private var showMenuBarIcon = true
     @AppStorage("showDockIcon", store: CadenzaApp.rootAppStorageDefaults)
     private var showDockIcon = true
+    @AppStorage(
+        FirstLaunchOnboarding.completionVersionKey,
+        store: CadenzaApp.rootAppStorageDefaults
+    ) private var onboardingCompletedVersion = 0
+    @AppStorage(
+        FirstLaunchOnboarding.startedVersionKey,
+        store: CadenzaApp.rootAppStorageDefaults
+    ) private var onboardingStartedVersion = 0
+    @State private var updateController = AppUpdateController(
+        defaults: CadenzaApp.rootAppStorageDefaults
+    )
+    @State private var onboardingLoginCoordinator: ProfileLoginCoordinator?
+    @State private var onboardingLoginTask: Task<Void, Never>?
+    @State private var showsUpdateResult = false
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
@@ -391,9 +426,53 @@ struct CadenzaApp: App {
             } else if case .halted(let reason) = runtime {
                 BootHaltView(reason: reason)
             } else if let appState = runningState {
-                MainWindow()
+                Group {
+                    if shouldPresentOnboarding(for: appState) {
+                        FirstLaunchOnboardingView(
+                            meetingDetectionEnabled: AppState.meetingDetectionEnabled(
+                                in: .standard
+                            ),
+                            captureMicrophoneEnabled: CadenzaApp.rootAppStorageDefaults
+                                .bool(forKey: "captureMicrophone"),
+                            accountIsConfigured: appState.profileBootContext?
+                                .profile?.boundAccount != nil,
+                            onComplete: { choices in
+                                completeOnboarding(choices, appState: appState)
+                            }
+                        )
+                        .onAppear {
+                            if onboardingStartedVersion < FirstLaunchOnboarding.currentVersion {
+                                onboardingStartedVersion = FirstLaunchOnboarding.currentVersion
+                            }
+                        }
+                    } else {
+                        MainWindow()
+                    }
+                }
                     .environment(appState)
+                    .environment(updateController)
                     .frame(minWidth: 800, minHeight: 600)
+                    .sheet(item: $onboardingLoginCoordinator) { coordinator in
+                        ProfileLoginSheet(coordinator: coordinator) {
+                            onboardingLoginTask?.cancel()
+                            onboardingLoginTask = nil
+                            onboardingLoginCoordinator = nil
+                        }
+                    }
+                    .alert(
+                        updateAlertTitle,
+                        isPresented: $showsUpdateResult
+                    ) {
+                        if case .updateAvailable = updateController.state,
+                           let releaseURL = updateController.availableReleaseURL {
+                            Button(onboardingText("View Release")) {
+                                NSWorkspace.shared.open(releaseURL)
+                            }
+                        }
+                        Button(onboardingText("Not now"), role: .cancel) {}
+                    } message: {
+                        Text(updateAlertMessage)
+                    }
                     .onAppear {
                         setupIfNeeded()
                         applyTheme(appTheme)
@@ -416,6 +495,16 @@ struct CadenzaApp: App {
                             OAuthCoordinator.shared.attachAnchor { @MainActor [weak appState] in
                                 appState?.bringMainWindowToFront()
                             }
+                        }
+                    }
+                    .task(id: onboardingCompletedVersion) {
+                        guard appState.startupPolicy.externalAccessEnabled,
+                              !shouldPresentOnboarding(for: appState) else { return }
+                        await updateController.monitorAutomaticChecks()
+                    }
+                    .onChange(of: updateController.state) { _, newState in
+                        if case .updateAvailable = newState {
+                            showsUpdateResult = true
                         }
                     }
                     .onChange(of: appIconVariant) { _, newValue in
@@ -446,6 +535,18 @@ struct CadenzaApp: App {
                         runningState?.importAudioFiles()
                     }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
+                }
+                CommandGroup(after: .appInfo) {
+                    Button(onboardingText("Check for Updates…")) {
+                        Task {
+                            await updateController.checkManually()
+                            showsUpdateResult = true
+                        }
+                    }
+                    .disabled(
+                        updateCheckIsRunning
+                            || runningState?.startupPolicy.externalAccessEnabled != true
+                    )
                 }
             }
         }
@@ -482,6 +583,79 @@ struct CadenzaApp: App {
         if !appState.hasBeenSetUp {
             Task { await appState.setup() }
         }
+    }
+
+    private func shouldPresentOnboarding(for appState: AppState) -> Bool {
+        if FirstLaunchOnboardingView.previewOverrideEnabled {
+            return true
+        }
+        guard case .profile = appState.profileBootContext?.mode else { return false }
+        return FirstLaunchOnboarding.shouldPresent(
+            completedVersion: onboardingCompletedVersion,
+            startedVersion: onboardingStartedVersion,
+            allowsOnboarding: appState.startupPolicy == .standard
+        )
+    }
+
+    private func completeOnboarding(_ choices: OnboardingChoices, appState: AppState) {
+        CadenzaApp.rootAppStorageDefaults.set(
+            choices.meetingDetectionEnabled,
+            forKey: "enableMeetingDetection"
+        )
+        appState.setMeetingDetectionEnabled(choices.meetingDetectionEnabled)
+        CadenzaApp.rootAppStorageDefaults.set(
+            choices.captureMicrophoneEnabled,
+            forKey: "captureMicrophone"
+        )
+
+        // Account binding may relaunch the app, so completion is durable first.
+        onboardingCompletedVersion = FirstLaunchOnboarding.currentVersion
+
+        guard choices.wantsAccount,
+              let coordinator = appState.makeProfileLoginCoordinator() else { return }
+        onboardingLoginCoordinator = coordinator
+        onboardingLoginTask = Task { await coordinator.begin() }
+    }
+
+    private var updateCheckIsRunning: Bool {
+        if case .checking = updateController.state { return true }
+        return false
+    }
+
+    private var updateAlertTitle: String {
+        switch updateController.state {
+        case .updateAvailable:
+            onboardingText("A new Cadenza version is available")
+        case .upToDate:
+            onboardingText("Cadenza is up to date")
+        case .failed:
+            onboardingText("Could not check for updates")
+        case .idle, .checking:
+            onboardingText("Check for Updates")
+        }
+    }
+
+    private var updateAlertMessage: String {
+        switch updateController.state {
+        case .updateAvailable:
+            if let release = updateController.availableRelease {
+                onboardingText("Version \(release.version) is ready on GitHub Releases.")
+            } else {
+                onboardingText("A new Cadenza version is available.")
+            }
+        case .upToDate:
+            onboardingText("You are using the newest available version.")
+        case .failed:
+            onboardingText("Could not reach GitHub Releases. Check your connection and try again.")
+        case .idle:
+            onboardingText("No update check has run yet.")
+        case .checking:
+            onboardingText("Checking for a newer release…")
+        }
+    }
+
+    private func onboardingText(_ key: String.LocalizationValue) -> String {
+        String(localized: key, table: "Onboarding")
     }
 
     private func applyTheme(_ theme: AppTheme) {
@@ -553,6 +727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "showMenuBarIcon": true,
             "showDockIcon": true,
             "enableMeetingDetection": false,
+            AppUpdateController.automaticChecksEnabledKey: true,
             "appIconVariant": AppIconVariant.classic.rawValue,
             "runInBackground": false,
             "openMainWindowOnLaunch": true,

@@ -305,7 +305,7 @@ struct ProfilesSettingsSection: View {
 
 extension ProfileLoginCoordinator: Identifiable {}
 
-private struct ProfileLoginSheet: View {
+struct ProfileLoginSheet: View {
     let coordinator: ProfileLoginCoordinator
     let dismiss: () -> Void
     @State private var confirmingMove = false

@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import AVFoundation
+import UserNotifications
 
 /// One-shot payload carrying an in-progress chat from FloatingAIChatButton to AIChatView.
 struct AIChatHandoff {
@@ -372,6 +373,7 @@ final class AppState {
     // Permissions (checked directly in main process)
     var hasMicrophonePermission: Bool = false
     var hasScreenRecordingPermission: Bool = false
+    var hasAccessibilityPermission: Bool = false
     var hasCalendarPermission: Bool = false
     var calendarPermissionStatus: PermissionStatus = .notDetermined
 
@@ -479,6 +481,10 @@ final class AppState {
     var stopRequestTime: Date?
     private var globalHotkeyMonitor: Any?
     private var localHotkeyMonitor: Any?
+    /// Tracks the monitor lifecycle separately from the opaque monitor tokens.
+    /// AppKit can return `nil` for a global key monitor before Accessibility is
+    /// granted, but a later grant must still retry the registration exactly once.
+    private var areGlobalHotkeysRegistered = false
     private var isMeetingDetectionActive = false
 
     // MARK: - Window helper for OAuth presentation anchors
@@ -669,15 +675,11 @@ final class AppState {
         recordingEngine.isStopping
     }
 
-    /// A post-processing job owns the transcription/summary pipeline and must
-    /// finish before any new capture can begin. The engine repeats this gate so
-    /// automatic meeting starts cannot bypass the AppState command surface.
-    var isPostProcessingRecordingStartBlocked: Bool {
-        coordinator?.hasActiveWork == true
-    }
-
+    /// Capture is only unavailable while the previous recording's durable stop
+    /// finalization runs. Post-processing (transcription/summary) proceeds in
+    /// parallel with a new recording and never blocks the start controls.
     var isRecordingStartBlocked: Bool {
-        isFinalizingRecording || isPostProcessingRecordingStartBlocked
+        isFinalizingRecording
     }
 
     var recordingStartBlockReason: String? {
@@ -928,6 +930,11 @@ final class AppState {
         }
         coordinator.onRecordingDiscarded = { [weak self] recordingID, reason in
             self?.recordingDiscardedReason = reason
+            // The toolbar banner above is invisible when the discard follows an
+            // auto-started/auto-stopped recording with no window open — the
+            // 2026-08-13 silent-opening incident trashed a meeting recording
+            // without the user ever noticing. A notification survives that.
+            self?.notifyRecordingDiscarded(reason: reason)
             // Only navigate away if we're viewing the specific discarded recording
             if case .recordingDetail(let viewingID) = self?.activeDestination, viewingID == recordingID {
                 self?.closeDetail()
@@ -1136,6 +1143,50 @@ final class AppState {
         detectNotionForcedReconnect()
     }
 
+    /// Post a user notification when post-processing moves a recording to
+    /// Trash (too short / empty transcript). The in-window toolbar banner is
+    /// the primary surface, but auto-started recordings are typically discarded
+    /// with no window open, so this is the only signal the user ever gets that
+    /// a recording existed and where to recover it.
+    private func notifyRecordingDiscarded(reason: String) {
+        guard !AppState.isRunningTests else { return }
+        Task {
+            let center = UNUserNotificationCenter.current()
+            // Nothing in the app requests notification authorization up front,
+            // so the first discard would otherwise fail with notDetermined and
+            // the user would never learn a recording went to Trash. Provisional
+            // authorization delivers quietly (Notification Center, no system
+            // prompt); the user can upgrade it in System Settings.
+            let settings = await center.notificationSettings()
+            if settings.authorizationStatus == .notDetermined {
+                do {
+                    _ = try await center.requestAuthorization(
+                        options: [.alert, .sound, .provisional]
+                    )
+                } catch {
+                    NSLog("[AppState] notification authorization failed: %@", error.localizedDescription)
+                }
+            }
+            let content = UNMutableNotificationContent()
+            // UNMutableNotificationContent takes plain String rather than a
+            // LocalizedStringKey, so notification copy must resolve explicitly.
+            content.title = String(localized: "Recording moved to Trash")
+            content.body = reason
+            let request = UNNotificationRequest(
+                identifier: "recordingDiscarded-\(UUID().uuidString)",
+                content: content,
+                trigger: nil
+            )
+            do {
+                try await center.add(request)
+            } catch {
+                // Denied or restricted: the toolbar banner remains the only
+                // surface. Record why so a silent discard stays diagnosable.
+                NSLog("[AppState] discard notification not delivered: %@", error.localizedDescription)
+            }
+        }
+    }
+
     // MARK: - MCP Server
 
     /// Reconcile the MCP server with current settings. Called at startup and
@@ -1310,12 +1361,28 @@ final class AppState {
 
     // MARK: - Permissions (direct — no XPC)
 
+    nonisolated static func accessibilityPermissionWasGranted(
+        previouslyGranted: Bool,
+        currentStatus: PermissionStatus
+    ) -> Bool {
+        !previouslyGranted && currentStatus == .granted
+    }
+
     @discardableResult
     func checkPermissions() async -> Bool {
         guard startupPolicy.checksPermissions else { return false }
         let previouslyHadCalendarPermission = hasCalendarPermission
         hasMicrophonePermission = Permissions.microphoneStatus == .granted
         hasScreenRecordingPermission = await Permissions.checkScreenRecording()
+        let accessibilityStatus = Permissions.accessibilityStatus
+        let accessibilityWasGranted = Self.accessibilityPermissionWasGranted(
+            previouslyGranted: hasAccessibilityPermission,
+            currentStatus: accessibilityStatus
+        )
+        hasAccessibilityPermission = accessibilityStatus == .granted
+        if accessibilityWasGranted {
+            refreshGlobalHotkeysForAccessibility()
+        }
         let calendarStatus = Permissions.calendarStatus()
         calendarPermissionStatus = calendarStatus
         hasCalendarPermission = calendarStatus == .granted
@@ -1356,19 +1423,19 @@ final class AppState {
         guard profileTransitionPhase == .idle else {
             throw ProfileTransitionHaltedError()
         }
-        guard !isPostProcessingRecordingStartBlocked else {
-            throw RecordingStartError.finalizationInProgress
-        }
         stopRequestTime = nil
         try await recordingEngine.startRecording(meetingName: meetingName, captureMicrophone: captureMicrophone)
     }
 
-    func prepareSystemAudioCapture() async {
-        guard startupPolicy.allowsHardwareCapture else { return }
+    @discardableResult
+    func prepareSystemAudioCapture() async -> Bool {
+        guard startupPolicy.allowsHardwareCapture else { return false }
         do {
             try await recordingEngine.prepareSystemAudioCapture()
+            return true
         } catch {
             recordingEngine.presentStartError(error)
+            return false
         }
     }
 
@@ -3283,6 +3350,10 @@ final class AppState {
     // MARK: - Global Hotkeys
 
     private func registerGlobalHotkeys() {
+        guard startupPolicy.registersGlobalHotkeys,
+              !areGlobalHotkeysRegistered else { return }
+        areGlobalHotkeysRegistered = true
+
         // ⌘⇧R — toggle recording
         // ⌘⇧P — pause/resume
 
@@ -3295,6 +3366,19 @@ final class AppState {
             self?.handleHotkeyEvent(event)
             return event
         }
+    }
+
+    /// Rebuild the event monitors after Accessibility changes from unavailable
+    /// to granted. During initial setup `checkPermissions()` runs before monitor
+    /// registration, so this deliberately does nothing until registration owns
+    /// the lifecycle. Subsequent calls are safe because registration is itself
+    /// idempotent.
+    func refreshGlobalHotkeysForAccessibility() {
+        guard startupPolicy.registersGlobalHotkeys,
+              areGlobalHotkeysRegistered else { return }
+        removeGlobalHotkeyMonitorTokens()
+        areGlobalHotkeysRegistered = false
+        registerGlobalHotkeys()
     }
 
     private func handleHotkeyEvent(_ event: NSEvent) {
@@ -3347,6 +3431,11 @@ final class AppState {
     }
 
     func removeGlobalHotkeys() {
+        removeGlobalHotkeyMonitorTokens()
+        areGlobalHotkeysRegistered = false
+    }
+
+    private func removeGlobalHotkeyMonitorTokens() {
         if let monitor = globalHotkeyMonitor {
             NSEvent.removeMonitor(monitor)
             globalHotkeyMonitor = nil

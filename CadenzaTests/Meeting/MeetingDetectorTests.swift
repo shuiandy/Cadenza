@@ -24,6 +24,28 @@ struct MeetingDetectorTests {
 
     // MARK: - resetNotificationState
 
+    @Test func startMonitoringIsIdempotent() {
+        let (detector, _, listener) = makeDetector()
+        defer { detector.stopMonitoring() }
+
+        detector.startMonitoring()
+        detector.startMonitoring()
+
+        #expect(listener.startCount == 1)
+    }
+
+    @Test func monitoringCanRestartAfterStop() {
+        let (detector, _, listener) = makeDetector()
+        defer { detector.stopMonitoring() }
+
+        detector.startMonitoring()
+        detector.stopMonitoring()
+        detector.startMonitoring()
+
+        #expect(listener.startCount == 2)
+        #expect(listener.stopCount == 1)
+    }
+
     @Test func appPollRefreshesPIDForAnExistingBundleID() {
         let (detector, _, _) = makeDetector()
         detector._test_setRunningMeetingApps([
@@ -1684,6 +1706,234 @@ struct MeetingDetectorTests {
 
         #expect(!detector.sessionState.isActive)
         _ = terminatedBundleID
+    }
+
+    // MARK: - System-mic keep-alive (silent opening)
+
+    /// Regression for the 2026-08-13 silent-opening incident: the user joined a
+    /// scheduled Teams call and waited muted. The session went active on
+    /// calendar (+2, generic match — the event names no app so the Teams-only
+    /// keepalives never apply) + window (+1). Nobody spoke, so no app-owned
+    /// audio evidence ever appeared, and the call window collapsed to a
+    /// non-call shape. At min-hold expiry the raw score was 2 < 3 and the
+    /// detector declared signalDrop, killing the recording (later silently
+    /// trashed as empty). With the mic still occupied, the system-mic
+    /// keep-alive must close the one-point gap and keep the session active.
+    @Test func active_silentOpeningAfterMinHold_systemMicClosesOnePointGap() {
+        let (detector, query, _) = makeDetector()
+        query.activeInputBundleIDs = []
+        query.activeOutputBundleIDs = []
+        detector._test_setRunningMeetingApps([
+            .init(id: "com.microsoft.teams2", app: .teams, name: "Microsoft Teams", pid: pid_t(4242))
+        ])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSessionState(.active(app: .teams))
+        detector._test_setSystemMicActivity(true)
+        // Min-hold just expired — the hold is not what keeps it alive.
+        detector._test_setActiveSince(Date().addingTimeInterval(-91))
+        detector.currentCalendarMeeting = MeetingEventDTO(
+            id: "silent-opening",
+            title: "Weekly Sync",
+            startDate: Date().addingTimeInterval(-120),
+            endDate: Date().addingTimeInterval(1800),
+            meetingURL: nil,
+            meetingApp: nil,
+            calendarName: "Work",
+            notes: nil,
+            source: "apple",
+            calendarID: "work",
+            defaultColorHex: "",
+            organizer: nil,
+            attendees: [],
+            isRecurring: false,
+            location: nil
+        )
+
+        var endingCalled = false
+        detector.onMeetingEnding = { _ in endingCalled = true }
+
+        detector._test_evaluateConfidence(windows: [])
+
+        #expect(detector.sessionState.isActive)
+        #expect(!endingCalled)
+    }
+
+    /// A window flicker (minimize / shape change) while the user is muted must
+    /// not end the session as long as the mic stays occupied and the calendar
+    /// still carries the rest of the score.
+    @Test func active_windowFlickerWithCalendarAndSystemMic_doesNotEnd() {
+        let (detector, query, _) = makeDetector()
+        query.activeInputBundleIDs = []
+        query.activeOutputBundleIDs = []
+        detector._test_setRunningMeetingApps([
+            .init(id: "com.microsoft.teams2", app: .teams, name: "Microsoft Teams", pid: pid_t(4242))
+        ])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSessionState(.active(app: .teams))
+        detector._test_setSystemMicActivity(true)
+        // Well past min-hold, so only the keep-alive can carry the flicker.
+        detector._test_setActiveSince(Date().addingTimeInterval(-600))
+        detector.currentCalendarMeeting = MeetingEventDTO(
+            id: "window-flicker",
+            title: "Weekly Sync",
+            startDate: Date().addingTimeInterval(-600),
+            endDate: Date().addingTimeInterval(1800),
+            meetingURL: nil,
+            meetingApp: nil,
+            calendarName: "Work",
+            notes: nil,
+            source: "apple",
+            calendarID: "work",
+            defaultColorHex: "",
+            organizer: nil,
+            attendees: [],
+            isRecurring: false,
+            location: nil
+        )
+
+        let callWindows = [
+            CGWindowEnumerator.EnumeratedWindow(
+                pid: pid_t(4242),
+                snapshot: .init(
+                    title: "Call with Teammate | Microsoft Teams",
+                    width: 1689,
+                    height: 1056,
+                    isOnScreen: true
+                )
+            )
+        ]
+
+        var endingCalled = false
+        detector.onMeetingEnding = { _ in endingCalled = true }
+
+        detector._test_evaluateConfidence(windows: callWindows)
+        #expect(detector.sessionState.isActive)
+
+        // Window disappears for a tick (score 5 → 2) while the mic stays busy.
+        detector._test_evaluateConfidence(windows: [])
+
+        #expect(detector.sessionState.isActive)
+        #expect(!endingCalled)
+    }
+
+    /// The system-mic keep-alive is capped: a session whose call actually ended
+    /// silently (no assertion, no per-process mic ever) must not stay pinned
+    /// until the calendar event runs out just because Cadenza's own capture
+    /// keeps the system-wide mic signal true.
+    @Test func active_systemMicKeepAliveExpires_progressesToEnding() {
+        let (detector, query, _) = makeDetector()
+        query.activeInputBundleIDs = []
+        query.activeOutputBundleIDs = []
+        detector._test_setRunningMeetingApps([
+            .init(id: "com.microsoft.teams2", app: .teams, name: "Microsoft Teams", pid: pid_t(4242))
+        ])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSessionState(.active(app: .teams))
+        detector._test_setSystemMicActivity(true)
+        detector._test_setActiveSince(Date().addingTimeInterval(-700))
+        detector.currentCalendarMeeting = MeetingEventDTO(
+            id: "silent-opening-expired",
+            title: "Weekly Sync",
+            startDate: Date().addingTimeInterval(-700),
+            endDate: Date().addingTimeInterval(1800),
+            meetingURL: nil,
+            meetingApp: nil,
+            calendarName: "Work",
+            notes: nil,
+            source: "apple",
+            calendarID: "work",
+            defaultColorHex: "",
+            organizer: nil,
+            attendees: [],
+            isRecurring: false,
+            location: nil
+        )
+        // Just past the 600s cap (fails if the cap regresses upward).
+        detector._test_setSystemMicKeepAliveSince(Date().addingTimeInterval(-601))
+
+        var endingCalled = false
+        detector.onMeetingEnding = { _ in endingCalled = true }
+
+        detector._test_evaluateConfidence(windows: [])
+
+        #expect(detector.sessionState.isEnding)
+        #expect(endingCalled)
+    }
+
+    /// Counterpart to the silent-opening fix: with the mic NOT occupied, the
+    /// same one-point gap (calendar only, no window) must still end normally.
+    @Test func active_calendarOnlyWithoutSystemMic_entersEnding() {
+        let (detector, query, _) = makeDetector()
+        query.activeInputBundleIDs = []
+        query.activeOutputBundleIDs = []
+        detector._test_setRunningMeetingApps([
+            .init(id: "com.microsoft.teams2", app: .teams, name: "Microsoft Teams", pid: pid_t(4242))
+        ])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSessionState(.active(app: .teams))
+        detector._test_setSystemMicActivity(false)
+        detector._test_setActiveSince(Date().addingTimeInterval(-91))
+        detector.currentCalendarMeeting = MeetingEventDTO(
+            id: "no-mic",
+            title: "Weekly Sync",
+            startDate: Date().addingTimeInterval(-120),
+            endDate: Date().addingTimeInterval(1800),
+            meetingURL: nil,
+            meetingApp: nil,
+            calendarName: "Work",
+            notes: nil,
+            source: "apple",
+            calendarID: "work",
+            defaultColorHex: "",
+            organizer: nil,
+            attendees: [],
+            isRecurring: false,
+            location: nil
+        )
+
+        var endingCalled = false
+        detector.onMeetingEnding = { _ in endingCalled = true }
+
+        detector._test_evaluateConfidence(windows: [])
+
+        #expect(detector.sessionState.isEnding)
+        #expect(endingCalled)
+    }
+
+    /// Keep-alive and triggering stay asymmetric: calendar + system mic without
+    /// a window is still one point short from idle, and the system-mic
+    /// keep-alive must never participate in idle → detected.
+    @Test func idle_calendarAndSystemMicWithoutWindow_doesNotTrigger() {
+        let (detector, query, _) = makeDetector()
+        query.activeInputBundleIDs = []
+        query.activeOutputBundleIDs = []
+        detector._test_setRunningMeetingApps([
+            .init(id: "us.zoom.xos", app: .zoom, name: "Zoom", pid: pid_t(1001))
+        ])
+        detector._test_setActiveMeetingApp(.zoom)
+        detector._test_setSessionState(.idle)
+        detector._test_setSystemMicActivity(true)
+        detector.currentCalendarMeeting = MeetingEventDTO(
+            id: "not-joined-yet",
+            title: "Weekly Sync",
+            startDate: Date().addingTimeInterval(-120),
+            endDate: Date().addingTimeInterval(1800),
+            meetingURL: nil,
+            meetingApp: nil,
+            calendarName: "Work",
+            notes: nil,
+            source: "apple",
+            calendarID: "work",
+            defaultColorHex: "",
+            organizer: nil,
+            attendees: [],
+            isRecurring: false,
+            location: nil
+        )
+
+        detector._test_evaluateConfidence(windows: [])
+
+        #expect(detector.sessionState.isIdle)
     }
 
     @Test func graceRefreshUsesCurrentWindowsBeforeDeclaringMeetingEnded() {

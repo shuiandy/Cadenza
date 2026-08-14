@@ -2,6 +2,15 @@ import Foundation
 @preconcurrency import AVFoundation
 import os
 
+/// Response *shape* only — key names, never values. A diarized response that
+/// silently stops carrying `speaker` is otherwise indistinguishable from one
+/// the local pass overwrote, and `NSLog` could not tell them apart: it is
+/// unpersisted at its default level on macOS 26 and redacted in a live stream.
+private let transcriberLog = Logger(
+    subsystem: "com.shuiandy.Cadenza",
+    category: "WhisperTranscriber"
+)
+
 /// Post-recording transcription using OpenAI Audio API.
 /// Supports chunked uploads for oversized files and long diarized recordings.
 /// Default model is gpt-4o-transcribe. Also supports gpt-4o-mini-transcribe and whisper-1.
@@ -71,7 +80,7 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
 
         // Skip entirely silent files — prevents API hallucinations from noise/silence
         if await AudioSilenceDetector.isSilent(at: url) {
-            NSLog("[WhisperTranscriber] file is silent, returning empty result")
+            transcriberLog.error("file is silent, returning empty result")
             return TranscriptResult(text: "", segments: [], language: nil, duration: nil)
         }
 
@@ -260,8 +269,11 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
         }
 
         onProgress?(0, chunkInfos.count)
-        NSLog("[WhisperTranscriber] splitting %.0fs audio into %d chunks (%.0fs each), concurrency=%d",
-              totalDuration, chunkInfos.count, chunkDuration, Self.maxConcurrency)
+        // Chunking is also what discards the provider's own speaker labels
+        // (see `speakerLabelForMergedChunks`), so record when it kicks in.
+        transcriberLog.info(
+            "splitting \(totalDuration, privacy: .public)s audio into \(chunkInfos.count, privacy: .public) chunks (\(chunkDuration, privacy: .public)s each), concurrency=\(Self.maxConcurrency, privacy: .public)"
+        )
 
         // Two permit pools: export bounds I/O, API bounds network calls.
         // This enables pipelining: chunk N uploads while chunk N+1 exports.
@@ -513,14 +525,17 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
         let duration = json["duration"] as? TimeInterval
 
         // Log top-level keys to diagnose response structure
-        NSLog("[WhisperTranscriber] response keys: %@", json.keys.sorted().joined(separator: ", "))
+        transcriberLog.info(
+            "response keys: \(json.keys.sorted().joined(separator: ", "), privacy: .public)"
+        )
 
         var segments: [TranscriptResultSegment] = []
 
         // Diarize models return "chunks" with speaker info instead of "segments"
         if let chunks = json["chunks"] as? [[String: Any]] {
-            NSLog("[WhisperTranscriber] found %d chunks, first chunk keys: %@",
-                  chunks.count, chunks.first?.keys.sorted().joined(separator: ", ") ?? "none")
+            transcriberLog.info(
+                "found \(chunks.count, privacy: .public) chunks, first chunk keys: \(chunks.first?.keys.sorted().joined(separator: ", ") ?? "none", privacy: .public)"
+            )
             for chunk in chunks {
                 let chunkText = chunk["text"] as? String ?? ""
                 let speaker = Self.normalizedSpeakerLabel(chunk["speaker"] as? String)

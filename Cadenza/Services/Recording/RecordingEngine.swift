@@ -363,6 +363,27 @@ final class RecordingEngine {
         provider: AIProvider,
         attemptID: RealtimeAttemptID
     )?
+    /// Set when the reconnect budget is exhausted. The failed attempt keeps
+    /// ownership of the manager so the saved failure can be replayed through
+    /// onRealtimeFailure once speech resumes, granting one fresh attempt
+    /// instead of writing off live captions for the rest of the recording.
+    @ObservationIgnored private var queuedRealtimeSpeechRetry: (
+        error: any Error,
+        provider: AIProvider,
+        attemptID: RealtimeAttemptID
+    )?
+    @ObservationIgnored private var lastRealtimeSpeechRetryAt: Date?
+    /// Floor between speech-triggered retries so a persistently failing
+    /// provider cannot be redialed on every audible poll tick.
+    private static let realtimeSpeechRetryMinInterval: TimeInterval = 30
+    /// Audio younger than this counts as resumed speech for the retry gate.
+    private static let realtimeSpeechRetrySilenceCeiling: TimeInterval = 1.0
+    /// The no-delta watchdog only suppresses its failure when the captured
+    /// audio was silent for at least this long when it fires — most of the
+    /// 8-second watchdog window. Any speech inside the window would have
+    /// produced deltas on a healthy stream, so a shorter silence means the
+    /// connection is half-open and the failure must be reported.
+    private static let realtimeWatchdogSilenceFloor: TimeInterval = 6.0
 #if DEBUG
     /// Deterministic scheduling seam for ownership-race regression tests.
     /// Release builds never contain or execute this hook.
@@ -727,10 +748,12 @@ extension RecordingEngine {
         activityLease = lease
 
         // Claim recording before the first suspension point. The MainActor
-        // claim is the sole bidirectional exclusion decision: once it succeeds,
-        // no automatic or manual processing operation can enter while provider
-        // resolution, permission handling, capture, or persistence awaits.
+        // claim decides ordering against reserved auto-start intents and other
+        // recording claims; post-processing already in flight never refuses a
+        // new recording, and new processing claims defer until this lease
+        // releases.
         let claimedRecordingLease: RecordingProcessingGate.RecordingLease
+        var supersededPendingMeetingAutoStart: (bundleID: String, appName: String)?
         if let reservedRecordingIntent {
             guard let recordingLease = recordingProcessingGate.claimRecording(
                 consuming: reservedRecordingIntent
@@ -742,8 +765,17 @@ extension RecordingEngine {
             }
             claimedRecordingLease = recordingLease
         } else {
+            // A manual start supersedes a queued auto-start on the same gate:
+            // the user is taking over capture right now. MeetingDetector only
+            // fires its activity callback on the idle→active transition, so a
+            // failed manual start restores the superseded pending meeting
+            // below — the ongoing meeting would never re-queue it on its own.
+            if !isAutoStarted, pendingMeetingRecordingIntent != nil {
+                supersededPendingMeetingAutoStart = pendingMeetingAutoStart
+                clearPendingMeetingAutoStart()
+            }
             guard let recordingLease = recordingProcessingGate.claimRecording() else {
-                log.notice("startRecording blocked: post-processing is still active")
+                log.notice("startRecording blocked: another recording claim is pending")
                 migrationGate.releaseActivity(activityLease)
                 activityLease = nil
                 throw RecordingStartError.finalizationInProgress
@@ -760,6 +792,25 @@ extension RecordingEngine {
                 releaseRecordingProcessingClaim()
                 migrationGate.releaseActivity(activityLease)
                 activityLease = nil
+                // The manual start that superseded a queued auto-start never
+                // became a recording. If that meeting is still running, put the
+                // pending auto-start back so the meeting isn't silently lost,
+                // and schedule the retry explicitly: the gate's all-idle edge
+                // fired before this restore, and the detector will not repeat
+                // its activity callback for a meeting that is already active.
+                // The short delay also keeps a doomed retry from stacking a
+                // second error dialog straight onto the manual start's failure.
+                if let superseded = supersededPendingMeetingAutoStart,
+                   pendingMeetingAutoStart == nil,
+                   isMeetingCurrentlyActive {
+                    setPendingMeetingAutoStart(
+                        bundleID: superseded.bundleID,
+                        appName: superseded.appName
+                    )
+                    schedulePendingMeetingAutoStartRetry(
+                        after: dependencies.now().addingTimeInterval(5)
+                    )
+                }
             }
         }
 
@@ -1371,6 +1422,29 @@ extension RecordingEngine {
         realtimeReconnectTask = nil
         isReconnectingRealtime = false
         queuedRealtimeFailure = nil
+        queuedRealtimeSpeechRetry = nil
+        lastRealtimeSpeechRetryAt = nil
+    }
+
+    /// Called from the audio-level poll. When reconnects were exhausted during
+    /// silence, resumed speech re-arms exactly one attempt: the saved terminal
+    /// failure is replayed with the budget rewound to one below the cap. If the
+    /// revived stream delivers a delta, onRealtimeStreamHealthy refills the
+    /// budget in full; if it fails again, the give-up branch re-queues here.
+    private func retryRealtimeOnSpeechIfNeeded(sustainedSilence: TimeInterval) {
+        guard recordingState == .recording,
+              let retry = queuedRealtimeSpeechRetry,
+              sustainedSilence < Self.realtimeSpeechRetrySilenceCeiling else { return }
+        let now = dependencies.now()
+        if let last = lastRealtimeSpeechRetryAt,
+           now.timeIntervalSince(last) < Self.realtimeSpeechRetryMinInterval {
+            return
+        }
+        queuedRealtimeSpeechRetry = nil
+        lastRealtimeSpeechRetryAt = now
+        realtimeReconnectCount = maxRealtimeReconnects - 1
+        log.notice("speech resumed after realtime gave up, retrying live transcription")
+        transcriptionManager.onRealtimeFailure?(retry.error, retry.provider, retry.attemptID)
     }
 
     private func isActiveRealtimeRecording(_ recordingID: UUID) -> Bool {
@@ -1437,6 +1511,21 @@ extension RecordingEngine {
             }
         }
 
+        transcriptionManager.onRealtimeStreamHealthy = { [weak self] in
+            guard let self,
+                  self.isActiveRealtimeRecording(configuration.recordingID) else { return }
+            // A delta proves this stream works end to end. Refill the budget so
+            // scattered one-off faults across a long recording never accumulate
+            // into the reconnect cap.
+            self.realtimeReconnectCount = 0
+            self.queuedRealtimeSpeechRetry = nil
+        }
+
+        transcriptionManager.realtimeAudioIsSilent = { [weak self] in
+            guard let self else { return true }
+            return self.audioMixer.sustainedSilenceDuration >= Self.realtimeWatchdogSilenceFloor
+        }
+
         transcriptionManager.onRealtimeFailure = { [weak self] error, failedProvider, failedAttemptID in
             guard let self,
                   failedProvider == configuration.selection.provider,
@@ -1457,8 +1546,9 @@ extension RecordingEngine {
             }
 
             guard self.realtimeReconnectCount < self.maxRealtimeReconnects else {
-                self.log.error("max realtime reconnect attempts reached, giving up — recording unaffected")
-                self.realtimeHint = String(localized: "Live transcription disconnected. Recording continues normally.")
+                self.log.error("max realtime reconnect attempts reached, pausing until speech resumes — recording unaffected")
+                self.realtimeHint = String(localized: "Live transcription interrupted. It will retry when the conversation resumes. Recording continues normally.")
+                self.queuedRealtimeSpeechRetry = (error, failedProvider, failedAttemptID)
                 return
             }
             self.realtimeReconnectCount += 1
@@ -1705,6 +1795,9 @@ private extension RecordingEngine {
                 if abs(level - self.audioLevel) > 0.02 {
                     self.audioLevel = level
                 }
+                self.retryRealtimeOnSpeechIfNeeded(
+                    sustainedSilence: self.audioMixer.sustainedSilenceDuration
+                )
             }
         }
         timer.resume()
@@ -1905,14 +1998,6 @@ extension RecordingEngine {
             return
         }
 
-        let recordingProcessingGate = recordingProcessingGateForNewRecording
-        bindAllIdleObserver(to: recordingProcessingGate)
-        if recordingProcessingGate.hasProcessingLeases {
-            NSLog("[RecordingEngine] handleMeetingActivity: post-processing active, preserving meeting until all-idle")
-            setPendingMeetingAutoStart(bundleID: bundleID, appName: appName)
-            return
-        }
-
         if let cooldown = detectionCooldownUntil, Date() < cooldown {
             NSLog("[RecordingEngine] handleMeetingActivity: in cooldown, will retry when ready")
             setPendingMeetingAutoStart(bundleID: bundleID, appName: appName)
@@ -2036,7 +2121,7 @@ extension RecordingEngine {
     /// Called when MeetingDetector transitions ending → idle (grace period expired).
     func handleMicDeactivated() {
         // This callback is also the authoritative re-check for a meeting that
-        // is pending behind post-processing. Clear that pending retry even
+        // is pending behind stop finalization. Clear that pending retry even
         // when no recording has started yet.
         isMeetingCurrentlyActive = false
         guard recordingState == .recording || recordingState == .paused else {
@@ -2077,16 +2162,16 @@ extension RecordingEngine {
     }
 
     /// Retry auto-recording for a meeting that was detected while the previous
-    /// recording was finalizing or post-processing was active. The pending
-    /// meeting is intentionally retained until every exclusion lease is idle.
+    /// recording was finalizing. The pending meeting is intentionally retained
+    /// until the recording lease releases; post-processing still running never
+    /// delays the retry.
     private func retryPendingMeetingAutoStartIfNeeded() {
         guard let pending = pendingMeetingAutoStart else { return }
 
         guard !isStopping,
               !isStarting,
               recordingState == .idle,
-              !recordingProcessingGateForNewRecording.hasRecordingLease,
-              !recordingProcessingGateForNewRecording.hasProcessingLeases else {
+              !recordingProcessingGateForNewRecording.hasRecordingLease else {
             return
         }
 
@@ -2169,7 +2254,7 @@ extension RecordingEngine {
                         appName: pending.meeting.appName
                     )
                 }
-                self.log.notice("auto-record deferred until recording and processing are all-idle")
+                self.log.notice("auto-record deferred until the recording lifecycle is idle")
             } catch {
                 self.log.error("auto-record failed: \(error.localizedDescription, privacy: .public)")
                 self.presentStartError(error)
@@ -2266,6 +2351,14 @@ extension RecordingEngine {
             ?? currentRealtimeAttemptID
             ?? RealtimeAttemptID()
         transcriptionManager.onRealtimeFailure?(error, provider, attemptID)
+    }
+    var _test_realtimeReconnectCount: Int { realtimeReconnectCount }
+    var _test_hasQueuedRealtimeSpeechRetry: Bool { queuedRealtimeSpeechRetry != nil }
+    func _test_triggerRealtimeStreamHealthy() {
+        transcriptionManager.onRealtimeStreamHealthy?()
+    }
+    func _test_simulateSpeechResumed(sustainedSilence: TimeInterval = 0) {
+        retryRealtimeOnSpeechIfNeeded(sustainedSilence: sustainedSilence)
     }
 
     /// Exposes the start-recording timeout wrapper so the timeout semantics can

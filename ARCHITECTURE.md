@@ -352,7 +352,7 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 - merge 失败保留 segments 目录
 - stop continuation 只在 finalize / post-process kick-off 边界之后 resume
 - 录音停止后有 10 秒 meeting detection cooldown，防止立即重触发
-- **Back-to-back 会议**：`handleMeetingActivity` 先检查 `isStopping`（存入 `pendingMeetingAutoStart`），再检查 cooldown。这保证 finalization 期间检测到的新会议不会被 cooldown 吞掉，finalization 完成后自动重新评估
+- **Back-to-back 会议**：`handleMeetingActivity` 先检查 `isStopping`（存入 `pendingMeetingAutoStart`），再检查 cooldown。这保证 finalization 期间检测到的新会议不会被 cooldown 吞掉，finalization 完成后自动重新评估。上一段录音的转录/摘要仍在跑**不推迟**新录音（见 §6.4 非对称调度）
 - `MeetingDetector.resetNotificationState()` 执行完整 cleanup（cancelGraceTimer + 恢复慢速轮询），与 `handleStateTransition` 的 ending→idle 路径一致
 
 ## 5. 转录管线
@@ -748,6 +748,32 @@ private var jobs: [UUID: ActiveJob] = [:]
 - `isPostProcessing`、`postProcessingPhase`、`transcriptionChunksXxx` 均为 computed properties，从 `jobs` 字典派生
 - cancel 一次取消所有活跃 job，resume 所有 blocked continuation，重置 slot 计数
 - detached task handle 存储在 ActiveJob 上，cancel 可传播到实际网络 I/O
+
+#### 与录音的调度关系（`RecordingProcessingGate`，非对称）
+
+`Cadenza/Shared/Services/RecordingProcessingGate.swift`（MainActor）。开源版初始提交（d0cf633）
+把录音↔后处理做成了严格双向互斥，实测把背靠背会议挡死：31 分钟录音停止后转录要跑数分钟，
+期间下一场会议无法开录（手动开始直接报错，还错说成"仍在保存中"）。2026-08-13 改为**非对称调度**：
+
+- **录音永不等后处理**。`claimRecording()` / `claimRecording(consuming:)` 只与其他录音 claim、
+  reserved intent 竞争；处理中的 lease 不拒绝新录音。转录/摘要还在跑时，手动与自动开始都立即成功。
+- **新后处理让位于录音**。`claimProcessing()` 在 recording lease 或 reserved intent 存在时拒绝，
+  提交转入 deferred queue，all-idle 边沿统一 drain：转录让位于录音，录音结束后续跑。**已在跑的
+  job 不抢占**（不浪费接近完成的转录）。
+- **正常停止的原子交接不变**。`transitionRecordingToProcessing` 把 recording lease 原子换成
+  processing lease，观察者看不到 all-idle 空隙。
+- **`pendingMeetingAutoStart` 只覆盖 `isStopping` / cooldown 窗口**。finalize 完成
+  （`completeStopLifecycle`）立即重试，不再等 processing 空闲；手动 `startRecording` 会取代
+  （clear）同一 gate 上排队的自动开始 intent。
+- **不变量边界**：durable stop finalization（`isStopping`）与存储迁移（`StorageMigrationGate`）
+  的排他语义不动。允许并行的前提：后处理只读**已 finalize** 的音频文件、经 `RecordingsStore`
+  actor 写库，与新录音无共享可变状态；代价只是与实时捕获的算力竞争，属可接受资源软约束。
+- AppState 的 `isRecordingStartBlocked` 只投影 `isStopping`：工具栏 "Saving recording…"
+  只在真正保存（merge/finalize）时出现。
+
+测试：`CadenzaTests/Recording/RecordingProcessingExclusionTests.swift`（gate 语义 + defer/drain +
+intent 优先级）、`RecordingEngineTests.activePostProcessingDoesNotBlockManualOrAutomaticStarts`、
+源码门禁 `AppLaunchBehaviorTests.finalizationBlocksRecordingEntrypointsWhilePostProcessingDoesNot`。
 
 ### 6.5 音频导入
 
@@ -1374,6 +1400,7 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 - calendar match
 - window heuristic（Teams 主路径是结构识别，见下）
 - tHelperOut output keep-alive（sustain-only，见下）
+- system-mic keep-alive（sustain-only，只补 1 分缺口，见下）
 - minimum active hold 90s
 - debounce 1s
 - grace 3s
@@ -1411,7 +1438,7 @@ Teams 在通话中开启屏幕分享时会重新组织窗口（call 主窗口和
 `modulehost` 的 `isRunningInput` **通话结束后仍为 true**，且 Cadenza 自己录音时 `systemMicActive` 也恒为 true，所以一个无日历、无窗口的 Teams quick call 结束后 **input 侧没有任何信号会掉下来**。2026-06-10 起首选判定是 output 探针（见下节，挂断同 tick 归 false → ~8s 内 auto-stop）；`teamsUncorroboratedKeepAliveCap` 降级为 output 探针失效场景（屏幕共享+远端全静音）的兜底：blackout 持续超过上限后 score 不再被 floor，状态机走 `active → ending → idle` 触发 auto-stop。
 
 - **cap = 10 min**（曾为 30 min）。对"quick call 结束后录死气"最坏情况的钝性时间界。自 output 探针接入后，正常挂断不再依赖它。
-- **受 cap/gate 约束的 flooring 路径现有三条**：`teamsUncorroboratedKeepAliveActive`（受 10min cap）、`teamsHelperOutputKeepAliveActive`（sustain-only，受 4h cap，见下节）、`minimumActiveHold`（90s，见 §12.1）。历史教训：曾有一条独立的 `continuityAudioActive && !expired` 分支，当 keepalive candidate 因非过期原因为 false（如日历显式指向别的 app）时，会无视 cap 把会议**无上限**钉死——已删除。回归测试：`teamsActive_continuityWithoutKeepAliveCandidate_progressesToEnding`。新增任何 flooring 路径都必须自带退出条件（cap、gate 或信号本身会掉）。
+- **受 cap/gate 约束的 flooring 路径现有四条**：`teamsUncorroboratedKeepAliveActive`（受 10min cap）、`teamsHelperOutputKeepAliveActive`（sustain-only，受 4h cap，见下节）、`systemMicKeepAliveActive`（sustain-only，只补 1 分缺口，受 10min cap，见下节）、`minimumActiveHold`（90s，见 §12.1）。历史教训：曾有一条独立的 `continuityAudioActive && !expired` 分支，当 keepalive candidate 因非过期原因为 false（如日历显式指向别的 app）时，会无视 cap 把会议**无上限**钉死——已删除。回归测试：`teamsActive_continuityWithoutKeepAliveCandidate_progressesToEnding`。新增任何 flooring 路径都必须自带退出条件（cap、gate 或信号本身会掉）。
 
 #### `isTeamsHelperOutputActive` —— 通话结束判别探针（✅ 已验证并接入评分，2026-06-10）
 
@@ -1424,6 +1451,14 @@ Teams 在通话中开启屏幕分享时会重新组织窗口（call 主窗口和
 - 诊断字段：`toutKeep`（keep-alive 生效）/ `toutExp`（4h cap 到期）。
 - 效果：quick call / Town Hall 这类窗口与日历都靠不住的会议，挂断后 output 掉 → score 掉 → `active→ending→idle` → auto-stop 在 ~grace(3s)+countdown(5s) 内完成，不再等 10min cap。
 - **仍未实测的场景**：演讲者共享屏幕 + 远端全静音（无远端音频 → output 可能 false）。此时 output keep-alive 不生效，session 退化到旧的 10min uncorroborated cap——**降级而非误停**（min-hold 90s 和窗口结构识别也还在撑）。下次屏幕共享会议记得看 `tHelperOut` 在共享期间的行为并回填这里。
+
+#### System-mic keep-alive —— 静音开场事故修复（2026-08-13）
+
+事故：用户加入 Teams 会议后静音等人说话。触发靠 cal(+2，日历事件**未指定 app**，通用匹配) + win(+1) = 3 恰好过线；因为全程无人说话，Teams 通话 assertion 从未建立、无任何 app-owned 音频证据。90s min-hold 一到期，win 已掉（窗口收成非通话形态），score=2 < 3 → signalDrop → auto-stop → 90s 录音转录为空被静默 trash。现有 keep-alive 全部漏接：`tcalKeep` 要求日历**显式**匹配 Teams（本例通用匹配不算）、`tblackout` 要求无日历无窗口（本例 cal=1 反而使其失效）、`toutKeep` 要求远端音频（静音时为 false）。
+
+修复（`shouldUseSystemMicKeepAlive`，**sustain-only**）：`systemMicActive` 系统级信号无法归因（Cadenza 自己录音全程为 true），所以它**只允许补恰好 1 分的缺口**（`threshold-1 ≤ rawScore < threshold`），语义上是替掉丢失的 win(+1)，其余分数必须由日历等独立证据撑着——rawScore=0 的"离会后停在 Chat 窗口"场景（回归测试 `teamsMeetingChatAfterLeave_entersEndingEvenWhileCadenzaMicRuns`）不受影响照常结束。受 10min cap（`systemMicKeepAliveCap`）；cap 仅当它是唯一 flooring 路径时才计时（`!otherFlooringActive && !toutKeep` gate，弱证据最后上、强证据先烧自己的 cap）。绝不参与 idle→detected。诊断字段：`smicKeep` / `smicExp`。
+
+可见性配套：post-processing 把录音移入废纸篓时（太短/空转录），`AppState.onRecordingDiscarded` 现在同时发系统通知（此前只有主窗口 toolbar banner，自动录音场景窗口根本没开，用户无感知）。
 
 #### 日历同步与 `reevaluateNow`
 
@@ -1613,7 +1648,8 @@ MCP 客户端 (Claude Code / Gemini CLI / Claude Desktop via mcp-remote)
 RecordingsStore (actor) → SwiftData
 ```
 
-- **生命周期**:`AppState.syncMCPServer()`(setup 末尾 + Settings 变更时调用);UserDefaults 键 `mcpServerEnabled` / `mcpWritesEnabled` / `mcpServerPort`(均默认关/8585);server 开关与端口是设备级配置，但 bearer token 和逐客户端 scope 以 active profile 命名空间存储，切换 profile 后必须重新连接。固定端口**无自动回退**——被占即 `.failed` 红字,防客户端配置静默失联。
+- **生命周期**:`AppState.syncMCPServer()`(setup **开头** + Settings 变更时调用——Cadenza 与客户端同为登录项,放末尾会输掉启动竞速让客户端看到 "Server disconnected");UserDefaults 键 `mcpServerEnabled` / `mcpWritesEnabled` / `mcpServerPort`(均默认关/8585);server 开关与端口是设备级配置，但 bearer token 和逐客户端 scope 以 active profile 命名空间存储，切换 profile 后必须重新连接。固定端口**无自动回退**——被占即 `.failed` 红字,防客户端配置静默失联。
+- **⚠️ profile 化的凭证迁移(`MCPCredentialMigration`,2026-08)**:profile 命名空间是后加的,而三个凭证键(`mcpClientAccessRecords` / `mcp.clientToken.<id>` / `mcp.bearerToken`)原本是写死的全局键。改成经 `ActiveProfileDefaults` 解析后,升级用户读的是 `<base>.profile.<uuid>` ——从未写过的键:store 载入 0 个已注册客户端,升级前签发的所有 token 全部 `authenticate` 失败,已配置的客户端一律 401,Settings 显示 stale。**迁移曾整个缺失**(那三个 `for mode:` 变体当时只有测试在用),2026-08-09 实测复现:Codex 20:35 还在正常调用,升级后即 401。现由 `ProfileBootstrap.reconcileCommittedState` 调用,**必须早于 `AppState.setup()`** —— server 一起来就读 scoped 键。marker `mcpCredentialsAdopted.v1` **是全局而非 per-profile**:被搬运的凭证先于 profile 存在,只能归属其中一个;per-profile marker 会让每个后续激活的 profile 都重跑一次,把同一份凭证复制进所有 profile。共享 token 采取**覆盖**语义(UI 的 `connect` 永远发逐客户端 token,scoped 共享 token 只可能是 `loadOrCreateToken` 按需生成、无人持有的),逐客户端记录则遇 scoped 已存在即整体让路。Keychain 写失败时不落 metadata、不置 marker,下次启动重试。
 - **HTTP 层硬约束**:严禁单次 `receive` 解析(OAuthCallbackServer 的 4KB 模式只能活在无 body GET;TCP ~1.4KB 即分片)。必须循环收到 `\r\n\r\n` 再按 `Content-Length` 收满。每响应 `Connection: close`(无 keep-alive 状态机)。上限:header 16KB(431)、body 1MB(413)、无 Content-Length 的 POST → 411、30s watchdog。无 SSE(GET→405)、无 session、batch→-32600。
 - **安全**:loopback-only;Bearer token SHA256 常时比较;Host/Origin 白名单防 DNS-rebinding(`MCPHTTPConnection.isAllowedHost/isAllowedOrigin`,纯函数有单测)。威胁模型边界:app 未 sandbox,本机进程本就能直读 SQLite——token 防的是浏览器侧与无差别扫描,不防本机恶意进程。
 - **工具层**:cursor 为全局 segment index(时间窗只过滤不重编号);speaker 经 `speakerMappings.profileName` 解析真名,`get_transcript` 响应带 `speakers` roster(`resolvedName: null` = 未识别占位符),AI 可经 `set_speaker_name` 回写映射(label 必须真实出现在该转录中,防幻觉;profile 按 displayName 不区分大小写复用,否则新建);trashed 一律隐藏(`fetchActiveDetail` 显式查 trash 列表,因 detail DTO 无 trashedDate);写工具双重把关(开关关闭时 tools/list 隐藏 + call 拒绝),每次写经 `os.Logger`(subsystem `com.shuiandy.Cadenza`,category `mcp`,`.notice` 可 `log show` 回查)。

@@ -51,11 +51,14 @@ final class ProcessTapSystemAudioCapture {
 
             let audioHandler = onSystemAudio
             let callbackQueue = callbackQueue
-            let ioBlock: AudioDeviceIOBlock = { [tapFormat, formatDescription, audioHandler, callbackQueue] _, inputData, inputTime, _, _ in
+            // Fresh per session: the clock latches its source on the first buffer.
+            let clock = AudioCaptureClock()
+            let ioBlock: AudioDeviceIOBlock = { [tapFormat, formatDescription, audioHandler, callbackQueue, clock] _, inputData, inputTime, _, _ in
                 guard let packet = Self.copyAudioPacket(
                         from: inputData,
                         inputTime: inputTime,
-                        format: tapFormat
+                        format: tapFormat,
+                        clock: clock
                       ) else { return }
                 callbackQueue.async {
                     guard let sampleBuffer = Self.makeSampleBuffer(
@@ -252,7 +255,8 @@ final class ProcessTapSystemAudioCapture {
     private static func copyAudioPacket(
         from audioBufferList: UnsafePointer<AudioBufferList>,
         inputTime: UnsafePointer<AudioTimeStamp>?,
-        format: AudioStreamBasicDescription
+        format: AudioStreamBasicDescription,
+        clock: AudioCaptureClock
     ) -> CapturedAudioPacket? {
         let firstBuffer = audioBufferList.pointee.mBuffers
         guard let sourceData = firstBuffer.mData,
@@ -270,7 +274,9 @@ final class ProcessTapSystemAudioCapture {
         return CapturedAudioPacket(
             data: Data(bytes: sourceData, count: dataSize),
             frameCount: CMItemCount(frameCount),
-            presentationTime: presentationTime(from: inputTime, sampleRate: format.mSampleRate)
+            presentationTime: clock.presentationTime(
+                from: inputTime, sampleRate: format.mSampleRate
+            )
         )
     }
 
@@ -326,21 +332,6 @@ final class ProcessTapSystemAudioCapture {
         return sampleBuffer
     }
 
-    private static func presentationTime(from timestamp: UnsafePointer<AudioTimeStamp>?, sampleRate: Double) -> CMTime {
-        if let timestamp {
-            let value = timestamp.pointee
-            if value.mFlags.contains(.sampleTimeValid), sampleRate > 0 {
-                return CMTime(
-                    value: Int64(value.mSampleTime.rounded()),
-                    timescale: CMTimeScale(Int32(sampleRate.rounded()))
-                )
-            }
-            if value.mFlags.contains(.hostTimeValid) {
-                return CMClockMakeHostTimeFromSystemUnits(value.mHostTime)
-            }
-        }
-        return CMClockGetTime(CMClockGetHostTimeClock())
-    }
 
     private func checkOSStatus(_ status: OSStatus, operation: String) throws {
         guard status == noErr else {

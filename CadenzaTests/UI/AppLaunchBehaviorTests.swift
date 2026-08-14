@@ -269,7 +269,7 @@ struct AppLaunchBehaviorTests {
 
         let prepareFunction = try #require(appState.range(of: "func prepareSystemAudioCapture()"))
         let prepareGuard = try #require(appState.range(
-            of: "guard startupPolicy.allowsHardwareCapture else { return }",
+            of: "guard startupPolicy.allowsHardwareCapture else { return false }",
             range: prepareFunction.upperBound..<appState.endIndex
         ))
         let enginePrepare = try #require(appState.range(
@@ -305,7 +305,7 @@ struct AppLaunchBehaviorTests {
         #expect(menuBar.contains("if appState.startupPolicy.allowsHardwareCapture"))
     }
 
-    @Test func postProcessingBlocksManualAutoAndToolbarRecordingEntrypoints() throws {
+    @Test func finalizationBlocksRecordingEntrypointsWhilePostProcessingDoesNot() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -323,20 +323,19 @@ struct AppLaunchBehaviorTests {
             encoding: .utf8
         )
 
+        // Post-processing runs in parallel with capture and must not gate any
+        // recording entrypoint. The only AppState start blocker is durable
+        // stop finalization.
+        #expect(!appState.contains("isPostProcessingRecordingStartBlocked"))
+        let blockedProjection = try #require(appState.range(
+            of: "var isRecordingStartBlocked: Bool {"
+        ))
+        let blockedBody = try #require(appState.range(
+            of: "isFinalizingRecording",
+            range: blockedProjection.upperBound..<appState.endIndex
+        ))
         let appStateStart = try #require(appState.range(of: "func startRecording("))
-        let appStateLeaseSignal = try #require(appState.range(
-            of: "coordinator?.hasActiveWork == true"
-        ))
-        let appStateGate = try #require(appState.range(
-            of: "guard !isPostProcessingRecordingStartBlocked else",
-            range: appStateStart.upperBound..<appState.endIndex
-        ))
-        let appStateEngineCall = try #require(appState.range(
-            of: "recordingEngine.startRecording(",
-            range: appStateStart.upperBound..<appState.endIndex
-        ))
-        #expect(appStateLeaseSignal.lowerBound < appStateStart.lowerBound)
-        #expect(appStateGate.lowerBound < appStateEngineCall.lowerBound)
+        #expect(blockedBody.lowerBound < appStateStart.lowerBound)
 
         let engineStart = try #require(engine.range(of: "func startRecording("))
         let engineGate = try #require(engine.range(
@@ -678,7 +677,7 @@ struct AppLaunchBehaviorTests {
         }
     }
 
-    @Test func menuBarRoutesAutoRecordEnableThroughRecordingNotice() throws {
+    @Test func menuBarAutoRecordTogglesInPlaceAndRoutesMissingAccessToSettings() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -688,10 +687,15 @@ struct AppLaunchBehaviorTests {
             encoding: .utf8
         )
 
-        #expect(menuBar.contains("if autoRecordMeetings"))
-        #expect(menuBar.contains("Button(\"Auto-record meetings\")"))
+        // Symmetric in-place toggle: no asymmetric enable-only Button.
+        #expect(menuBar.contains("Toggle(\"Auto-record meetings\", isOn: autoRecordBinding)"))
+        #expect(!menuBar.contains("Button(\"Auto-record meetings\")"))
+        // Suspend semantics: enabling stores the intent, and missing
+        // microphone access routes to Settings instead of rewriting it.
+        #expect(menuBar.contains("MicrophoneAutoRecordPolicy.action(for: status) != .enable"))
         #expect(menuBar.contains("appState.openSettings(category: .recording)"))
         #expect(menuBar.contains("Set Up System Audio Recording…"))
+        // The TCC request flow stays owned by Settings.
         #expect(!menuBar.contains("Permissions.requestMicrophone()"))
     }
 

@@ -405,10 +405,21 @@ struct M1StorageMigrationTests {
         // The completion marker records that the mapping ran.
         #expect(scoped.mappingComplete(for: profileID))
 
-        // A later copy with a cleared global clears the scoped twin too.
+        // A re-run must never touch a scoped value that is already set — by then
+        // it is the user's per-profile setting, not a mirror of the global. The
+        // copy re-runs whenever the marker is absent (crash window, or any bump
+        // of `mappingMarkerKey`), so a destructive branch here would silently
+        // delete settings on upgrade.
         defaults.removeObject(forKey: "userName")
+        defaults.set("Renamed by the user", forKey: scopedKey("markdownMirrorEnabled"))
         scoped.copyGlobalValues(to: profileID)
-        #expect(defaults.object(forKey: scopedKey("userName")) == nil)
+        #expect(defaults.object(forKey: scopedKey("userName")) as? String == "Andy")
+        #expect(
+            defaults.object(forKey: scopedKey("markdownMirrorEnabled")) as? String
+                == "Renamed by the user"
+        )
+        // Still absent globally and scoped: seeding never invents a value.
+        #expect(defaults.object(forKey: scopedKey("userJobTitle")) == nil)
     }
 
     /// The inventory is the authoritative list, verbatim: any drive-by

@@ -78,6 +78,16 @@ final class TranscriptionManager {
     private(set) var lastWhisperResults: (any Sendable)?
     private(set) var realtimeError: String?
     var onRealtimeFailure: ((Error, AIProvider, RealtimeAttemptID) -> Void)?
+    /// Fired once per realtime session, on the first content-bearing delta.
+    /// Deltas can only come from the current generation, so a stale stream can
+    /// never report a replacement session as healthy.
+    var onRealtimeStreamHealthy: (() -> Void)?
+    /// Consulted when the no-delta watchdog fires. true means the audio sent so
+    /// far was genuine silence, so the missing text is expected and the session
+    /// stays up. false means speech went untranscribed — a half-open connection
+    /// that will never error on its own — so the watchdog reports a failure.
+    /// nil (no capture-side signal available) is treated as silence.
+    var realtimeAudioIsSilent: (() -> Bool)?
     var onSegmentsChanged: (([TranscriptSegment]) -> Void)?
 
     /// Progress callback reporting (chunksDone, chunksTotal) during chunked file transcription.
@@ -247,10 +257,24 @@ final class TranscriptionManager {
                 guard self.isCurrentRealtimeSession(generation) else { return }
                 guard self.isTranscribing else { return }
                 guard self.realtimeContentDeltaCount == 0, self.sendAudioCount > 0 else { return }
-                let message = Self.realtimeTimeoutMessage
-                self.realtimeError = message
-                let error = TranscriptionError.apiError(message)
-                self.onRealtimeFailure?(error, provider, attemptID)
+                if self.realtimeAudioIsSilent?() ?? true {
+                    // No deltas while silent audio flows is what a healthy
+                    // realtime stream looks like: providers only emit text for
+                    // speech. Real faults (socket errors, server error events,
+                    // unexpected stream end) surface through the stream task
+                    // and still reach onRealtimeFailure. Record a diagnostic;
+                    // never tear down.
+                    NSLog("[TranscriptionManager] no realtime text %.0fs after connect; treating as silence, session stays up", Double(watchdogDelay.components.seconds))
+                    self.realtimeError = Self.realtimeTimeoutMessage
+                } else {
+                    // Speech was captured and no text ever arrived: the stream
+                    // is half-open in a way that never produces its own error
+                    // event, so this is the only place it can be detected.
+                    NSLog("[TranscriptionManager] no realtime text %.0fs after connect despite speech; reporting stream failure", Double(watchdogDelay.components.seconds))
+                    self.realtimeError = Self.realtimeTimeoutMessage
+                    let error = TranscriptionError.apiError(Self.realtimeTimeoutMessage)
+                    self.onRealtimeFailure?(error, provider, attemptID)
+                }
             }
         }
         noDeltaWatchdogTask = watchdogTask
@@ -419,6 +443,8 @@ final class TranscriptionManager {
 
         if !preserveFailureHandler {
             onRealtimeFailure = nil
+            onRealtimeStreamHealthy = nil
+            realtimeAudioIsSilent = nil
         }
         if !preserveRealtimeError {
             realtimeError = nil
@@ -665,6 +691,8 @@ final class TranscriptionManager {
         realtimeProvider = nil
         currentRealtimeAttemptID = nil
         onRealtimeFailure = nil
+        onRealtimeStreamHealthy = nil
+        realtimeAudioIsSilent = nil
         onProgress = nil
         isTranscribing = false
         noDeltaWatchdogTask?.cancel()
@@ -729,6 +757,7 @@ final class TranscriptionManager {
             if realtimeError == Self.realtimeTimeoutMessage {
                 realtimeError = nil
             }
+            onRealtimeStreamHealthy?()
         }
 
         let elapsed = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0

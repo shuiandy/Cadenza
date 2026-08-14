@@ -78,11 +78,11 @@ struct ProfileScopedDefaults {
         "\(key).profile.\(profileID.uuidString)"
     }
 
-    /// Copies the explicitly-set global value of every inventoried key to
-    /// the scoped key. Values keep their plist type verbatim. A key absent
-    /// globally is absent scoped — no defaults are invented. Globals are
-    /// left in place for rollback. Idempotent; sets the completion marker
-    /// last.
+    /// Seeds each inventoried scoped key from its explicitly-set global twin.
+    /// Values keep their plist type verbatim. A key absent globally is left
+    /// absent scoped — no defaults are invented. A scoped key that already has
+    /// a value is left alone: see `copy(key:from:profileID:)`. Globals are left
+    /// in place for rollback. Idempotent; sets the completion marker last.
     func copyGlobalValues(to profileID: UUID) {
         let explicit = explicitValues()
         for key in Self.scopedKeys {
@@ -113,12 +113,21 @@ struct ProfileScopedDefaults {
         }.sorted()
     }
 
+    /// Fills an absent scoped key from its global twin and does nothing else.
+    ///
+    /// It must never write over or delete a scoped value that is already there:
+    /// once the first mapping has run, that value is the user's own per-profile
+    /// setting, and this function's whole job was to seed it — not to keep it in
+    /// sync with a global key the app no longer reads. The copy is designed to
+    /// re-run (the marker exists to close a crash window, and any bump of
+    /// `mappingMarkerKey` re-runs it for every profile), so a destructive branch
+    /// here is a live hazard: on this developer's machine a re-run would have
+    /// deleted `smartFolders.overrides.v2`, whose global twin is long gone.
+    /// Skipping present keys is also what makes the re-run genuinely idempotent.
     private func copy(key: String, from explicit: [String: Any], profileID: UUID) {
         let scoped = Self.scopedKey(key, profileID: profileID)
-        if let value = explicit[key] {
-            defaults.set(value, forKey: scoped)
-        } else {
-            defaults.removeObject(forKey: scoped)
-        }
+        guard defaults.object(forKey: scoped) == nil else { return }
+        guard let value = explicit[key] else { return }
+        defaults.set(value, forKey: scoped)
     }
 }

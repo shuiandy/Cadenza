@@ -529,6 +529,12 @@ struct ScaledControlIsolationTests {
         ))
         #expect(try guardPrecedesSink(
             in: settings,
+            scope: "private struct AccessibilityPermissionRow",
+            guardText: "guard appState.startupPolicy.checksPermissions else { return }",
+            sink: "Permissions.requestAccessibility()"
+        ))
+        #expect(try guardPrecedesSink(
+            in: settings,
             scope: "private struct SystemAudioCapturePreparationRow",
             guardText: "guard appState.startupPolicy.allowsHardwareCapture else { return }",
             sink: "Permissions.openSystemAudioRecordingSettings()"
@@ -566,7 +572,7 @@ struct ScaledControlIsolationTests {
 
         #expect(settings.contains(".disabled(!appState.startupPolicy.allowsHardwareCapture)"))
         #expect(settings.contains(".disabled(!appState.startupPolicy.externalAccessEnabled)"))
-        #expect(settings.contains("if appState.startupPolicy.externalAccessEnabled {\n                DiagnosticsSection"))
+        #expect(settings.contains("if appState.startupPolicy.externalAccessEnabled {\n                UpdateSettingsSection()\n                DiagnosticsSection"))
         #expect(settings.contains("launchAtLogin = SMAppService.mainApp.status == .enabled"))
         #expect(!settings.contains("@State private var microphoneStatus = Permissions.microphoneStatus"))
         #expect(settings.contains("guard startupPolicy.checksPermissions else { return .notDetermined }"))

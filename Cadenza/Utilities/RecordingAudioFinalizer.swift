@@ -1,6 +1,18 @@
 import CryptoKit
 import Darwin
 import Foundation
+import os
+
+/// Finalization failures are only ever seen once — the recording is already
+/// over and the user gets one alert. `NSLog` is not persisted at its default
+/// level on macOS 26, so a Release-build failure left no evidence at all
+/// (observed 2026-08-10: a 58-segment recording failed to merge and the log
+/// held nothing past "started"). These go through `os.Logger` so `log show`
+/// can still answer "which stage failed" after the fact.
+private let finalizerLog = Logger(
+    subsystem: "com.shuiandy.Cadenza",
+    category: "RecordingAudioFinalizer"
+)
 
 enum RecordingAudioFinalizationOrigin: Sendable {
     case normalStop
@@ -478,12 +490,15 @@ enum RecordingAudioArtifactPipeline {
                 let expectedOutputDuration = stagedInputDurations
                     .dropLast(mergeResult.trimmedCount)
                     .reduce(0, +)
+                let boundaries = max(0, stagedInputDurations.count - 1)
                 guard AudioSegmentMerger.durationsMatch(
                     outputDuration: validatedOutputDuration,
-                    expectedDuration: expectedOutputDuration
+                    expectedDuration: expectedOutputDuration,
+                    boundaries: boundaries
                 ), AudioSegmentMerger.durationsMatch(
                     outputDuration: validatedOutputDuration,
-                    expectedDuration: mergeResult.mergedDuration
+                    expectedDuration: mergeResult.mergedDuration,
+                    boundaries: boundaries
                 ) else {
                     throw RecordingAudioArtifactError.invalidStagedAudio
                 }
@@ -1270,10 +1285,16 @@ struct RecordingAudioFinalizer: Sendable {
         case .trusted(let trusted):
             validated = trusted
         case .trustFailure(let reason):
+            finalizerLog.error(
+                "validation rejected \(request.recordingID.uuidString, privacy: .public): \(reason, privacy: .public)"
+            )
             return trustFailureOutcome(request, reason: reason)
         }
 
         guard await dependencies.recheckBeforeMerge(validated) else {
+            finalizerLog.error(
+                "recheck rejected \(request.recordingID.uuidString, privacy: .public): segment identity changed before merge"
+            )
             return trustFailureOutcome(
                 request,
                 reason: "Segment identity changed before merge"
@@ -1282,6 +1303,9 @@ struct RecordingAudioFinalizer: Sendable {
 
         await dependencies.recordEvent(.mergeStage)
         guard let artifact = await dependencies.mergeStage(request, validated) else {
+            finalizerLog.error(
+                "merge stage produced no artifact for \(request.recordingID.uuidString, privacy: .public)"
+            )
             return failedPreparationOutcome(
                 duration: validated.estimatedDuration ?? request.fallbackDuration
             )
@@ -1442,7 +1466,12 @@ extension RecordingAudioFinalizerDependencies {
                         stagedArtifact: stagedArtifact
                     )
                 } catch {
-                    NSLog("[RecordingAudioFinalizer] merge failed: %@", error.localizedDescription)
+                    // The error text embeds file URLs — the user's home, their
+                    // chosen recordings directory, recording UUIDs — and these
+                    // now persist (that was the point). Only the shape is public.
+                    finalizerLog.error(
+                        "merge failed: \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+                    )
                     return nil
                 }
             },
@@ -1453,7 +1482,9 @@ extension RecordingAudioFinalizerDependencies {
                 do {
                     return try RecordingAudioArtifactPipeline.publish(stagedArtifact)
                 } catch {
-                    NSLog("[RecordingAudioFinalizer] publish failed: %@", error.localizedDescription)
+                    finalizerLog.error(
+                        "publish failed: \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+                    )
                     return nil
                 }
             },
