@@ -40,15 +40,16 @@ struct WebSyncSnapshot: Sendable {
     /// historical-sync consent, and its audio additionally requires the
     /// with-audio consent.
     var awaitingHistoricalConsentBindingID: UUID? = nil
-    /// The meeting this recording was made for, for the web detail page.
-    ///
-    /// Resolved at the store boundary like `audioFileURL`, because
-    /// `RecordingDetailDTO` holds only `linkedCalendarEventID` and sync must not
-    /// reach into the calendar itself to look one up.
-    ///
-    /// NOT YET POPULATED — the wire contract and the server side accept it, and
-    /// the web renders it when present, but nothing fills it in here yet.
+    /// Denormalized meeting snapshot persisted on the recording at link time.
+    /// Sync sends this value and never asks EventKit.
     var calendarEvent: WebSyncCalendarEvent? = nil
+    /// User tapped Remove Link (`.userCleared`). Encoded as JSON null so the
+    /// server clears columns. Distinct from a missing field, which keeps the
+    /// last snapshot (never linked, or EventKit gone).
+    var calendarEventCleared: Bool = false
+    /// Set only when the server speaker-identity switch is on. Omitted from
+    /// the wire otherwise so older backends never see an unknown field.
+    var speakerMappings: [WebSyncSpeakerMapping]? = nil
 
     var contentRevision: Date {
         detail.updatedAt ?? detail.createdAt ?? detail.startDate

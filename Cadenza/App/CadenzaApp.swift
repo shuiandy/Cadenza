@@ -301,6 +301,9 @@ struct CadenzaApp: App {
                     break
                 }
                 if let storeURL = bootContext.storeURL {
+                    // Before the container opens: no second connection may
+                    // compact next to Core Data's own (write-lock contention).
+                    RecordingsStore.reclaimFreePagesBeforeOpen(at: storeURL)
                     container = try RecordingsStore.makeContainer(storeURL: storeURL)
                 } else {
                     container = try RecordingsStore.makeContainer()
@@ -738,7 +741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "silenceWatchdogMinutes": 15,
             "transcriptionLanguage": "auto",
             "summaryLanguage": "auto",
-            "summaryDetailLevel": "detailed",
+            SummaryDetailLevel.defaultsKey: SummaryDetailLevel.detailed.rawValue,
             "defaultAIProvider": "apple",
             "contentViewMode": "grid",
             "recordingsSort": "dateNewest",

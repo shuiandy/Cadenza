@@ -15,6 +15,7 @@ final class MeetingSummary {
     var language: String
     var createdAt: Date
     var chaptersJSON: String?
+    var generationMetadataJSON: String?
 
     @Relationship(inverse: \Recording.summary)
     var recording: Recording?
@@ -53,6 +54,7 @@ struct ActionItem: Codable, Identifiable, Sendable {
     var priority: ActionPriority
     var createdAt: Date?
     var updatedAt: Date?
+    var userModified: Bool? = nil
 
     init(assignee: String? = nil, task: String, deadline: String? = nil, isCompleted: Bool = false, priority: ActionPriority = .medium, createdAt: Date? = Date(), updatedAt: Date? = Date()) {
         self.id = UUID()
@@ -76,6 +78,7 @@ struct ActionItem: Codable, Identifiable, Sendable {
         priority = try container.decodeIfPresent(ActionPriority.self, forKey: .priority) ?? .medium
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt)
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
+        userModified = try container.decodeIfPresent(Bool.self, forKey: .userModified)
     }
 }
 

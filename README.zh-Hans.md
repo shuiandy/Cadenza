@@ -137,7 +137,7 @@ Cadenza 支持项目、文件夹、智能文件夹和自动标签。标签通过
   Cadenza 目前还不能在应用内导入或恢复这种归档。
 - **日历**：支持 EventKit 和 Google Calendar，以及 Zoom 会议元数据。
 - **MCP 服务器**：通过带 Bearer 身份验证的回环 HTTP 服务器，将转录开放给 Claude Code、
-  Claude Desktop、Codex、Gemini CLI 或 Hermes。默认关闭；写入权限和会议上下文访问分别独立
+  Claude Desktop、Codex、Grok、Gemini CLI 或 Hermes。默认关闭；写入权限和会议上下文访问分别独立
   选择启用。设置页面可以代你写入客户端配置。
 
 ## 工作原理

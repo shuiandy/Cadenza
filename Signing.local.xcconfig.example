@@ -1,0 +1,12 @@
+// Copy to Signing.local.xcconfig (untracked) and set your own values.
+//
+// DEVELOPMENT_TEAM is the 10-character Team ID from the OU field of your
+// signing certificate, NOT the identifier in parentheses after the email in
+// the certificate's common name. Read it with:
+//
+//   security find-identity -v -p codesigning
+//   security find-certificate -c "<certificate common name>" -p \
+//     | openssl x509 -noout -subject
+//
+// DEVELOPMENT_TEAM = ABCDE12345
+// CODE_SIGN_IDENTITY = Apple Development

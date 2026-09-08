@@ -3,6 +3,8 @@ import SwiftData
 
 @Model
 final class SpeakerVoiceSample {
+    #Index<SpeakerVoiceSample>([\.recordingID], [\.modelVersion])
+
     var recordingID: UUID
     var rawLabel: String
     var profile: SpeakerProfile?

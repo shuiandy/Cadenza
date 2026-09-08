@@ -104,7 +104,7 @@ struct ContentView: View {
     }
 
     private func recordingsPage(filterMode: RecordingsFilterMode) -> some View {
-        let recordings = recordingsForFilter(filterMode)
+        let recordings = applySpeakerFilter(recordingsForFilter(filterMode))
         let smartFolder: SmartFolderDTO? = if case .smartFolder(let id) = filterMode {
             appState.smartFolder(id: id)
         } else {
@@ -148,6 +148,13 @@ struct ContentView: View {
 
     // MARK: - Sorting & Search
 
+    /// Top-bar person chips narrow every recordings page to one mapped
+    /// speaker; a nil filter is a no-op.
+    private func applySpeakerFilter(_ list: [RecordingDTO]) -> [RecordingDTO] {
+        guard let person = appState.librarySpeakerFilter else { return list }
+        return list.filter { $0.speakerNames?.contains(person) == true }
+    }
+
     private func recordingsForFilter(_ mode: RecordingsFilterMode) -> [RecordingDTO] {
         if RecordingSearchDataSourcePolicy.usesSearchResults(query: appState.searchQuery) {
             if case .smartFolder(let id) = mode {
@@ -157,7 +164,7 @@ struct ContentView: View {
         }
         switch mode {
         case .all:
-            return applySortToRecordings(appState.recordings)
+            return appState.sortedLibraryRecordings(sortKey: recordingsSort)
         case .folder(let id):
             if let folder = appState.folders.first(where: { $0.id == id }) {
                 return sortedFolderRecordings(folder)
@@ -166,42 +173,18 @@ struct ContentView: View {
         case .smartFolder(let id):
             return smartFolderRecordings(id: id, source: appState.recordings)
         case .tag(let tag):
-            let key = TagNormalizer.formatKey(tag)
-            let filtered = appState.recordings.filter { rec in rec.tags.contains { TagNormalizer.formatKey($0) == key } }
-            return applySortToRecordings(filtered)
+            return appState.libraryRecordings(tag: tag, sortKey: recordingsSort)
         }
     }
 
     private func applySortToRecordings(_ recordings: [RecordingDTO]) -> [RecordingDTO] {
-        switch recordingsSort {
-        case "dateOldest":
-            return recordings.sorted { $0.startDate < $1.startDate }
-        case "recentlyAccessed":
-            return recordings.sorted { ($0.lastAccessedDate ?? .distantPast) > ($1.lastAccessedDate ?? .distantPast) }
-        case "nameAZ":
-            return recordings.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        case "nameZA":
-            return recordings.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedDescending }
-        default:
-            return recordings.sorted { $0.startDate > $1.startDate }
-        }
+        RecordingSorting.sort(recordings, by: recordingsSort)
     }
 
     private func sortedFolderRecordings(_ folder: FolderDTO) -> [RecordingDTO] {
         let folderRecordings = appState.recordings.filter { $0.folderID == folder.id }
         let sortKey = UserDefaults.standard.string(forKey: ActiveProfileDefaults.key("folderSort.\(folder.id)")) ?? recordingsSort
-        switch sortKey {
-        case "dateOldest":
-            return folderRecordings.sorted { $0.startDate < $1.startDate }
-        case "recentlyAccessed":
-            return folderRecordings.sorted { ($0.lastAccessedDate ?? .distantPast) > ($1.lastAccessedDate ?? .distantPast) }
-        case "nameAZ":
-            return folderRecordings.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        case "nameZA":
-            return folderRecordings.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedDescending }
-        default:
-            return folderRecordings.sorted { $0.startDate > $1.startDate }
-        }
+        return RecordingSorting.sort(folderRecordings, by: sortKey)
     }
 
     private func smartFolderRecordings(id: String, source: [RecordingDTO]) -> [RecordingDTO] {
@@ -273,9 +256,9 @@ struct RecordingsTopBar: View {
     @AppStorage("contentViewMode") private var contentViewModeRaw: String = "waterfall"
     @AppStorage("recordingsSort") private var recordingsSort: String = "dateNewest"
 
-    @State private var isSearchExpanded = false
     @FocusState private var isSearchFocused: Bool
     @State private var isSearchHovered = false
+    @State private var showTagsPopover = false
 
     private var controlSize: CGFloat {
         RecordingsTopBarLayoutMetrics.controlDimension(scale: uiScale)
@@ -289,14 +272,142 @@ struct RecordingsTopBar: View {
                     searchControl
                 }
             } else {
+                // Full-width context bar: search and filters lead, the view
+                // and sort controls trail. Each control keeps its own glass
+                // capsule; there is no full-width material slab behind them.
                 HStack(spacing: 6) {
-                    Spacer(minLength: 0)
-                    modeAndSortControls
                     searchControl
+                    personFilterChips
+                    tagMenuChip
+                    Spacer(minLength: 6)
+                    modeAndSortControls
                 }
             }
         }
+        // Match the collection's own horizontal padding so the search field's
+        // left edge and the sort control's right edge line up with the cards.
+        .padding(.horizontal, 16)
         .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    // MARK: - Person & Tag Filters
+
+    /// Most-recurring mapped speakers across the library; the chips filter
+    /// every recordings page down to one person.
+    private var topSpeakers: [String] {
+        appState.libraryTopSpeakers(limit: 3)
+    }
+
+    /// One standalone capsule per person, matching the concept's chip row.
+    @ViewBuilder
+    private var personFilterChips: some View {
+        ForEach(topSpeakers, id: \.self) { name in
+            personChip(name)
+        }
+    }
+
+    private func personChip(_ name: String) -> some View {
+        let isSelected = appState.librarySpeakerFilter == name
+        return Button {
+            appState.librarySpeakerFilter = isSelected ? nil : name
+        } label: {
+            HStack(spacing: 5) {
+                ZStack {
+                    Circle()
+                        .fill(RecordingCardView.tagColor(for: name).opacity(0.22))
+                    Text(verbatim: String(name.prefix(1)).uppercased())
+                        .font(.cadenza(8, weight: .bold, scale: uiScale))
+                        .foregroundStyle(RecordingCardView.tagColor(for: name))
+                }
+                .frame(width: 16, height: 16)
+                .accessibilityHidden(true)
+                Text(name)
+                    .font(.cadenza(11, weight: isSelected ? .semibold : .regular, scale: uiScale))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(isSelected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+            .background(Capsule().fill(isSelected ? Color.accentColor.opacity(0.15) : .clear))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.cadenzaPlain)
+        .cadenzaGlass(in: Capsule(), interactive: true)
+        .overlay(
+            Capsule()
+                .strokeBorder(Color.accentColor.opacity(isSelected ? 0.4 : 0), lineWidth: 1)
+        )
+        .help("Show only this speaker")
+        .accessibilityValue(isSelected ? Text("Selected") : Text("Not selected"))
+    }
+
+    private var allTags: [String] {
+        appState.libraryTagsByFrequency
+    }
+
+    /// Button + popover, never `Menu`: a borderless menu's label is laid out
+    /// inside AppKit's own button box, which both offsets the clickable area
+    /// and drops the glass background entirely (same quirk the calendar-link
+    /// row documents). A plain Button renders and hit-tests like every other
+    /// chip in this bar.
+    @ViewBuilder
+    private var tagMenuChip: some View {
+        let tags = allTags
+        if !tags.isEmpty {
+            Button {
+                showTagsPopover = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "tag")
+                        .font(.cadenza(11, scale: uiScale))
+                    Text("Tags")
+                        .font(.cadenza(11, scale: uiScale))
+                    Image(systemName: "chevron.down")
+                        .font(.cadenza(8, weight: .semibold, scale: uiScale))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.cadenzaPlain)
+            .cadenzaGlass(in: Capsule(), interactive: true)
+            .popover(isPresented: $showTagsPopover, arrowEdge: .bottom) {
+                tagListPopover(tags)
+            }
+            .accessibilityLabel(Text("Tags"))
+        }
+    }
+
+    private func tagListPopover(_ tags: [String]) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(tags, id: \.self) { tag in
+                    Button {
+                        showTagsPopover = false
+                        appState.navigate(to: .tag(tag))
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(RecordingCardView.tagColor(for: tag))
+                                .frame(width: 6, height: 6)
+                                .accessibilityHidden(true)
+                            Text(tag)
+                                .font(.cadenza(12, scale: uiScale))
+                                .lineLimit(1)
+                            Spacer(minLength: 12)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.cadenzaPlain)
+                }
+            }
+            .padding(6)
+        }
+        .frame(width: 220)
+        .frame(maxHeight: 360)
     }
 
     private var modeAndSortControls: some View {
@@ -318,40 +429,62 @@ struct RecordingsTopBar: View {
     }
 
     private var searchControl: some View {
-        // Search: capsule button that expands into text field.
+        // Persistent search: the field is always visible, so searching is a
+        // single click (or keystroke) instead of hiding behind an icon.
         HStack(spacing: 5) {
-            if isSearchExpanded {
-                Image(systemName: "magnifyingglass")
-                    .font(.cadenza(15, weight: .regular, scale: uiScale))
-                    .foregroundStyle(.primary)
-                    .accessibilityHidden(true)
+            Image(systemName: "magnifyingglass")
+                .font(.cadenza(15, weight: .regular, scale: uiScale))
+                .foregroundStyle(isSearchFocused || isSearchHovered ? .primary : .secondary)
+                .accessibilityHidden(true)
 
-                TextField("Search", text: Binding(
-                    get: { appState.searchQuery },
-                    set: { appState.searchQuery = $0 }
-                ))
-                .textFieldStyle(.plain)
-                .font(.cadenza(12, scale: uiScale))
-                .focused($isSearchFocused)
-                .onExitCommand { collapseSearch() }
-            } else {
+            TextField("Search title, transcript, summary", text: Binding(
+                get: { appState.searchQuery },
+                set: { appState.searchQuery = $0 }
+            ))
+            .textFieldStyle(.plain)
+            .font(.cadenza(12, scale: uiScale))
+            .focused($isSearchFocused)
+            .onExitCommand { clearSearch() }
+            .accessibilityLabel("Search")
+            .background {
+                // Invisible ⌘K target; the visible hint is the chip below.
+                Button("") { isSearchFocused = true }
+                    .keyboardShortcut("k", modifiers: .command)
+                    .hidden()
+            }
+
+            if appState.searchQuery.isEmpty && !isSearchFocused {
+                Text(verbatim: "⌘K")
+                    .font(.cadenza(9, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .strokeBorder(.quaternary, lineWidth: 1)
+                    )
+                    .accessibilityHidden(true)
+            }
+
+            if !appState.searchQuery.isEmpty {
                 Button {
-                    expandSearch()
+                    clearSearch()
                 } label: {
-                    Image(systemName: "magnifyingglass")
-                        .font(.cadenza(15, weight: .regular, scale: uiScale))
-                        .foregroundStyle(isSearchHovered ? .primary : .secondary)
-                        .frame(width: controlSize, height: controlSize)
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.cadenza(12, weight: .regular, scale: uiScale))
+                        .foregroundStyle(.tertiary)
                 }
                 .buttonStyle(.cadenzaPlain)
-                .accessibilityLabel("Search")
+                .accessibilityLabel("Clear")
             }
         }
         .frame(
-            width: RecordingsTopBarLayoutMetrics.searchWidth(
-                isExpanded: isSearchExpanded,
+            // Wider floor than the expand-on-demand era: the persistent field
+            // carries the full "title, transcript, summary" placeholder.
+            width: max(280, RecordingsTopBarLayoutMetrics.searchWidth(
+                isExpanded: true,
                 scale: uiScale
-            ),
+            )),
             height: controlSize
         )
         .padding(.horizontal, 8)
@@ -359,28 +492,11 @@ struct RecordingsTopBar: View {
         .cadenzaGlass(in: Capsule(), interactive: true)
         .contentShape(Rectangle())
         .onHover { isSearchHovered = $0 }
-        .onChange(of: isSearchFocused) { _, focused in
-            if !focused && isSearchExpanded && appState.searchQuery.isEmpty {
-                collapseSearch()
-            }
-        }
     }
 
-    private func expandSearch() {
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) {
-            isSearchExpanded = true
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            isSearchFocused = true
-        }
-    }
-
-    private func collapseSearch() {
+    private func clearSearch() {
         appState.searchQuery = ""
         isSearchFocused = false
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) {
-            isSearchExpanded = false
-        }
     }
 
     @State private var isSortHovered = false

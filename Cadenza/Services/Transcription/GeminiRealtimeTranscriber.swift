@@ -301,19 +301,29 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         }
     }
 
-    func sendAudio(_ data: Data) async throws {
-        guard let transport else { return }
+    /// Sample rate declared to Gemini for every audio chunk. Capture hands
+    /// `sendAudio` PCM in `AudioConverter.transcriptionFormat` (24 kHz mono
+    /// Int16); Gemini Live resamples server-side from whatever rate the
+    /// mimeType declares, so the declaration must track the capture format.
+    /// A hard-coded 16000 here made Gemini decode 24 kHz audio at two thirds
+    /// speed.
+    nonisolated static let declaredInputSampleRate = Int(AudioConverter.transcriptionFormat.sampleRate)
 
-        let base64Audio = data.base64EncodedString()
-        let message: [String: Any] = [
+    nonisolated static func audioInputMessage(base64Audio: String) -> [String: Any] {
+        [
             "realtimeInput": [
                 "audio": [
-                    "mimeType": "audio/pcm;rate=16000",
+                    "mimeType": "audio/pcm;rate=\(declaredInputSampleRate)",
                     "data": base64Audio
                 ]
             ]
         ]
+    }
 
+    func sendAudio(_ data: Data) async throws {
+        guard let transport else { return }
+
+        let message = Self.audioInputMessage(base64Audio: data.base64EncodedString())
         let jsonData = try JSONSerialization.data(withJSONObject: message)
         try await sendTextFrame(jsonData, using: transport)
     }
@@ -810,14 +820,16 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         if let serverContent {
             let turnComplete = (serverContent["turnComplete"] ?? serverContent["turn_complete"]) as? Bool ?? false
 
-            if let transcriptText = extractTranscriptText(from: serverContent), !transcriptText.isEmpty {
+            if let transcript = extractTranscript(from: serverContent, turnComplete: turnComplete) {
                 RealtimeDebugLog.shared.append(
-                    "Gemini: yielded \(transcriptText.utf8.count) transcript bytes"
+                    "Gemini: yielded \(transcript.text.utf8.count) transcript bytes"
+                        + (transcript.isFinal ? " (final)" : " (interim)")
                 )
                 continuation?.yield(TranscriptDelta(
-                    text: transcriptText,
-                    isFinal: turnComplete,
-                    language: nil
+                    text: transcript.text,
+                    isFinal: transcript.isFinal,
+                    language: nil,
+                    replacesHypothesis: usesDedicatedTranscription
                 ))
             } else {
                 NSLog(
@@ -837,7 +849,31 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
 
     // MARK: - Helpers
 
-    private func buildSetupConfig(language: String?) -> [String: Any] {
+    /// gemini-3.5-transcribe-live and successors are dedicated ASR models on
+    /// the Live API, not dialogue models whose captions fall out of a side
+    /// channel. They take structured language hints, answer in TEXT, and split
+    /// interim hypotheses from the authoritative final.
+    nonisolated private var usesDedicatedTranscription: Bool {
+        GeminiTranscribeInteraction.isTranscribeModel(model)
+    }
+
+    /// internal rather than private so the exact setup message each model
+    /// family sends is pinned by tests; nothing outside this type calls it.
+    nonisolated func buildSetupConfig(language: String?) -> [String: Any] {
+        if usesDedicatedTranscription {
+            // No system instruction: there is no model to instruct, and the
+            // Simplified-vs-Traditional problem the prompt below works around
+            // is handled structurally by languageCodes. An empty array means
+            // auto-detect, which is also what enables code-switching.
+            return ["setup": [
+                "model": "models/\(model)",
+                "generationConfig": ["responseModalities": ["TEXT"]],
+                "inputAudioTranscription": [
+                    "languageCodes": GeminiTranscribeInteraction.languageCodes(for: language)
+                ]
+            ]]
+        }
+
         // Native-audio Live models only support AUDIO responses. Ask Gemini to emit
         // text transcriptions for both the user's input audio and the model output.
         var setupConfig: [String: Any] = [
@@ -864,14 +900,34 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         return ["setup": setupConfig]
     }
 
-    private func extractTranscriptText(from serverContent: [String: Any]) -> String? {
-        // Prefer inputTranscription (speech-to-text of the user's audio)
+    /// Pull the transcript out of one `serverContent` frame along with whether
+    /// it is authoritative. The two model families disagree about what
+    /// `inputTranscription` means: the dedicated ASR emits it once per
+    /// utterance as the settled text (interim hypotheses arrive separately),
+    /// while the dialogue model streams increments there and signals the end
+    /// of a turn out of band.
+    nonisolated func extractTranscript(
+        from serverContent: [String: Any],
+        turnComplete: Bool
+    ) -> (text: String, isFinal: Bool)? {
         let inputTranscription = (serverContent["inputTranscription"] ?? serverContent["input_transcription"]) as? [String: Any]
         if let text = extractText(from: inputTranscription) {
             RealtimeDebugLog.shared.append(
                 "Gemini: received \(text.utf8.count) input-transcription bytes"
             )
-            return text
+            return (text, usesDedicatedTranscription ? true : turnComplete)
+        }
+
+        // Interim hypotheses are whole-utterance rewrites, so they are only
+        // read for the model family whose deltas replace rather than append.
+        if usesDedicatedTranscription {
+            let interim = (serverContent["interimInputTranscription"] ?? serverContent["interim_input_transcription"]) as? [String: Any]
+            if let text = extractText(from: interim) {
+                RealtimeDebugLog.shared.append(
+                    "Gemini: received \(text.utf8.count) interim-transcription bytes"
+                )
+                return (text, false)
+            }
         }
 
         // Fall back to outputTranscription — some models return transcript through the output channel
@@ -880,13 +936,13 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
             RealtimeDebugLog.shared.append(
                 "Gemini: received \(text.utf8.count) output-transcription bytes"
             )
-            return text
+            return (text, turnComplete)
         }
 
         return nil
     }
 
-    private func extractText(from container: [String: Any]?) -> String? {
+    nonisolated private func extractText(from container: [String: Any]?) -> String? {
         guard let text = container?["text"] as? String else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed

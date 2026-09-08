@@ -105,7 +105,7 @@ final class RecapGenerator {
         """
 
         do {
-            let fullResponse = try await AIGenerationGate.shared.run { () async throws -> String in
+            let fullResponse = try await AIGenerationGate.shared.run(provider: service.provider) { () async throws -> String in
                 var fullResponse = ""
                 let stream = service.streamChat(systemPrompt: systemPrompt, userMessage: input, model: modelID)
                 for try await chunk in stream {
@@ -192,7 +192,7 @@ final class RecapGenerator {
         """
 
         do {
-            let fullResponse = try await AIGenerationGate.shared.run { () async throws -> String in
+            let fullResponse = try await AIGenerationGate.shared.run(provider: service.provider) { () async throws -> String in
                 var fullResponse = ""
                 let stream = service.streamChat(systemPrompt: systemPrompt, userMessage: input, model: modelID)
                 for try await chunk in stream {

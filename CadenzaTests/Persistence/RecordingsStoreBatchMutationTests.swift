@@ -77,6 +77,32 @@ struct RecordingsStoreBatchMutationTests {
         return profile.id
     }
 
+    @Test(arguments: [false, true])
+    func privateContextFailuresPreserveEarlierStagedChanges(personalResult: Bool) async throws {
+        let fixture = try makeFixture(recordingCount: 1)
+        let id = try #require(fixture.recordingIDs.first)
+        let input = SummaryContextInput()
+        var output: PersonalRelevance?
+        if personalResult {
+            let summary = SummaryResult(title: "Fictional", overview: "Access review", keyPoints: ["Review pending"],
+                actionItems: [], decisions: [], followUps: [], yourTasks: [], tags: [], chapters: [], rawText: "")
+            #expect(await fixture.store.saveSummary(recordingID: id, summary: summary, chaptersJSON: nil) == .saved)
+            #expect(await fixture.store.saveSummaryContext(recordingID: id, input: input))
+            let detail = try #require(await fixture.store.fetchSummaryContextDetail(recordingID: id))
+            let source = try #require(SummaryContextSnapshot.build(detail: detail, input: input, userName: "Nora", jobTitle: "",
+                defaultFocus: "Access", event: nil, history: []))
+            output = try #require(PersonalRelevance.parse("{}", snapshot: source))
+        }
+        let version = "private-context-mutation"
+        let profileID = try await stageAttachedSpeakerSample(store: fixture.store, recordingID: id, modelVersion: version)
+        await fixture.store.failNextSaveForTesting()
+        if let output { #expect(await fixture.store.savePersonalRelevance(recordingID: id, result: output) == false) }
+        else { #expect(await fixture.store.saveSummaryContext(recordingID: id, input: input) == false) }
+        let reader = RecordingsStore(modelContainer: fixture.container)
+        #expect(await reader.fetchConfirmedSamples(modelVersion: version).contains { $0.profileID == profileID })
+        #expect(await reader.fetchSummaryContext(recordingID: id).1 == nil)
+    }
+
     @Test
     func trashCommitsOneThousandRowsAsOneBatch() async throws {
         let fixture = try makeFixture(

@@ -14,6 +14,7 @@ struct SummaryDTO: Codable, Sendable {
     var language: String
     var createdAt: Date
     var chapters: [ChapterDTO]
+    var generationMetadata: SummaryGenerationMetadata? = nil
 }
 
 struct ActionItemDTO: Codable, Sendable, Identifiable {
@@ -27,7 +28,7 @@ struct ActionItemDTO: Codable, Sendable, Identifiable {
     var updatedAt: Date? = nil
 }
 
-struct ChapterDTO: Codable, Sendable {
+struct ChapterDTO: Codable, Sendable, Equatable {
     var title: String
     var startSeconds: TimeInterval
     var summary: String

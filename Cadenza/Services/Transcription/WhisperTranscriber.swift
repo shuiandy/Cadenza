@@ -445,7 +445,7 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
         let exportDeadline = ContinuousClock.now.advanced(by: .seconds(30))
         let pumpTerminalAction = OSAllocatedUnfairLock(initialState: false)
         try await CancellableCallbackOperation.run(for: .seconds(30)) { complete, isActive in
-            let queue = DispatchQueue(label: "cadenza.audio-compress")
+            let queue = DispatchQueue(label: "cadenza.audio-compress", qos: .utility)
             writerInput.requestMediaDataWhenReady(on: queue) {
                 guard isActive() else { return }
                 while writerInput.isReadyForMoreMediaData, isActive() {
@@ -524,8 +524,12 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
         let language = json["language"] as? String
         let duration = json["duration"] as? TimeInterval
 
-        // Log top-level keys to diagnose response structure
-        transcriberLog.info(
+        // Log top-level keys to diagnose response structure. Notice level:
+        // .info is not persisted by default, and a diarized response that
+        // arrives without chunks (or with uniform speakers) is otherwise
+        // invisible after the fact. That evidence gap is what made the
+        // August 2026 speaker-collapse regression undiagnosable from logs.
+        transcriberLog.notice(
             "response keys: \(json.keys.sorted().joined(separator: ", "), privacy: .public)"
         )
 
@@ -533,8 +537,9 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
 
         // Diarize models return "chunks" with speaker info instead of "segments"
         if let chunks = json["chunks"] as? [[String: Any]] {
-            transcriberLog.info(
-                "found \(chunks.count, privacy: .public) chunks, first chunk keys: \(chunks.first?.keys.sorted().joined(separator: ", ") ?? "none", privacy: .public)"
+            let distinctSpeakers = Set(chunks.compactMap { $0["speaker"] as? String })
+            transcriberLog.notice(
+                "found \(chunks.count, privacy: .public) chunks, \(distinctSpeakers.count, privacy: .public) distinct speakers, first chunk keys: \(chunks.first?.keys.sorted().joined(separator: ", ") ?? "none", privacy: .public)"
             )
             for chunk in chunks {
                 let chunkText = chunk["text"] as? String ?? ""
@@ -581,25 +586,37 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
         totalChunkCount <= 1 ? rawLabel : nil
     }
 
-    /// Merge consecutive segments from the same speaker into one.
-    private static func mergeSameSpeakerSegments(_ segments: [TranscriptResultSegment]) -> [TranscriptResultSegment] {
+    /// Merge consecutive segments from the same speaker into one, capped at
+    /// ~30s/~500 chars per merged segment (mirroring
+    /// `SpeakerDiarizer.mergeConsecutiveSpeakers`). Unlabeled segments never
+    /// merge: a diarized response whose speaker fields are missing or uniform
+    /// (observed from the API since early August 2026) would otherwise
+    /// collapse a whole upload into one multi-minute segment that no later
+    /// diarization or subdivision pass can meaningfully re-label.
+    static func mergeSameSpeakerSegments(_ segments: [TranscriptResultSegment]) -> [TranscriptResultSegment] {
         guard !segments.isEmpty else { return [] }
         var result: [TranscriptResultSegment] = []
         var startTime = segments[0].startTime
         var endTime = segments[0].endTime
         var speaker = segments[0].speaker
         var parts: [String] = [segments[0].text.trimmingCharacters(in: .whitespaces)]
+        var mergedTextLength = parts[0].count
 
         for seg in segments.dropFirst() {
-            if seg.speaker == speaker {
+            let sameSpeaker = speaker != nil && seg.speaker == speaker
+            let tooLong = (seg.endTime - startTime) > 30 || mergedTextLength > 500
+            if sameSpeaker && !tooLong {
                 endTime = seg.endTime
-                parts.append(seg.text.trimmingCharacters(in: .whitespaces))
+                let trimmed = seg.text.trimmingCharacters(in: .whitespaces)
+                parts.append(trimmed)
+                mergedTextLength += trimmed.count + 1
             } else {
                 result.append(TranscriptResultSegment(startTime: startTime, endTime: endTime, text: parts.joined(separator: " "), speaker: speaker))
                 startTime = seg.startTime
                 endTime = seg.endTime
                 speaker = seg.speaker
                 parts = [seg.text.trimmingCharacters(in: .whitespaces)]
+                mergedTextLength = parts[0].count
             }
         }
         result.append(TranscriptResultSegment(startTime: startTime, endTime: endTime, text: parts.joined(separator: " "), speaker: speaker))

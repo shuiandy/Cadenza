@@ -12,13 +12,13 @@ final class GeminiService: AIServiceProtocol {
         self.transport = transport
     }
 
-    func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String]) async throws -> SummaryResult {
+    func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) async throws -> SummaryResult {
         let modelID = model ?? provider.summaryModel
         let url = try endpointURL(modelID: modelID, streaming: false)
 
         let body: [String: Any] = [
             "system_instruction": [
-                "parts": [["text": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags)]]
+                "parts": [["text": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel)]]
             ],
             "contents": [
                 ["role": "user", "parts": [["text": SummaryPrompt.user(transcript: transcript)]]]
@@ -37,51 +37,45 @@ final class GeminiService: AIServiceProtocol {
             throw AIServiceError.invalidResponse
         }
 
+        guard candidates.first?["finishReason"] as? String == "STOP" else { throw AIServiceError.incompleteResponse }
         return SummaryPrompt.parseResponse(text)
     }
 
-    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String]) -> AsyncThrowingStream<String, Error> {
-        let modelID = model ?? provider.summaryModel
+    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) -> AsyncThrowingStream<String, Error> {
+        streamSummaryCompletion(systemPrompt: SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel),
+            userMessage: SummaryPrompt.user(transcript: transcript), model: model, detailLevel: detailLevel)
+    }
 
-        return AsyncThrowingStream { continuation in
+    func streamSummaryCompletion(systemPrompt: String, userMessage: String, model: String?, detailLevel: SummaryDetailLevel) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let url = try self.endpointURL(modelID: modelID, streaming: true)
-
+                    let url = try endpointURL(modelID: model ?? provider.summaryModel, streaming: true)
                     let body: [String: Any] = [
-                        "system_instruction": [
-                            "parts": [["text": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags)]]
-                        ],
-                        "contents": [
-                            ["role": "user", "parts": [["text": SummaryPrompt.user(transcript: transcript)]]]
-                        ],
-                        "generationConfig": [
-                            "temperature": 0.3
-                        ]
+                        "system_instruction": ["parts": [["text": systemPrompt]]],
+                        "contents": [["role": "user", "parts": [["text": userMessage]]]],
+                        "generationConfig": ["temperature": 0.3]
                     ]
-
-                    let events = try self.postStreamJSON(url: url, body: body)
-
-                    for try await payload in events {
+                    var reason: String?
+                    for try await payload in try postStreamJSON(url: url, body: body) {
                         try Task.checkCancellation()
-                        guard let lineData = payload.data(using: .utf8),
-                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                              let candidates = json["candidates"] as? [[String: Any]],
-                              let content = candidates.first?["content"] as? [String: Any],
-                              let parts = content["parts"] as? [[String: Any]],
-                              let text = parts.first?["text"] as? String else { continue }
-                        continuation.yield(text)
+                        guard let data = payload.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                        if json["error"] != nil { throw AIServiceError.invalidResponse }
+                        guard let candidate = (json["candidates"] as? [[String: Any]])?.first else { continue }
+                        if let terminal = candidate["finishReason"] as? String { reason = terminal }
+                        if let content = candidate["content"] as? [String: Any], let parts = content["parts"] as? [[String: Any]] {
+                            for part in parts where part["thought"] as? Bool != true {
+                                if let text = part["text"] as? String { continuation.yield(text) }
+                            }
+                        }
                     }
+                    try Task.checkCancellation()
+                    guard reason == "STOP" else { throw AIServiceError.incompleteResponse }
                     continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+                } catch { continuation.finish(throwing: error) }
             }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
         }
     }
 

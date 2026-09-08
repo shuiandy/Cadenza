@@ -292,10 +292,11 @@ struct M1StorageMigration {
 
     /// Target validation gate used before any registry re-establishment or
     /// source retirement on a resumed launch. The profile store must exist
-    /// as a regular file whose full logical digest is computable (a
-    /// complete, readable database); with `requireExactDigest` it must
-    /// equal the digest recorded after the staged mutations — which binds
-    /// every entity and field, counted or not. Anything else fails closed.
+    /// as a regular file that passes the structural probe (a complete,
+    /// readable database); with `requireExactDigest` its full logical
+    /// digest must equal the digest recorded after the staged mutations —
+    /// which binds every entity and field, counted or not. Anything else
+    /// fails closed.
     /// The exact check applies wherever the target should still be the
     /// untouched migration product; a target that has served as the live
     /// store since (journal already `done`) is validated for integrity
@@ -318,7 +319,7 @@ struct M1StorageMigration {
                 return false
             }
             do {
-                _ = try SQLiteLogicalDigest.digest(of: storeURL)
+                try SQLiteStoreProbe.verifyReadable(at: storeURL)
                 return true
             } catch {
                 NSLog(

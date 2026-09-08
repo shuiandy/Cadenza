@@ -118,6 +118,23 @@ struct TranscriptDelta: Sendable {
     let text: String
     let isFinal: Bool
     let language: String?
+    /// True when `text` is a complete hypothesis that supersedes whatever the
+    /// stream said last, rather than an increment to append to it. Dedicated
+    /// ASR models (Apple's, gemini-3.5-transcribe-live) resend the whole
+    /// utterance as it firms up; appending those would duplicate every word.
+    let replacesHypothesis: Bool
+
+    init(
+        text: String,
+        isFinal: Bool,
+        language: String?,
+        replacesHypothesis: Bool = false
+    ) {
+        self.text = text
+        self.isFinal = isFinal
+        self.language = language
+        self.replacesHypothesis = replacesHypothesis
+    }
 }
 
 /// Result from post-recording transcription.

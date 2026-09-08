@@ -126,7 +126,12 @@ REVIEWED_BINARY_ASSET_FILES = frozenset(
 
 FORBIDDEN_CONTENT = (
     (re.compile(r"/Users/[A-Za-z0-9._-]+/"), "absolute macOS user path"),
-    (re.compile(r"\bDEVELOPMENT_TEAM\s*[=:]"), "hard-coded Apple development team"),
+    # The signing template documents the setting with a placeholder; any other
+    # value after the key is a real team ID and still fails.
+    (
+        re.compile(r"\bDEVELOPMENT_TEAM\s*[=:](?!\s*ABCDE12345\b)"),
+        "hard-coded Apple development team",
+    ),
     (
         re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
         "private key material",
@@ -170,7 +175,6 @@ LEGACY_COMMENT_FILES: frozenset[str] = frozenset(
         "Cadenza/Models/ArtifactTargetKey.swift",
         "Cadenza/Models/MeetingEvent.swift",
         "Cadenza/Models/NavigationDestination.swift",
-        "Cadenza/Services/AI/AIGenerationGate.swift",
         "Cadenza/Services/AI/MeetingPrepContextBuilder.swift",
         "Cadenza/Services/AI/MeetingPrepEligibility.swift",
         "Cadenza/Services/AI/MeetingPrepFingerprint.swift",

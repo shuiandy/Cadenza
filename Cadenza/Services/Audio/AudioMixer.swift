@@ -60,15 +60,28 @@ final class AudioMixer {
     private(set) var outputFileURL: URL?
 
     /// Sustained-silence tracking across both capture paths (system + mic).
-    /// Fed from background callbacks; read by RecordingEngine's watchdog tick.
+    /// Fed from background callbacks; read by RecordingEngine's auto-stop
+    /// silence watchdog, where audio on either track keeps the recording alive.
     private let silenceTracker = SilenceTracker()
+
+    /// Sustained-silence tracking for the system-audio track alone. Realtime
+    /// transcription is fed only this track, so provider-facing checks (the
+    /// no-delta watchdog, the speech-retry gate) must consult this tracker:
+    /// the combined one goes non-silent on local mic noise the provider
+    /// never hears.
+    private let systemAudioSilenceTracker = SilenceTracker()
 
     var sustainedSilenceDuration: TimeInterval {
         silenceTracker.silenceDuration
     }
 
+    var systemAudioSustainedSilenceDuration: TimeInterval {
+        systemAudioSilenceTracker.silenceDuration
+    }
+
     func resetSilenceTracking() {
         silenceTracker.reset()
+        systemAudioSilenceTracker.reset()
     }
 
     /// Prime the Core Audio tap from a user-initiated UI action without starting
@@ -108,6 +121,7 @@ final class AudioMixer {
 
         pauseFlag.isPaused = false
         silenceTracker.reset()
+        systemAudioSilenceTracker.reset()
         let url = outputURL ?? defaultOutputURL()
         outputFileURL = url
 
@@ -131,6 +145,7 @@ final class AudioMixer {
         let levelSampler = AudioLevelSampler()
         let micLevelSampler = AudioLevelSampler()
         let tracker = silenceTracker
+        let systemTracker = systemAudioSilenceTracker
 
         // Capture the transcription callback for use in the closure
         let transcriptionCallback = onTranscriptionAudio
@@ -149,11 +164,13 @@ final class AudioMixer {
                 break
             case .level(let level):
                 tracker.record(level: level)
+                systemTracker.record(level: level)
                 Task { @MainActor [weak self] in
                     self?.currentAudioLevel = level
                 }
             case .unknownFormat:
                 tracker.record(level: nil)
+                systemTracker.record(level: nil)
             }
 
             // Forward converted audio for real-time transcription

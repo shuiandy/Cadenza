@@ -100,6 +100,7 @@ enum ExportContentRenderer {
         if !detail.tags.isEmpty {
             lines.append("- Tags: \(detail.tags.joined(separator: ", "))")
         }
+        if let metadata = summary.generationMetadata { lines += ["", metadata.exportStatusText] }
         lines += ["", "## Overview", "", summary.overview, ""]
 
         if !summary.chapters.isEmpty {

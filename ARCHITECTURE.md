@@ -1,9 +1,13 @@
 # Cadenza 架构总览
 
-Last updated: 2026-03-27
+Last updated: 2026-09-06
 
 > 本文档是 Cadenza 的唯一架构入口。
 > 任何影响录音生命周期、后处理、持久化、详情页加载、用户可见状态、权限、AI 上下文装配的改动，都必须同步更新本文件。
+
+本次校准范围：启动、数据库读取与缓存、集合/详情 UI、转录与摘要调度、MCP 性能。
+描述以本 checkout 的源码为准，包含工作区已有的 Gemini 和 MCP bridge 改动；不代表这些改动
+已提交、发布或安装。其它专题保留原有记录，不能把文件日期当作全篇所有结论的重新验收日期。
 
 ## 0. 文档目的
 
@@ -25,6 +29,21 @@ Last updated: 2026-03-27
 - toolbar / overlay / detail 页的用户可见状态
 - 权限敏感 API 的调用方式
 - AI assistant / project AI 的上下文装配
+
+### 0.1 性能审查入口
+
+| 要回答的问题 | 本文入口 | 源码入口与关键符号 |
+| --- | --- | --- |
+| 启动为何等待，MCP 何时可用 | §9 | [AppBootSequence](Cadenza/App/AppBootSequence.swift)、[ProfileBootstrap](Cadenza/Services/Profiles/ProfileBootstrap.swift) `runPipeline/bootTargetProblem`、[AppState](Cadenza/App/AppState.swift) `setup` |
+| 列表、搜索和写入如何争用数据库 | §7.3、§7.6–7.7 | [RecordingsStore](Cadenza/Services/Persistence/RecordingsStore.swift) `fetchRecordingDTOs/searchRecordingDTOs/save` |
+| 千条录音的滚动、glass 与详情刷新 | §8.3–8.7、§8.14 | [RecordingsContentView](Cadenza/Views/Recordings/RecordingsContentView.swift)、[RecordingDetailView](Cadenza/Views/Recordings/RecordingDetailView.swift)、[ColorHex](Cadenza/Utilities/ColorHex.swift) |
+| 转录、说话人和摘要究竟几路并发 | §5.6–5.7、§6.2、§6.4 | [PostProcessingCoordinator](Cadenza/Services/PostProcessing/PostProcessingCoordinator.swift)、[AIGenerationGate](Cadenza/Services/AI/AIGenerationGate.swift)、[SpeakerDiarizer](Cadenza/Services/Transcription/SpeakerDiarizer.swift) |
+| MCP 页大小是否约束后端读取量 | §12.x、§14.4 | [MCPToolRegistry](Cadenza/Services/MCP/MCPToolRegistry.swift) `listRecordings/fetchActiveDetail`、[CadenzaMCPMain](CadenzaMCP/CadenzaMCPMain.swift) `runBridge` |
+| 当前瓶颈、优化顺序和验收方法 | [§14.4](#current-performance-findings)、[§15.5](#performance-priorities)、[§17](#validation-baseline) | [2026-09-06 性能审查](docs/reviews/performance-audit-2026-09-06.md)（代码证据、隔离探针与限制） |
+
+“已确认调用链/复杂度”“隔离探针实测”“真实 App 性能验收”分开记录；历史的 Fixed/Done
+仅说明当时那项改动，不表示当前整条链路已无瓶颈。当前未完成真实 App 的千条录音 GPU/帧率、
+真实数据库 SQL 统计及云端转录 RTF 验收，不应从 lazy 容器、DTO 或 Task 名称推断这些结果。
 
 ## 1. 模块总览
 
@@ -52,7 +71,9 @@ Cadenza app process
 └── RecordingsStore (SwiftData ModelActor)
 ```
 
-当前设计是单进程。没有 XPC service，也没有 CoreEngine 单独进程。
+App 内的录音、转录与数据服务仍在同一个进程，没有 XPC service 或 CoreEngine 单独进程。
+当前工作区另有 `cadenza-mcp` 辅助可执行程序：客户端通过 stdio 调用它，再经 loopback HTTP
+访问 App 的 MCP server；它不直接打开录音数据库，见 §12.x。
 
 ### 1.2 模块职责表
 
@@ -65,7 +86,7 @@ Cadenza app process
 | 持久化 | `RecordingsStore`, `Recording`, `Transcript`, `MeetingSummary`, `Folder`, `Project`, `SpeakerProfile`, `DatabaseBackup` | SwiftData 数据存储、DTO 转换、备份、恢复 bookkeeping | 视图层尽量不直接持有 SwiftData model |
 | Recordings UI | `RecordingsContentView`, `RecordingCardView`, `RecordingListRow`, `RecordingDetailView` | 列表、卡片、详情、手动重试 / 重生摘要、播放、speaker mapping | detail 页是按需 reload，不是 live object 绑定 |
 | Project UI / memory | `ProjectDetailView`, `ProjectMemoryService` | 项目聚合视图、项目级 AI brief / ask AI | 走结构化上下文，不是简单拼 prompt |
-| AI assistant | `AIChatView`, `ChatHistoryManager` | 对近期录音做问答、流式回复、聊天历史 | 当前不是索引检索，而是先加载 detail DTO 再拼上下文 |
+| AI assistant | `AIChatView`, `AIContextAssembler`, `QueryAnalyzer`, `ChatHistoryManager` | 按问题范围组装上下文、流式回复、聊天历史 | 已有统一 context assembler 与预算/缓存；不等于全文索引或全库召回保证，见 §12.6 |
 | 导出 / OAuth | `ExportService`, `NotionExportService`, `CraftExportService`, `GoogleCalendarService`, `ZoomMeetingService`, `OAuthTokenManager` | 导出与第三方连接 | 仍然都在主进程内 |
 | 权限 / 工具 | `Permissions`, `KeychainManager`, `StoreRepair` | 权限判断、密钥、容错工具 | `StoreRepair` 存在，但当前主 DTO 路径没有真正用上 |
 
@@ -75,6 +96,10 @@ Cadenza app process
 - Keychain 读取在主进程里直接完成
 - `UserDefaults` 直接在主进程读取
 - SwiftData 访问统一经过 `RecordingsStore`
+- 性能优化必须保留转录/摘要期间手动与自动开始新录音的能力；仅真实 finalization、其它录音
+  claim 与存储迁移等既有排他边界继续生效，不能把后台处理 busy 当作禁止录音的理由
+- 保留产品要求的 glass effect、全库可达性、选择/滚动位置、播放状态、转录质量和权限选择；
+  缩小资源开销不能通过静默删功能、改 provider 或隐藏后续录音实现
 
 ## 2. 状态归属与用户可见状态
 
@@ -362,21 +387,21 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 | 功能 | Provider | Model ID |
 | --- | --- | --- |
 | 录后转录 | OpenAI（默认） | `gpt-4o-transcribe-diarize` |
-| 录后转录 | Gemini | `gemini-3.1-flash-lite-preview` |
+| 录后转录 | Gemini | `gemini-3.5-transcribe`（Interactions API，非 generateContent） |
 | 录后转录 | Whisper Local | `tiny` / `base` / `small` / `medium` (CoreML) |
 | 录后转录 | Apple | 系统 SpeechTranscriber |
-| 实时转录 | OpenAI（推荐） | `gpt-4o-transcribe` |
-| 实时转录 | Gemini | `gemini-2.5-flash-preview-native-audio-dialog` |
+| 实时转录 | OpenAI（推荐） | `gpt-live-transcribe` |
+| 实时转录 | Gemini | `gemini-3.5-transcribe-live` |
 | 实时转录 | Apple | 系统 SpeechAnalyzer |
 | 说话人识别 | SpeakerKit (Local) | PyannoteModels (on-device) |
-| Summary | OpenAI | `gpt-5.4` |
+| Summary | OpenAI | `gpt-5.6-sol` |
 | Summary | Claude | `claude-sonnet-4-6` |
-| Summary | Gemini | `gemini-3.1-pro-preview` |
+| Summary | Gemini | `gemini-3.7-flash` |
 | Summary | MiniMax | `MiniMax-M2.7` |
 | Summary | Apple (Local) | FoundationModels (~4K token context) |
-| Chat | OpenAI | `gpt-5.4`（与 summary 同；team 确认 mini ID 后可切） |
+| Chat | OpenAI | `gpt-5.6-terra`（latency-first tier） |
 | Chat | Claude | `claude-haiku-4-5`（fast tier，~5x 便宜，~3-5x 快） |
-| Chat | Gemini | `gemini-3.1-pro-preview`（与 summary 同；team 确认 flash ID 后可切） |
+| Chat | Gemini | `gemini-3.7-flash`（与 summary 同） |
 | Chat | MiniMax | `MiniMax-M2.7`（本身较快，与 summary 同） |
 | Chat | Apple (Local) | FoundationModels |
 | AI Context Budget | Claude/OpenAI | ~30k tokens |
@@ -423,16 +448,42 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 
 | 参数 | 值 |
 | --- | --- |
-| 默认模型 | `gemini-3.1-flash-lite-preview` |
+| 默认模型 | `gemini-3.5-transcribe` |
 | 分块 | `>10min` 或 `>15MB` 自动分 5 分钟 chunk |
 | chunk 并发 | 5 |
 | 上传方式 | 单文件直传，或 chunk 导出后逐块上传 |
 | 请求超时 | 300s |
 | 资源超时 | 600s |
 
+`gemini-3.5-transcribe` 走 `POST /v1beta/interactions`（模型名在 body 里，不在 path），
+不再靠提示词加 response_schema 让 flash 模型自己吐 JSON。转录在 `output_text`，
+说话人与词级时间戳在 `steps[].content[].annotations[]` 的 `word_info` 里。
+`GeminiTranscribeInteraction` 负责构造与解析，按说话人变化、1.5s 静音、30s/500 字
+上限从词切分成段（与 `mergeSameSpeakerSegments` 同一套上限，防止塌缩成巨段）。
+请求显式带 `store: false`：Interactions API 默认留存交互 55 天（付费档），
+不关等于让 Google 存一份会议音频。model ID 含 `transcribe` 才走这条路，
+其余（如用户把 `transcriptionModel.gemini` 覆盖成 flash）仍走旧的 generateContent 路径。
+
+**provider 劣化处理**（照着 2026-08 OpenAI diarize 那次的教训设计）：
+`parse` 除了转录还回一个 `Quality`（词数 / 有时间戳的词数 / 有说话人的词数，只有计数
+没有内容）。判定分三档：
+
+| 响应形态 | 判定 | 行为 |
+| --- | --- | --- |
+| 有词标注有时间戳，speaker 全空 | **不算劣化** | 正常按词切分，说话人留给本地 diarization；notice 记一笔 |
+| 完全没有词标注 | 劣化 | 重试（劣化是逐请求抖动的，重试常常就好了），耗尽后按句切分并把时间按字数占比铺满该 chunk |
+| 有词标注但没时间偏移 | 劣化 | 同上 |
+
+关键不变量：**任何劣化都不允许退化成一整段**。旧的 `startTime: 0, endTime: 0` 单段
+写法连 `subdivideCoarseSegments` 都救不了（它只切 >60s，而那段声称时长为 0），
+下游没有任何东西可对齐。兜底段的时间是插值的，日志会明说，别把它当真实时间戳。
+日志一律走 `os.Logger` 的 `.notice`/`.error`，NSLog 在当前 macOS 进不了统一日志，
+上次就是因此两周无人察觉。
+
 当前行为：
 
 - duration 读取失败但文件很大时，会按文件大小估算时长，避免错误退回单请求路径
+- 分块转录时丢弃 provider 的 `spk_N` 标签（chunk 之间不通用），交给本地 diarization
 - chunk 导出会压成 16kHz mono AAC 32kbps，减小上传体积
 - 通过 `onProgress(done, total)` 回传 chunk 级进度，toolbar 显示 `Transcribing 0/7...` → `Transcribing 3/7`
 - Prompt 要求按说话人切换分段，同一说话人连续发言合成一段
@@ -440,7 +491,8 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 剩余瓶颈：
 
 - 单个 chunk 仍然是 base64 JSON 上传，不是流式上传
-- 首个 chunk 有冷启动延迟（模型加载），后续 chunk 复用连接秒完
+- 当前 `apiPermits.withPermit` 覆盖完整重试循环，2s/4s 退避仍占名额；OpenAI 路径已按每次 attempt 申请/释放
+- 每任务独立 export/API pool；本地编码、网络等待与 provider 耗时应分开计时，不能从请求顺序推断服务端模型冷启动或宣称后续 chunk “秒完”
 
 #### Apple `AppleSpeechTranscriber`
 
@@ -548,18 +600,19 @@ OpenAI `gpt-4o-transcribe-diarize` 使用 `diarized_json` response format（不�
 
 | 参数 | 值 |
 | --- | --- |
-| 模型 | `gemini-2.5-flash-preview-native-audio-dialog` |
+| 模型 | `gemini-3.5-transcribe-live` |
 | 连接超时 | 10s |
 | TCP keepalive | 30s |
 | 单次 raw send deadline | 10s |
 | audio-stream-end deadline | 2s |
 | 音频格式 | `audio/pcm;rate=16000` |
-| responseModalities | `["AUDIO"]`（必须，否则 inputAudioTranscription 不生效） |
-| 转录配置 | `inputAudioTranscription: {}` |
+| responseModalities | `["TEXT"]`（专用 ASR；旧对话模型走 `["AUDIO"]`） |
+| 转录配置 | `inputAudioTranscription: { languageCodes: [...] }` |
+| 会话上限 | 10 分钟（到点断开，走 RecordingEngine 重连轮转） |
 
-转录文本提取优先级：`inputTranscription` → `outputTranscription`。不使用 `modelTurn`（那是模型的语音回复，不是转录结果）。实现为 actor，不再依赖 legacy `@unchecked Sendable`；raw send/receive 的 callback、deadline、caller cancellation 共享 resume-once 状态，timeout/cancel 只撤销本 session 的 exact transport。stop 先 finish stream、取消 retained receive task 和 transport，绝不等待 WebSocket close frame。startup catch 还会同时校验 generation 与 transport identity，A 的迟到失败不能撤销复用同一 service 实例后的 B。
+转录文本提取优先级：`inputTranscription` → `interimInputTranscription` → `outputTranscription`。不使用 `modelTurn`（那是模型的语音回复，不是转录结果）。两代模型对 `inputTranscription` 的语义不同：专用 ASR 把它当作**整句定稿**（interim 走单独字段，且每条 delta 是整句重写，故打 `replacesHypothesis`），旧对话模型把它当作**增量**、靠 `turnComplete` 判定终态。`GeminiRealtimeTranscriber.usesDedicatedTranscription` 按 model ID 里是否含 `transcribe` 分流。实现为 actor，不再依赖 legacy `@unchecked Sendable`；raw send/receive 的 callback、deadline、caller cancellation 共享 resume-once 状态，timeout/cancel 只撤销本 session 的 exact transport。stop 先 finish stream、取消 retained receive task 和 transport，绝不等待 WebSocket close frame。startup catch 还会同时校验 generation 与 transport identity，A 的迟到失败不能撤销复用同一 service 实例后的 B。
 
-注意：Gemini Live API 本质是对话模型，转录是 `inputAudioTranscription` 附带功能，延迟高于 OpenAI 专用转录 API。
+注意：`gemini-3.5-transcribe-live` 之前用的是对话模型，转录只是 `inputAudioTranscription` 的附带产物，质量与延迟都明显吃亏；换成专用 ASR 后这条不再成立。代价是 live 会话不支持 diarization 与词级时间戳，且单次上限 10 分钟。
 
 #### Apple 本地 realtime
 
@@ -593,7 +646,7 @@ OpenAI `gpt-4o-transcribe-diarize` 使用 `diarized_json` response format（不�
 - 与上次 flush 相隔 ≥ 180ms flush
 - final 段之间时间间隔短、长度短时会合并
 - 尾部 final 段会再做 compact
-- 8 秒无文本输出但有音频发送时，watchdog 会报 realtime failure
+- 8 秒无文本输出但有音频发送时，no-delta watchdog 触发：**系统轨**近 6s 静音（`AudioMixer.systemAudioSustainedSilenceDuration`）视为正常静音只记诊断；否则判半开连接报 realtime failure。判定只看系统轨，因为实时流只喂系统音频——合并轨（含麦克风）会被本地环境声污染，把「远端没人说话」误判成「有语音没转录」（2026-08-20 实锤：开会等人阶段连环误杀烧光重连额度）。放弃后的 speech-retry 门限同样只看系统轨；首条 delta 触发 `onRealtimeStreamHealthy`（清重连计数、清 speech-retry 队列、清中断横幅——give-up 不关流，session 可以带着横幅自愈）
 
 ### 5.5 实时转录启动顺序
 
@@ -620,7 +673,23 @@ callback 必须在 capture 前安装，因为 `AudioMixer` 会在启动时快照
 - 流程：`diarize(audioURL:)` → `DiarizationResult` → `applySpeakersAligned()`（WhisperKit 对齐）或 `applySpeakers()`（IoU overlap fallback）→ `mergeConsecutiveSpeakers()`
 - IoU 匹配：`SpeakerSegment` 的 `Float` 时间戳转 `TimeInterval`，逐 entry 找最大重叠的 speaker segment
 - 合并：同 speaker 连续段落合并，cap 在 30s / 500 chars 防止 SwiftUI 渲染巨型文本块
-- 空白 entry 过滤：合并前先 `removeAll` 纯空白 entries
+- 空白 entry 过滤：后处理合并结束、保存前 `removeAll` 纯空白 entries
+
+当前资源边界：`diarizationGate` 串行化分析，模型 prepare 为 single-flight，但每次分析仍通过
+`AudioProcessor.loadAudioAsFloatArray` 完整解码音频。仅 16kHz mono Float32 数据就约
+230.4MB/小时，不含模型及张量。启用 speaker memory、且没有可复用样本时，
+`runSpeakerMemoryIfNeeded` → `SpeakerKitEmbeddingExtractor.extractEmbeddings` 再调用
+`SpeakerDiarizer.diarize`；首次分析的 `windowEmbeddings` 尚未传给该路径复用。
+因此“单次只跑一个分析”不等于“同一录音只分析一次”，见 §14.4。
+
+### 5.7 本地 Whisper 的窗口与预处理边界
+
+[LocalWhisperPipelineRuntime](Cadenza/Services/Transcription/LocalWhisperPipelineRuntime.swift)
+共享一个缓存 pipeline，以单 permit 串行推理；默认 core 窗口 10 分钟，两侧 overlap 5 秒，
+按时间归属及去重保留边界文本，模型切换前释放旧 pipeline。
+[LocalWhisperTranscriber](Cadenza/Services/Transcription/LocalWhisperTranscriber.swift)
+仍先把整段音频转换为 16kHz mono Int16 WAV，再进入窗口推理。窗口限制了单次输入数组，
+但没有消除完整 WAV 的转换等待和临时磁盘开销；SpeakerDiarizer 的全音频数组也不受此窗口约束。
 
 ### 5.8 实时转录 UI 节流
 
@@ -647,25 +716,22 @@ callback 必须在 capture 前安装，因为 `AudioMixer` 会在启动时快照
 
 ### 6.1 自动后处理全链路
 
-`PostProcessingCoordinator.startPostProcessing(...)` 的顺序是：
+`startPostProcessing(...)` 管理提交、去重、defer 及 leases；实际阶段由 `processJob` 执行：
 
-0. 验证音频文件存在（不存在则跳过，不报错）
-1. 录音时长 < 30s 时直接丢弃，不调 API（`minimumTranscriptionDuration = 30`）
-2. 解析转录 provider
-3. 转录音频文件
-4. 说话人识别（如已启用）：`SpeakerDiarizer` → `applySpeakersAligned` / `applySpeakers` → `mergeConsecutiveSpeakers`
-5. 如 provider 输出过粗，合成更可读的 transcript entries
-6. `subdivideCoarseSegments()`：将 >60s 的段落按句子边界（`.!?。！？…`）拆分，时间按字数比例分配；支持 CJK 句子边界和 CJK/Latin 混排拼接
-7. 过滤空白 entries（`text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty`）
-8. 保存 transcript
-9. transcript 为空则自动 discard
-10. 流式生成 summary，并在同一次 LLM 请求里 inline 分类 meeting type
-11. 验证 summary 是否”有意义”
-12. 保存 summary + meetingType（单次写入，`chaptersJSON = nil`）
-13. 音频压缩（48kHz → 16kHz M4A，`replaceItemAt` 原子替换，仅在压缩后更小时替换）
-14. chapters 不再自动生成，改为用户打开 detail 页时按需触发（`generateChaptersIfNeeded`）
-15. 如已配置则 auto export
-16. 增加 `postProcessingCompletedToken`
+1. 检查文件与所选 provider 配置；缺文件或配置错误按失败结束，保留恢复/重试信息
+2. `0 < duration < 30s` 走短录音 trash，不调转录 API（`minimumTranscriptionDuration = 30`）
+3. 申请 transcription slot，调用本 job 的 TranscriptionManager，runner 返回后释放 slot
+4. 先构造可读 entries，再用 `subdivideCoarseSegments()` 细分 >60s 粗段；插值时间不能当作 provider 原始时间戳
+5. 如已启用且转录未失败，执行 SpeakerDiarizer 并在细分 entries 上分配 speaker；分析失败非致命
+6. 合并连续同 speaker 段（30s/500 chars 上限）、过滤空白，保存 transcript 并取得 speaker identity revision
+7. 保存成功且满足 consent/标签条件时，启动独立 speaker memory 任务；它不阻塞 summary，但可能重复分析音频
+8. 未失败且 transcript 为空时走空内容 trash；失败不能等同于静音或无内容
+9. 申请 summary slot，格式化带 speaker 映射的正文，执行 quick/enrich 或 map-reduce（另受 AIGenerationGate 限制）
+10. 按 §6.3 验证结果，同次保存 summary + meetingType；失败保留录音
+11. 未失败时执行受所有权约束的音频压缩，按设置 auto export，最后 `finishJob` 更新完成状态
+
+Chapters 不属于自动后处理固定阶段，用户打开有 summary、无 chapters 的详情时按需生成。
+当前首份 transcript 保存仍要等步骤 5 的 diarization；“先呈现文本再补 speaker”是优化候选，尚未实现。
 
 #### `buildEntries()` — Segment 到 Entry 转换
 
@@ -692,29 +758,51 @@ callback 必须在 capture 前安装，因为 `AudioMixer` 会在启动时快照
 - 持久化发生在完整结果 parse 成功之后
 - 流式 summary 中途失败时保留已流出的 partial text，不清空
 
+#### Summary detail preference
+
+Settings → Transcription → Summary & AI uses the device-level `summaryDetailLevel` preference. Stored values remain compatible: `highlights` = Brief, `detailed` = Standard (default), `fullBreakdown` = Detailed. Previously this control was not connected to generation.
+
+`SummaryGenerator` snapshots the level at generation start and explicitly passes it through quick/review, map/reduce and provider calls. Direct provider calls snapshot the setting at their service boundary. The level controls narrative depth; attribution, factual accuracy and material task/decision conditions remain mandatory at every level. Apple FM uses compact depth instructions and remains subject to its local context limit. Changes affect new/regenerated summaries only; existing results are not rewritten.
+
 #### Map-reduce for long transcripts
 
 Transcripts exceeding 40,000 characters (~30 min meeting) automatically use map-reduce:
 
 1. `SummaryPrompt.splitForMapReduce` 按段落/句子边界切成 ~15K char chunks
-2. Map phase: 每个 chunk 通过 `streamChat` 并行生成纯文本摘要（`withThrowingTaskGroup`）
+2. Map phase: 每次只提交下一个 chunk 的 `streamSummaryCompletion`，各 chunk 之间释放 provider 域的单个许可，让其他等待任务有机会执行
 3. Reduce phase: chunk summaries 组合后流式传给 reduce prompt，输出标准 JSON 格式
 
 Fallback: map phase 失败时自动回退到 single-prompt 路径，调用者不会看到退化。
 
-UI 体验：短暂等待（map 并行处理）→ 流式输出最终摘要。
+UI 体验：等待 map 结果后，流式输出 reduce 的最终摘要；等待时长取决于各 map 及 gate 排队，
+不能以 task group 的并发数推断网络并发。Quick/enrich、Recap、Meeting Prep 也使用此 gate，
+不同 cloud provider 使用独立许可，本地推理共享本地域。coordinator 的 summary pool 与此 gate 是两层约束。
 
 #### Two-stage summary (quick + enrich)
 
-For transcripts ≤ 40K chars (single-prompt path), summary generation uses two API calls:
+For transcripts ≤ 40K chars, generation normally uses two calls: a quick draft and a complete review against the source. The review returns optional `review_issues`; a concrete unresolved issue with an exact source excerpt can trigger **at most one** repair for the evaluated OpenAI model IDs. Unsupported providers keep the complete review with an unresolved status. Long input retains map/reduce; Apple retains its compact local path. No fact-ledger pipeline is used.
 
-1. **Quick phase**: `quickSystem` prompt → JSON with title/overview/key_points/action_items/tags/meeting_type
-2. **Enrich phase**: `enrichSystem` prompt (transcript + quick context) → JSON with decisions/follow_ups
-3. **Merge**: combine into full `SummaryResult`
+`SummaryGenerationMetadata` is versioned optional JSON on `MeetingSummary`, not on the recording list row. It records depth, prompt version, actual processing stage and the exact input revision. Processing status does not certify factual accuracy. Legacy absence remains unrecorded. A draft fallback cannot overwrite a prior completed review; regeneration preserves completed and explicitly user-edited tasks.
 
-UI shows quick results immediately; decisions/follow-ups sections display a spinner during enrich. DB write happens once after merge.
+`SummarySourceVersion` captures exact transcript content/timing separately from mapped-speaker input. Summary/chapter CAS compares the persistent transcript ID and transcript digest; speaker-name changes retain output and set a separate advisory flag. Legacy combined digests fall back to the persistent transcript ID, which changes on every transcript replacement. `saveSummary` distinguishes saved, superseded, cancelled, unavailable, retained-reviewed, and persistence-failure outcomes. Every transcript replacement invalidates chapters and review provenance, regardless of speaker-reset mode. Summary/chapter writes compare the captured version atomically; a new summary ID rejects late chapter writes. Detail conversion hides stale chapters; list projections do not fault summary content. Calendar or role does not supply evidence for the base meeting record. Name, model and depth are captured before generation stages.
 
-Enrich failure is graceful: quick result is returned as-is (decisions/followUps empty). Map-reduce path does NOT use two-stage (reduce already produces full JSON).
+The shared `AIGenerationGate` maintains one permit per cloud provider and a separate local-resource domain. It supports waiting cancellation, error release and bounded foreground preference (a waiting background request is served after three foreground handoffs). Automatic recording summaries explicitly use foreground priority across detached tasks; on-demand chapters use background priority. Active requests are not preempted. Same-provider sequential stages remain sequential. Aggregate map-worker wait time is not wall-clock delay and must not be subtracted from end-to-end latency.
+
+New transcripts persist a compact unmapped source version on `Transcript` when saved/imported. Detail reads use a bounded 64-entry cache for legacy or mapped versions; no transcript content is retained by that cache. The first mapped read after a cold start can still format/hash once. Summary-only context reads omit transcript DTOs; candidate selection queries the earlier 90-day window only when opening the editor. New provenance fields stay outside the explicit web-sync whitelist.
+
+Cloud summary calls require normal provider termination (Claude end-turn/message-stop, OpenAI stop/DONE, Gemini STOP). Chat retains its existing partial-output behavior. Developer summary evaluation is DEBUG-only, claims its task slot synchronously, and requires explicit paid-request confirmation; absent first-readable timings remain unknown. These transport checks do not establish factual quality.
+
+#### Optional personal context and history
+
+`SummaryContextRecord` holds per-meeting local input and derived personal notes independently of `Recording`. The profile-scoped `summaryFocus` preference supplies a default; a meeting focus overrides it. Users explicitly update personal notes from the detail view. Updating context does not regenerate the canonical summary or rewrite historical records.
+
+`SummaryContextSnapshot` freezes the saved summary and reference IDs, selected user context, optional linked-calendar data and explicitly selected historical summaries. `MeetingPrepContextBuilder.confirmedHistory` is the shared scoping entry for this stricter history policy: same open profile, active records, earlier than the current meeting, within 90 days, maximum three. Similar titles alone never select history. No permission requests occur. Calendar title/notes emails and URLs are omitted from provider input. Provider payloads use request-local fact/history aliases; recording UUIDs, summary UUIDs and content fingerprints are resolved only locally. Disabled selections and raw editor JSON are excluded by a separate provider payload.
+
+Personal relevance, optional suggestions and historical progress are separate outputs. They never append to `yourTasks` or the canonical decisions. Every current item must reference a saved current-summary item. Historical items retain source IDs, dates and versions; an empty set of current references renders the exact previous fact plus “Not updated in this meeting”. Source deletion, summary/transcript changes, changed selection, calendar unlinking and preference changes invalidate the result. Cloud providers make one optional personal-context call; local providers conservatively select matching summary excerpts without another multi-stage model pipeline.
+
+Private context/results do **not** enter `SummaryDTO`, web sync, MCP summaries, the Markdown mirror or standard/portable exports. A separate user-invoked copy action includes personal output without raw background. Full local database snapshots preserve private context and provenance. The snapshot/profile entity inventory covers the added table, including old stores where that optional table does not yet exist. No server schema rollout is required: the existing web payload whitelist remains unchanged, with strict nested-field tests. Any future remote field needs backend deployment and acceptance verification first.
+
+The existing `QualityComparisonRunner` owns both fictional base-summary and personal-context evaluations. Reports distinguish model runs from deterministic tests and agent inspection from human blind review. Generation metrics include actual usage when the provider supplies it; absent values remain absent. P0 and post-change reports are separate immutable artifacts, not evidence that arbitrary meeting summaries cannot omit facts.
 
 ### 6.3 summary 验证
 
@@ -723,9 +811,9 @@ Enrich failure is graceful: quick result is returned as-is (decisions/followUps 
 - `overview` 不能只是空白
 - `keyPoints` 不能为空
 
-验证失败：
-
-- recording 会被自动丢弃，理由是没有 meaningful content
+当前失败处理区分来源：有明确 generation error 或缺少结果时保留录音并报告失败供重试；
+有结果但无 meaningful content 且无 generator error 时才走 `no_meaningful_content` trash。
+不能把 provider/解析/持久化故障描述或优化成“没有有效内容就删除”。
 
 ### 6.4 `PostProcessingCoordinator` 的并发池模型
 
@@ -746,8 +834,13 @@ private var jobs: [UUID: ActiveJob] = [:]
 - summary 仍串行（避免 LLM provider 限流冲突）
 - 每个 job 拥有独立的 TranscriptionManager 和 SummaryGenerator 实例
 - `isPostProcessing`、`postProcessingPhase`、`transcriptionChunksXxx` 均为 computed properties，从 `jobs` 字典派生
-- cancel 一次取消所有活跃 job，resume 所有 blocked continuation，重置 slot 计数
+- 取消与 slot 生命周期按 job generation/lease 管理；活跃 runner 真正返回后才释放所持 slot，不能在发出 cancel 时提前把容量全量重置
 - detached task handle 存储在 ActiveJob 上，cancel 可传播到实际网络 I/O
+
+上述 2/1 是自动 job 阶段上限，不是进程全部网络/CPU 工作的上限。每个 OpenAI 文件任务另有
+6 export + 6 API permits，Gemini 为 3 export + 5 API permits。两个长任务理论上分别可叠加到
+12/12 或 6/10，实际受 chunk 数与阶段限制。所有 chunk 预先创建 task，导出完成后等待上传，
+尚无跨任务的有界待上传队列；已有 job 在新录音开始后也不会自动下调这些预算。
 
 #### 与录音的调度关系（`RecordingProcessingGate`，非对称）
 
@@ -940,6 +1033,11 @@ Schema([
 
 这是当前数据库线程安全的核心基础。
 
+一次无 suspension 的全量 fetch、关系读取或 DTO 构造会占用该 store，其他读取与写入需等待。
+`await store...` 不等于分页，也不自动消除 I/O 争用。不能仅因 store 在 MainActor 创建就断言
+SQL 全在主线程：2026-09-06 的 Swift 6 最小 ModelActor 探针未观察到这种行为；真实执行器/SQL
+耗时仍应在当前工具链和 App 中采样，探针范围见审查报告。
+
 ### 7.4 数据完整性措施
 
 当前保护手段：
@@ -976,26 +1074,34 @@ Schema([
 
 ### 7.6 数据库性能画像
 
-便宜的部分：
+DTO 是隔离边界，不是低成本查询的证明。当前主路径：
 
-- 列表页只取 `RecordingDTO`
-- 详情页按需取 `RecordingDetailDTO`
-- project 列表只取 `ProjectDTO`
-- 视图层不长期持有 SwiftData model
+| 路径 | 实际工作 | 规模增长的成本 |
+| --- | --- | --- |
+| `fetchRecordingDTOs` | fetch 整个 active/folder 范围；默认日期在 fetch 排序，其它多种排序及标签过滤在内存；无 fetchLimit | 每次刷新随作用域录音数增长 |
+| `recordingToDTO` | 访问 transcript/summary 关系取 200 字符预览；逐 mapping 查询 speaker profile | 可能产生关系 faults/N+1；SQL 次数待实测，短预览不等于只读短正文 |
+| `searchRecordingDTOs` | 全范围 fetch、排序后扫描正文及摘要字段，为所有匹配项构造 DTO | 大致随总内容量增长；250ms debounce 与逐项取消仅减少无效查询 |
+| `fetchRecordingDetail` | 按 ID 构造完整正文/segments/summary，存入 detailCache | 只读遍历会持续积累，缓存没有条目/字节上限 |
+| `save` | 清空整个 detailCache 后保存 | 无关录音写入也导致下次详情重建 |
+| `AppState.refreshRecordings` | 每次独立 Task 重新取全库、重建 SmartFolderCache、增加 token | 多阶段完成/启动刷新没有统一合并，分类缓存仅避免 body 中反复分类 |
 
-不够可扩展的部分：
-
-- `fetchRecordingDTOs()` 对很多排序仍然是取出后内存排序
-- `searchRecordingDTOs()` 是内存全量扫描 title / tags / transcript / summary / decisions / follow-ups / action items
-- 文本搜索复杂度基本是 O(录音数 × 内容大小)
-
-目前对小到中等规模本地库够用，但不是大规模索引架构。
+`fetchRecordingDetailUncached` 已供部分批量导出路径使用，但不能据此推断 MCP/镜像也绕过缓存。
+当前没有覆盖列表与正文搜索的统一分页/全文索引层；不能用固定“少于 1000 条够用”作为验收结论。
+需要同时测录音数、正文长度、segment 行数、说话人关系数及回收站规模。
 
 ### 7.7 隐藏的写放大
 
 `fetchRecordingDetail(recordingID:)` 现在是纯只读。
 
 `lastAccessedDate` 写入已拆为独立的 `markAccessed(recordingID:)`，只在 `RecordingDetailView.onAppear` 调用一次。自动 reload、AI chat 上下文装配、后台后处理路径不再触发写入。
+
+另一个放大路径是 Markdown 镜像：启用时 `save()` 发 `.cadenzaRecordingsChanged`，
+`AppState.configureMarkdownMirror` debounce 500ms 后调用无 IDs 的 `refreshIfEnabled()`。
+[RecordingsStore+MarkdownMirror](Cadenza/Services/Persistence/RecordingsStore+MarkdownMirror.swift)
+读取全部 active recording 和 import ledger，经缓存路径构造所有 detail；
+[MarkdownMirrorService](Cadenza/Services/Export/MarkdownMirrorService.swift) 随后逐条渲染、读取
+已有文件并计算哈希，即使文件未变仍有读取/计算成本。不导出 transcript 也没有避免上游完整 detail
+构造。增量 dirty-ID 刷新是待做项，不能移除现有用户修改冲突检测来减少哈希工作。
 
 ### 7.8 当前数据库防损坏仍不够强的地方
 
@@ -1084,66 +1190,59 @@ detail 页不是 live object 订阅，而是 pull-style reload：
 
 ### 8.3 `loadDetail()` 流程
 
-```swift
-private func loadDetail() {
-    if isActiveRecording { return }
-    detailLoadSequence &+= 1
-    let sequence = detailLoadSequence
-    appState.fetchRecordingDetail(recordingID: recordingID) { dto in
-        guard sequence == detailLoadSequence else { return }
-        if let dto {
-            detail = dto
-            if let path = dto.audioFilePath {
-                audioPlayer.load(url: URL(fileURLWithPath: path))
-            }
-            appState.recordingDetailTitle = dto.title
-            loadLinkedEvent()
-            loadSpeakerProfiles()
-        }
-    }
-}
-```
+以 `RecordingDetailView.loadDetail` 为准，避免在文档复制容易过期的实现代码：
+
+1. 本页对应录音正在捕获时返回
+2. `detailLoadTracker.begin(hasContent:)` 建立请求，异步取 detail
+3. `detailLoadTracker.finish(request:found:)` 验证当前请求，拒绝过期返回
+4. 将 `dto.audioFile` 经当前存储 root 解析为 URL；仅 `playerNeedsReload(loaded:resolved:)` 判断变化时加载播放器
+5. 更新标题、日历及 speaker profiles，重建缓存的 player timeline 和 transcript turns
+6. 有 summary、无 chapters 时触发按需生成；未找到记录时清理派生内容，进入 unavailable 状态
 
 ### 8.4 为什么这里没有明显竞态
 
-`detailLoadSequence` 是 detail 页的关键防线：
+`detailLoadTracker` 是 detail 页的请求防线：
 
 - 每次 load 自增序号
 - callback 返回时序号不一致就丢弃结果
 
 这能挡掉 out-of-order async 返回导致的 stale UI。
 
-### 8.5 三态渲染
+### 8.5 内容与加载状态
 
 ```text
-detail != nil     → 完整详情内容
-isActiveRecording → Recording in Progress placeholder
-其它情况          → Loading...
+detail != nil                → 保留已有详情内容
+isActiveRecording            → Recording in Progress placeholder
+tracker.phase == unavailable → 不可用状态
+其它情况                     → Loading...
 ```
 
 ### 8.6 busy 状态不是单点判断
 
 detail 页会合并：
 
-- 本地 manual flags：`isRetryingTranscription`、`isGeneratingSummary`
-- 全局 pipeline 状态：`recordingState == .transcribing/.summarizing`
+- 按本页 recordingID 查询 `isRetryingTranscription(for:)` / `isGeneratingSummary(for:)`
+- 同一 recordingID 的 `isProcessing(recordingID:)`
 
-这避免 detail 页和 toolbar 对同一条 recording 的理解不一致。
+全局 `recordingState` 仍是 reload 的触发源，但不能据此把其它录音的 busy 映射到本页操作。
 
 ### 8.7 detail 页的性能与副作用
 
 优点：
 
-- transcript / summary 只在 detail 页按需加载
+- detail 页按需拉取 DTO；MCP、列表预览和镜像也会访问正文，不能理解为全 App 只有本页读正文
 - 录音进行中不会错误切到静态 placeholder
 - stale async 结果会被丢弃
 
 成本：
 
 - `lastAccessedDate` 只在 `onAppear` 写一次（不再每次 reload 都写）
-- 只有 audio path 变化时才会 `audioPlayer.load(...)`，避免普通 reload 重置播放状态
+- 只有解析后的 audio URL 变化时才会 `audioPlayer.load(...)`，包括 root 迁移，避免普通 reload 重置播放状态
 - linked calendar event 和 speaker profiles 是额外 follow-up load
 - 多个 token 连续触发时，会出现较密集的 reload
+- 无关录音完成也会触发本页 reload，并重建 timeline/turns；tracker 拒绝陈旧结果，不消除已经发出的读取
+- transcript 行已 lazy；query/speaker 的 `visibleTranscriptTurns` 过滤及 active entry 线性查找仍在播放刷新路径
+- `AudioPlayerService` 的播放 tick 为 250ms；按内容/query revision 缓存过滤、按时间索引定位尚是优化候选
 
 ### 8.8 这页最容易改漏的点
 
@@ -1296,20 +1395,52 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 （14 个），其中 `everyPageOffTheSidebarHasAnExit` 是不变量门禁：**新增的 destination 只要
 `sidebarDestination == nil` 就必须 `requiresExplicitExit`**，漏了会被拦下。
 
+### 8.14 录音集合、玻璃与全库刷新
+
+- `RecordingsContentView.contentForSection`：waterfall/grid 用 LazyVGrid，list 用 LazyVStack；
+  grid/list 另有日期分组及 pinned headers。waterfall 当前是自适应网格，不是真正的 masonry。
+- 卡片使用值类型 DTO，processing phase 由集合传入；没有每张卡片独立的数据库 task。
+  `CardFrameRegistry` 在框选事件读取已 materialize 的 AppKit frame，不在普通滚动时写回 SwiftUI geometry 状态。
+- `dayGroups` 仍在计算属性中调用 `RecordingDayGrouper.group`，全量分组/排序尚无 revision cache。
+  Lazy 只约束视图 materialization，不约束此前的全库 DTO、日期分组及选择集合计算。
+- `ColorHex.swift` 的 `AppCollectionCardModifier` 当前为 fill + stroke，**不含 glassEffect**；
+  `AppGlassPanelModifier` 和玻璃按钮仍经 `PlatformCompatibility` 使用系统 glass。
+  这是现状描述，不是移除卡片玻璃的产品批准，也不能据此声称“保留所有玻璃效果的千条库性能已通过”。
+- 主导航保留根 ContentView，以保存返回列表的滚动/选择状态。优化应缩小数据与视图刷新范围，
+  在目标视觉不变的前提下测试可见玻璃元素的分组、GPU 成本及离屏资源；不能直接销毁根视图来省内存。
+
 ## 9. 启动序列
 
-`AppState.setup()` 的大体顺序：
+### 9.1 服务装配前的 bootstrap
 
-| 阶段 | 主要动作 | 是否可能阻塞 |
+`CadenzaApp` → `AppBootSequence.resolveLive` → `ProfileBootstrap.runLive/runPipeline`，
+先确定 profile/transfer/halt，再构造 AppState、ModelContainer 和服务。TestHost 与隔离 fixture
+有专门分支，不能用它们的启动时间代表真实 profile 启动。
+
+`runPipeline` 是 MainActor 同步路径；`bootTargetProblem` 在容器打开前验证文件并调用
+`SQLiteLogicalDigest.digest`，扫描所有表、行、文本与 BLOB，结果仅作为成功/失败门禁。
+正常已有 profile 路径在初始 active store 与最终 resolved profile 两处检查，通常两次扫描。
+因此 MCP 在 setup 开头启动仍需等待此前 bootstrap。
+
+这是尚存成本，不是可删除的完整性要求。初始与最终门禁都应保留；仅丢弃结果的健康检查可评估
+较轻只读检查，迁移/transfer/retire 用来比较内容的 digest 必须保留。
+`quick_check(1)` 限制错误输出条数，不是只检查一行，也不提供全部 UNIQUE/index 交叉验证。
+
+### 9.2 `AppState.setup()` 的主要顺序
+
+| 阶段 | 当前动作 | 性能与顺序约束 |
 | --- | --- | --- |
-| 1. 装配 | `hasBeenSetUp`、聊天历史加载、store/coordinator/engine 连线 | 否 |
-| 2. 权限 | `await checkPermissions()` | 是 |
-| 3. 检测器 | `MeetingDetector` 回调连线、`startMonitoring()`、快捷键注册 | 否 |
-| 4. 本地数据 | `refreshRecordings()`、`refreshFolders()`、`refreshTrash()` | 否 |
-| 5. 恢复 | `coordinator.recoverInterrupted()`（必须在 auto-trash 前） | 是 |
-| 6. 备份与清理 | `DatabaseBackup.performBackup()`、auto-trash 短录音 | 部分 |
-| 7. 恢复（续） | orphaned audio 恢复、purge trash | 部分 |
-| 7. 日历 | `calendarManager.startMonitoring()` + 30s AppState 同步 | 否 |
+| 1. MCP | 根据 StartupPolicy 启动 listener，然后载入 chat history、接 callback | listener readiness 与 calendar/data readiness 分开；不是所有数据已预热 |
+| 2. 运行策略 | 本地凭据/权限状态检查；TestHost 退出，fixture 仅加载本地列表后退出 | 不在自动路径增加交互权限请求；fixture 不执行真实恢复/清理/联网 |
+| 3. 监控 | 配置会议 callbacks，按策略开启日历、polling 与 meeting detection | 重复启动受现有 guard 约束 |
+| 4. 首批数据 | refreshRecordings / folders / trash | 异步提交不代表没有整库读取；各 Task 会与其它 store 工作排队 |
+| 5. 备份 | await `performStartupBackup`，实际备份在后台执行 | 保留 normalization、恢复与清理之前的恢复点 |
+| 6. 规范化 | normalizeAllTagsIfNeeded，再 refreshRecordings | 即使规范化无变化，当前仍会请求列表刷新 |
+| 7. 恢复与短录音 | recoverInterrupted → trashShortUntranscribedRecordings → refreshRecordings | 必须先恢复，避免把 interrupted 的 duration=0 行误清理 |
+| 8. 音频与清理 | recoverOrphanedAudioFiles；另起受 migration lease 保护的 trash/orphan purge Task | 涉及目录扫描、数据库与文件操作；不能为首屏指标删除恢复能力 |
+
+启动 profiling 应分别标记 bootstrap、首屏可交互、首批列表、MCP ready、备份和恢复完成。
+不要把整段 setup 的耗时当作主线程阻塞时长，也不要把首屏出现当作恢复/后台工作已经完成。
 
 ## 10. 线程模型总览
 
@@ -1326,6 +1457,10 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 | `RecordingsStore` | `@ModelActor actor` | actor 序列化 |
 | `TranscriptionManager` | `@MainActor` | 状态在主线程 |
 | `PostProcessingCoordinator` | `@MainActor` | 队列和 UI 相关状态在主线程 |
+| `LocalWhisperPipelineRuntime` | 共享 runtime + 单 permit | 缓存 pipeline，窗口推理顺序执行 |
+| `SpeakerDiarizer` | MainActor 状态 + 分析 gate，音频加载 detached | 同时只分析一个输入，但仍完整加载音频；不证明 SDK 推理的具体线程 |
+| `AIGenerationGate` | actor + continuation gate | 同一 provider 串行；不同 provider 独立，本地单独成域 |
+| `MCPServer` / `MCPHTTPConnection` | actor + Network 回调队列 | 并发连接与共享 store 串行工作是不同层次 |
 
 ## 11. 关键数值常量
 
@@ -1340,7 +1475,6 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 | meeting detection cooldown | 10s | `RecordingEngine` |
 | merge timeout | `max(120, segmentCount * 5)` | `RecordingEngine` |
 | `finishWriting()` 超时 | 10s | `AudioFileWriter` |
-| AVAudioEngine tap buffer | 8192 samples | `AudioCaptureService` |
 
 ### 11.2 文件转录
 
@@ -1353,6 +1487,10 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 | Gemini chunk | 300s (5min) | `GeminiTranscriber` |
 | `maxRetries` | 3/chunk | `WhisperTranscriber` / `GeminiTranscriber` |
 | `maxExportConcurrency` | 6 (Whisper，与 maxConcurrency 对齐) | `WhisperTranscriber` |
+| Gemini export 并发 | 3/任务 | `GeminiTranscriber` |
+| 自动后处理池 | transcription=2，summary=1 | `PostProcessingCoordinator` |
+| 摘要 map 调度 / 实际生成 | 1 个 map task / 每 provider 域 1 个执行 | `SummaryGenerator` / `AIGenerationGate` |
+| Local Whisper core / overlap | 600s / 5s | `LocalWhisperChunkPlanner` |
 | request timeout | 300s | `WhisperTranscriber` / `GeminiTranscriber` |
 | resource timeout | 600s | `WhisperTranscriber` / `GeminiTranscriber` |
 | segment 细分阈值 | 60s | `PostProcessingCoordinator.subdivideCoarseSegments` |
@@ -1382,13 +1520,16 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 | 常量 | 值 | 位置 |
 | --- | --- | --- |
 | 备份保留数 | 3 | `DatabaseBackup` |
-| trash purge | 30 天 | `RecordingsStore` |
+| trash purge | 用户配置 `trashRetentionDays`，3/7/15/30 天 | `RecordingsStore.purgeExpiredTrashWithOutcome` |
 | auto-discard 短录音 | `<30s`（UserDefaults `autoDiscardThreshold`） | `RecordingsStore.finalizeRecording` |
-| storage limit | UserDefaults `storageLimitMB`（0=无限） | `RecordingsStore.enforceStorageLimit` |
+| storage limit | UserDefaults `storageLimitMB`（0=无限） | `RecordingsStore.cleanupStorage/storageQuotaStatus` |
 | 音频压缩 | 48kHz → M4A，仅压缩后更小时替换 | `PostProcessingCoordinator.compressAudioIfNeeded` |
 | orphaned file 最小长度 | `>=30s` | `AppState.recoverOrphanedAudioFiles()` |
 | CalendarManager poll | 60s | `CalendarManager` |
 | AppState calendar sync | 5s | `AppState.startCalendarPolling()` |
+| UI 搜索 debounce | 250ms | `RecordingSearchCoordinator` |
+| Markdown mirror debounce | 500ms | `AppState.configureMarkdownMirror` |
+| Detail cache 容量 | 无显式条目/字节上限 | `RecordingsStore.detailCache` |
 
 ## 12. 其它模块的架构备注
 
@@ -1635,8 +1776,12 @@ backend 合同由 web API 的导出端点与 `NotionExportService`/`BulkExportCo
 代码位于 `Cadenza/Services/MCP/`，协议行为由 `CadenzaTests/MCP/` 覆盖。
 
 ```
-MCP 客户端 (Claude Code / Gemini CLI / Claude Desktop via mcp-remote)
-   │ HTTP POST /mcp + Bearer token (JSON-RPC 2.0, MCP Streamable HTTP 子集)
+MCP 客户端 (Claude Code / Gemini CLI / Claude Desktop / Codex / Grok)
+   │ stdio (newline-delimited JSON-RPC;客户端配置统一为 command+args,无 URL 无 token)
+   ▼
+cadenza-mcp (app bundle 内的 stdio 桥,CadenzaMCP target)
+   │ 读 endpoint.json + credentials/<client>.token → HTTP POST /mcp + Bearer
+   │ (Hermes 不走桥:YAML 配置直连 HTTP)
    ▼
 127.0.0.1:8585  MCPServer (actor, NWListener, requiredInterfaceType=.loopback)
    ├─ MCPHTTPConnection (actor/连接)  receive 循环 + Content-Length 分帧
@@ -1653,9 +1798,24 @@ RecordingsStore (actor) → SwiftData
 - **HTTP 层硬约束**:严禁单次 `receive` 解析(OAuthCallbackServer 的 4KB 模式只能活在无 body GET;TCP ~1.4KB 即分片)。必须循环收到 `\r\n\r\n` 再按 `Content-Length` 收满。每响应 `Connection: close`(无 keep-alive 状态机)。上限:header 16KB(431)、body 1MB(413)、无 Content-Length 的 POST → 411、30s watchdog。无 SSE(GET→405)、无 session、batch→-32600。
 - **安全**:loopback-only;Bearer token SHA256 常时比较;Host/Origin 白名单防 DNS-rebinding(`MCPHTTPConnection.isAllowedHost/isAllowedOrigin`,纯函数有单测)。威胁模型边界:app 未 sandbox,本机进程本就能直读 SQLite——token 防的是浏览器侧与无差别扫描,不防本机恶意进程。
 - **工具层**:cursor 为全局 segment index(时间窗只过滤不重编号);speaker 经 `speakerMappings.profileName` 解析真名,`get_transcript` 响应带 `speakers` roster(`resolvedName: null` = 未识别占位符),AI 可经 `set_speaker_name` 回写映射(label 必须真实出现在该转录中,防幻觉;profile 按 displayName 不区分大小写复用,否则新建);trashed 一律隐藏(`fetchActiveDetail` 显式查 trash 列表,因 detail DTO 无 trashedDate);写工具双重把关(开关关闭时 tools/list 隐藏 + call 拒绝),每次写经 `os.Logger`(subsystem `com.shuiandy.Cadenza`,category `mcp`,`.notice` 可 `log show` 回查)。
-- **一键连通(`MCPClientConnector`)**:Settings 的 Connected clients 五行(Claude Code / Gemini CLI / Claude Desktop / Codex (GPT) / Hermes)。检测纯文件系统(`~/.claude.json` / `~/.gemini/settings.json` / `~/Library/Application Support/Claude/claude_desktop_config.json` / `~/.codex/config.toml` / `~/.hermes/config.yaml`,home 与 /Applications 可注入测试),状态四态:notInstalled / disconnected / connected / stale(token 或 URL 不匹配,reset token 后变 Update 按钮)。连接:Claude Code 经 `zsh -lc` 跑官方 `claude mcp add -s user`(它的 ~/.claude.json 是活状态文件,不直接写);Gemini/Desktop JSON 无损 merge(只 upsert `mcpServers.cadenza`,其余键全保留);Desktop 用 mcp-remote 的 `env.AUTH_HEADER` 形式(其 args 按空格分割的已知 bug);Codex 是 TOML **文本级整段 upsert**(Swift 无 TOML 库;只动我们自己的 `[mcp_servers.cadenza]` 段,边界=下一个行首 `[`),用 config.toml 的静态 `http_headers` 字段;Hermes 是 YAML **文本级块替换**(同样无 stdlib parser):重生成 `mcp_servers.cadenza` 的 `url:` + `headers.Authorization:`,保留其它子键(timeout/connect_timeout)与文件注释/空行;cadenza 仅匹配 `mcp_servers` 的**直接子项**(嵌套同名键忽略),url/headers 用带前瞻的 subtree-skip 删除(消除跨空行的 stale Authorization 但不吃尾部分隔注释),tab 缩进 / inline-flow / 多行 scalar 一律抛 `configUnrecognized` → 退回手动片段。**ChatGPT 桌面版无法接入**:其 connectors 由 OpenAI 云端发起,127.0.0.1 不可达;GPT 侧正解就是 Codex。**connect 失败(抛错)时 UI 在该客户端行下方展示系统错误 + 对应客户端的手动配置片段**,正常路径不显示任何手动配置。
+- **stdio 桥(`cadenza-mcp`,2026-08)**:独立 `CadenzaMCP` tool target(源码 `CadenzaMCP/` + 复用 `MCPModels.swift`/`MCPBridgeRuntime.swift`),以 auxiliary executable 形式嵌入 `Cadenza.app/Contents/MacOS/`(project.yml 依赖 `copy.destination: executables`)。所有本地客户端(Hermes 除外)统一配置为 `command = cadenza-mcp, args = ["--client", <accessID>]` ——配置里**没有 URL、端口、token**。桥每次请求都重新解析运行时文件(`MCPBridgeRuntime`,`~/Library/Application Support/Cadenza/mcp/`):`endpoint.json` 由 app 在 listener `.running` 时写入(改端口不再打断任何客户端),`credentials/<client-id>.token`(0600)由 Settings 的 Connect 写入、Revoke 删除(token 从此不落任何第三方配置文件,防 dotfiles 泄漏;reset/换 token 不需要改客户端配置)。连接失败时:探测 endpoint → 若 app **未运行**才 `NSWorkspace.openApplication`(activates=false+hides,防 reopen 激活主窗口的老 bug)→ 250ms 轮询至多 45s(已运行仅 10s,防 MCP 关闭时死等);401 时重读一次 token 文件再重试;桥级失败对有 id 的请求合成 JSON-RPC error(-32000,附 Settings 指引),对 notification 只写 stderr。启动竞态(Claude Desktop 登录同时拉起)由桥内建解决,原 `~/.local/bin/cadenza-mcp-bridge` 脚本与 mcp-remote/npx 依赖全部退役。同一二进制还带人用子命令(`MCPBridgeCLI` 解析,纯函数有单测):`list / search / transcript / summary / tags / actions / tools / call <tool> '{JSON}'`,走与桥完全相同的投递链路(endpoint 发现、拉起 app、凭证文件),以独立身份 `cadenza-cli` 认证;其凭证由 `AppState.syncMCPServer()` 在每次 reconcile 时自动供给(scope 经 `MCPServer.scopesForNewConnection()` 跟随权限开关,Settings 的 connect 走同一函数,两处不会漂移)。CLI 不直读 SQLite:store 单写者是 app,app 未运行时由桥拉起,MCP 开关关闭则明确报错。
+- **一键连通(`MCPClientConnector`)**:Settings 的 Connected clients 六行(Claude Code / Gemini CLI / Claude Desktop / Codex (GPT) / Grok / Hermes)。检测纯文件系统(`~/.claude.json` / `~/.gemini/settings.json` / `~/Library/Application Support/Claude/claude_desktop_config.json` / `~/.codex/config.toml` / `~/.grok/config.toml` / `~/.hermes/config.yaml`,home 与 /Applications 可注入测试),状态四态:notInstalled / disconnected / connected / stale。桥类客户端的 connected = 配置指向当前 bridge 路径 + args 正确 **且** 凭证文件内容与 access store 期望 token 一致(`storedCredential` 参数);旧 HTTP 形态条目一律读作 stale → Update 即迁移。连接:Claude Code 经 `zsh -lc` 跑官方 `claude mcp add -s user -- <bridge> --client claude-code`(它的 ~/.claude.json 是活状态文件,不直接写);Gemini/Desktop JSON 无损 merge(只 upsert `mcpServers.cadenza` 为 command+args,其余键全保留);Codex / Grok 是同一套 TOML **文本级整段 upsert**(Swift 无 TOML 库;只动我们自己的 `[mcp_servers.cadenza]` 段,边界=下一个行首 `[`),写 `command`/`args` 并**顺手清除旧的 `url`/`http_headers`(Codex)/`headers`(Grok) 键与嵌套 header 表**(迁移);Hermes 仍是 YAML **文本级块替换**直连 HTTP(其 gateway 无已验证的 stdio 支持):重生成 `mcp_servers.cadenza` 的 `url:` + `headers.Authorization:`,保留其它子键与注释/空行;cadenza 仅匹配 `mcp_servers` 的**直接子项**,url/headers 用带前瞻的 subtree-skip 删除,tab 缩进 / inline-flow / 多行 scalar 一律抛 `configUnrecognized` → 退回手动片段。**ChatGPT 桌面版无法接入**:其 connectors 由 OpenAI 云端发起,127.0.0.1 不可达;GPT 侧正解就是 Codex。**connect 失败(抛错)时 UI 在该客户端行下方展示系统错误 + 对应客户端的手动配置片段**(凭证文件在写配置前已落盘,手动贴片段也能工作),正常路径不显示任何手动配置。
 - **⚠️ tags 谓词陷阱**:`#Predicate { $0.tags.contains(x) }` 会被 SwiftData 编译成 SQL 字符串搜索,空 tags 行(NULL 列)直接 `_NSCoreDataStringSearch` → `CFStringGetLength(NULL)` segfault(2026-06-12 测试中实锤,crash report 在案;当晚 MCP 层先做了内存过滤 workaround,但 store 层谓词仍在,UI 的 tag 过滤 + 搜索路径照样能崩主 app)。2026-06-12 已根治:`RecordingsStore.fetchRecordingDTOs` 的 tagFilter 改为 fetch 后内存过滤(谓词只保留 trashedDate/folder),MCP 层的 `listRecordings` 仍传 `tagFilter: nil` 并自做内存过滤(双保险),回归测试 `RecordingsStoreTests.tagFilterSurvivesUntaggedRows`。新代码不要把数组 `contains` 写回 #Predicate。
-- **测试**:`CadenzaTests/MCP/`(71 个:Models/Router/Tools/HTTP/Connector),HTTP 测试起真 listener(ephemeral port)并含 TCP 分片到达用例;工具测试共享单一内存容器(macOS 26 并发建 ModelContainer 会 SIGTRAP,见 TestHelpers 注释);connector 测试注入 temp home,merge 纯函数直接测。
+- **测试**:`CadenzaTests/MCP/`(Models/Router/Tools/HTTP/Connector),HTTP 测试起真 listener(ephemeral port)并含 TCP 分片到达用例;工具测试共享单一内存容器(macOS 26 并发建 ModelContainer 会 SIGTRAP,见 TestHelpers 注释);connector 测试注入 temp home,merge 纯函数直接测。Grok 复用 Codex TOML 引擎,另测 `headers` 字段与 `~/.grok/config.toml` 生命周期。
+
+#### MCP 性能边界（2026-09-06）
+
+| 工具/入口 | 当前执行方式 | 后续优化必须保留 |
+| --- | --- | --- |
+| `list_recordings` | 全作用域 DTO → filter/sort → 全结果 fingerprint → 截取页面；甚至 trash-only 也先读 active | cursor 的过滤绑定、变化检测、稳定排序、精确总数 |
+| `search_transcripts` | store 返回全部匹配，再取前 10/25 条；snippet 再拉完整 detail | 搜索覆盖范围、snippet 语义、profile/权限边界 |
+| `get_transcript/get_summary` | `fetchActiveDetail` 先加载整个 trash 列表检查 ID，再取完整且缓存的 detail | trashed 不可见；按 ID 查询不能跳过 active 状态判断 |
+| stdio bridge | 每行 `await session.handle` 后再读下一行 | request ID 对应关系；引入并发时保留写操作顺序和取消 |
+
+`limit/maxChars` 当前主要限制响应，不保证相应的数据库行数、解码量或内存上限。
+`MCPServer.maxConcurrentConnections=32` 限制连接数，不能让共享 store 的同步查询并行，
+也不能解除 bridge 内部串行。优化应先消除重复全库工作，再评估 HTTP keep-alive 等传输开销。
+MCP ready 也不表示日历缓存已就绪，保持现有 calendarIsReady 检查。
 
 ## 12.y Meeting Prep(agent-authored artifacts)
 
@@ -1988,10 +2148,12 @@ MeetingPrepScheduler.tick(events:now:)          — 每场会一次
 
 ## 14. 当前已知问题、瓶颈与高风险区
 
-> 来源：2026-03-10 code review，经人工筛选确认。
-> 分为三类：**Confirmed issue**（代码证据充分，可直接修）、**Needs profiling**（结论合理但需 Instruments 验证）、**Architecture tradeoff**（设计层面取舍，不是 bug）。
+**当前性能审查从 [§14.4](#current-performance-findings) 开始。** §14.1–14.2 保留 2026-03-10
+的历史修复记录，其数字和实现细节只属于当时基线，不覆盖后续回归或新增路径。§14.3 是剩余产品取舍。
+Confirmed 表示当前代码可确认调用链；Needs profiling 表示需要真实 App 采样；二者都不能直接当作
+已经测出的 FPS、RSS 或用户等待时长。
 
-### 14.1 Confirmed issue（已全部修复 2026-03-10）
+### 14.1 历史修复记录（2026-03-10，不代表当前全量问题已解决）
 
 #### ~~[P1] 后处理转录工作卡在 MainActor 上~~ ✅ Fixed
 
@@ -2021,7 +2183,7 @@ MeetingPrepScheduler.tick(events:now:)          — 每场会一次
 
 ~~AudioFileWriter 新增 onWriterFailure 回调，writer 进入 failed 状态时触发一次。~~
 
-### 14.2 ~~Needs profiling~~ ✅ All resolved
+### 14.2 历史热路径修复记录（2026-03-10，当前规模验收另列）
 
 #### ~~录音热路径格式转换与 Data 分配~~ ✅ Mitigated
 
@@ -2043,24 +2205,52 @@ MeetingPrepScheduler.tick(events:now:)          — 每场会一次
 
 #### 数据库搜索是内存全量扫描
 
-`fetchRecordingDTOs()` 和 `searchRecordingDTOs()` 对标题/标签/转录文本/摘要做内存扫描。小到中等规模（<1000 录音）够用，大规模需要 FTS 索引。
+列表与搜索的实际读取成本见 §7.6，全文索引尚未实现。是否可接受应由库规模、内容分布与
+并行工作负载决定，旧的“<1000 录音够用”没有当前端到端基线支持。
 
 #### Backup restore 仍缺少产品入口
 
 Snapshot 已使用 SQLite online backup API、唯一 staging、原子发布和三份 rotation；
 剩余产品缺口是没有 in-app database restore，也没有 portable-archive importer。
 
+<a id="current-performance-findings"></a>
+
+### 14.4 当前代码可确认的性能问题（2026-09-06，尚未修复）
+
+ID 与 [性能审查报告](docs/reviews/performance-audit-2026-09-06.md) 对应；优先级是优化排序，
+不是每台设备均发生严重卡顿的断言。报告保留具体位置与分析，本表随实现更新状态。
+
+| ID | 优先级 | 当前机制与影响 | 代码符号 / 本文说明 |
+| --- | --- | --- | --- |
+| F1 | P1 | bootstrap 同步整库 logical digest，正常 profile 路径通常两次 | `ProfileBootstrap.bootTargetProblem`；§9.1 |
+| F2 | P1 | 列表全量 fetch、预览关系读取、多次全库 refresh | `RecordingsStore.recordingToDTO`、`AppState.refreshRecordings`；§7.6 |
+| F3 | P1 | 搜索扫描全部作用域正文，同步占用共享 store | `searchRecordingDTOs`；§7.3、§7.6 |
+| F4 | P1 | MCP 每页重建全库结果/fingerprint；单条 detail 前加载全部 trash | `MCPToolRegistry.listRecordings/fetchActiveDetail`；§12.x |
+| F5 | P1 | 镜像单条保存可触发全库 detail、渲染及文件哈希 | `configureMarkdownMirror/fetchMarkdownMirrorRecords`；§7.7 |
+| F6 | P2 | detail cache 无容量上限，save 全清；全局 token 触发无关详情重建 | `detailCache/save/loadDetail`；§7.6、§8.7 |
+| F7 | P1 | speaker memory 可再次 diarize；全音频 Float 数组，首份文本保存等待首次分析 | `SpeakerDiarizer.diarize`、`SpeakerKitEmbeddingExtractor`；§5.6、§6.1 |
+| F8 | P2 | 云端并发按 job 相乘，导出与待上传队列缺少全局资源预算 | `WhisperTranscriber/GeminiTranscriber`；§6.4 |
+| F9 | P2 | Gemini 2s/4s 重试退避仍持有 API permit | `transcribeSingleWithRetry` 外层 permit；§5.1 |
+| F10 | P2 | map task group 被 shared 单槽 gate 串行化，prep/recap 也竞争 | `AIGenerationGate.run`；§6.2 |
+| F11 | P2 | 新 stdio bridge await 当前请求完成才读取下一行，慢工具阻塞后续工具 | `CadenzaMCPMain.runBridge`；当前工作区新增实现 |
+
+### 14.5 待真实 App profiling 的项目
+
+- 保留目标 glass 外观的 grid/list/waterfall 滚动、缩放、框选与后台处理并发；不能用当前平面卡片结果代替玻璃卡片验收
+- 每次 SwiftUI 更新中的日期分组、详情搜索/播放定位与透明面板 GPU 成本；先测再决定是否使用 NSCollectionView
+- 首屏查询的实际 SQL 数、关系 fault、store 排队及分页前后的 RSS；代码只能确认访问路径，不能给出准确 SQL 次数
+- 本地 Whisper 全 WAV 预转换、重复 diarization、云端导出/上传/provider 等待的独立耗时
+- Web Sync discovery、备份与镜像开启时的后台 I/O；不能通过关闭同步/备份来宣称整体优化完成
+
 ## 15. 下一步性能优化路线图
 
 ### 15.1 目标
 
-接下来的性能优化不再以单点 micro-opt 为主，而是以三个目标排序：
+当前目标：千条录音时保持浏览响应；缩短 Stop 到可读文本/summary 的等待；让录音、后台处理与
+MCP 共存且资源有界。§15.2–15.4 是历史演进记录，当前待做顺序见 §15.5；历史 Done 不能当作
+新的性能验收。所有优化须满足 §1.3 的录音、glass、数据和交互约束。
 
-1. 缩短用户从 Stop 到看到 summary 的首屏等待时间
-2. 提高多录音积压时的后处理吞吐
-3. 降低 detail load / 搜索 / 录音热路径的结构性浪费
-
-### 15.2 Phase 1：一周内可落地的收益项（已完成 2026-03-10）
+### 15.2 历史 Phase 1（2026-03-10）
 
 #### ~~合并 summary 落库写入~~ ✅ Done
 
@@ -2076,7 +2266,7 @@ Snapshot 已使用 SQLite online backup API、唯一 staging、原子发布和�
 
 chapters 不再随 summary 自动生成。改为用户打开 detail 页时，`generateChaptersIfNeeded(recordingID:)` 检查是否有 summary 但没 chapters，按需触发。省去了用户从未查看的录音的 chapters API 调用。
 
-### 15.3 Phase 2：吞吐与体感重构
+### 15.3 历史 Phase 2：已引入的吞吐与体感机制
 
 #### ~~后处理从全局串行改成小并发流水线~~ ✅ Done (Phase 2A)
 
@@ -2106,12 +2296,12 @@ chapters 不再随 summary 自动生成。改为用户打开 detail 页时，`ge
 
 - 阈值：40,000 chars，chunk 大小 ~15K chars
 - `SummaryPrompt.splitForMapReduce` 按段落/句子边界切分
-- Map: `withThrowingTaskGroup` 并行 `streamChat`，纯文本输出
+- Map: 按顺序提交纯文本摘要，各 chunk 之间释放 provider 域许可；不宣称三路网络并发
 - Reduce: 流式 `streamChat` + `reduceSystem` prompt → 标准 JSON
 - Fallback: map 失败时自动回退 single-prompt
 - 新增 8 个测试（SplitForMapReduceTests + MapReducePromptTests）
 
-### 15.4 Phase 3：库规模与录音稳定性
+### 15.4 历史 Phase 3：索引提案与热路径修复
 
 #### 搜索与排序引入索引层
 
@@ -2135,20 +2325,34 @@ chapters 不再随 summary 自动生成。改为用户打开 detail 页时，`ge
 - `pcmBufferToData()` 的 Data 分配保留（被下游 transcription queue 持有，无法复用）
 - 已有的 AVAudioConverter cache 和 mic format description cache 不变
 
-### 15.5 推荐落地顺序
+<a id="performance-priorities"></a>
 
-推荐按下面顺序推进：
+### 15.5 当前推荐落地顺序（待实施）
 
-1. ~~只读 detail fetch~~ ✅
-2. ~~合并 summary 同步写库~~ ✅
-3. ~~chapters 按需生成~~ ✅
-4. ~~后处理小并发池~~ ✅
-5. quick / full summary 两阶段（Phase 2C — 条件性评估）
-6. 长 transcript map-reduce
-7. 搜索 / 索引层
-8. 录音热路径 buffer pool
+1. 列表轻量投影、数据库分页/可下推排序、MCP 单条 active 查询、刷新合并与镜像 dirty-ID 更新（F2/F4/F5）
+2. 全文索引、按字节/条目约束的 detail cache 与 revision 定点失效（F3/F6）；保留中文、标签、trash 和 cursor 一致性语义
+3. 独立缩短 bootstrap 健康检查成本（F1），保持初始/最终门禁和迁移 digest；不要把两类用途全量替换
+4. 复用 diarization embeddings、窗口化音频、区分初步文本与最终 speaker 结果（F7）；保持用户映射和 revision 防陈旧写
+5. provider/account 请求池与音频计算预算、Gemini attempt permit、摘要 gate 分域及 bridge 有界并发（F8–F11）；优先保障新录音
+6. 在目标玻璃效果与交互不变的条件下，根据 SwiftUI/GPU 实测缩小刷新和渲染范围（§14.5），再决定是否更换集合实现
 
-### 15.6 性能之外，这个 app 下一步还能做什么
+### 15.5.1 2026-09-06 性能整改落地记录
+
+依据 `docs/reviews/performance-audit-2026-09-06.md`（合并版审查，含实施状态表）。新机制与不变量：
+
+- **持久化历史保留 7 天**：`RecordingsStore.pruneHistorySlice(olderThan:)` 每次调用只删一个按天切片，AppState 在切片间 await 让出 store actor，录音进行时暂停；启动 20 秒后开始。容器创建前 `SQLiteStoreMaintenance.reclaimFreePagesIfNeeded` 做 incremental_vacuum（阈值 16 MB，每次上限 128 MB）。SwiftData 从不清理历史，真实库曾有 272 MB 历史对 21 MB 数据。**actor 方法内没有挂起点，任何全库维护都必须做成一批一返回。**
+- **web 同步探测不再每分钟落库**：调度状态在 `WebSyncCoordinator.audioProbeAttempts`（进程内，@ObservationIgnored），只在 `audioProbeRevision` 变化时写库。`lastAttemptAt` 仍承担最旧优先排序，改动时两处要一起看。
+- **列表投影列**：`Recording.transcriptPreview / summaryPreview` 由 `saveTranscript`、`saveSummary`、外部导入维护；nil 表示未投影，空串表示已投影但无内容（DTO 转换把空串映射回 nil），`backfillListPreviews(batchSize:)` 每次只处理一批候选。`recordingToDTO` 不得再读 `transcript.fullText`。`#Index` 覆盖 id、startDate、trashedDate 与 (trashedDate, startDate)。
+- **观察边界**：`PostProcessingCoordinator.jobs` 是 `@ObservationIgnored`，视图只读 `jobPhases` 投影；`AppState.upcomingMeetings / currentMeeting` 赋值前比较；资料库根 body 不读日历镜像，today strip 自带时钟；详情页只有 `PlaybackControlsBar` 与两个 observer 读播放时钟。这些都有源码门禁测试。
+- **后台工作优先级**：`ProcessingWorkPriority.shared` 由 `RecordingProcessingGate` 的录音 lease 驱动，只在阶段任务创建时生效；被 await 的子任务会被提升到等待方的优先级，所以不要用 `Task.detached(priority:).value` 做动态降级，那既无效又丢失取消传播。对在飞工作的真正预算见审查文档 T5。
+- **speaker memory 复用首轮 diarization**：`PrecomputedSpeakerEmbeddingExtractor`，不再对同一文件二次解码推理。
+- **Markdown 镜像定向刷新**：save 通知携带触及的 recordingID，`MarkdownMirrorRefreshQueue` 负责 debounce 与不丢失的 drain，正在进行的刷新不被后续保存取消。
+- **说话人分配**：`SpeakerDiarizer.assignSpeakers` 静态扫描版，云端路径经 `assignSpeakersOffMain` 离开主线程。
+
+### 15.6 历史产品方向草案（非当前实现清单）
+
+以下保留早期讨论，不作为当前架构事实。例如统一 `AIContextAssembler` 已存在，现状见 §12.6，
+后续重点是检索/索引和召回，而不是再次新增同名层。其它方向应先对照源码再判断是否未实现。
 
 如果不只盯着“更快出 summary”，而是看当前代码里已经长出来的能力，这个 app 下一步最自然的方向有 5 条。
 
@@ -2238,7 +2442,7 @@ chapters 不再随 summary 自动生成。改为用户打开 detail 页时，`ge
 
 这会是库规模继续上升后的分水岭。
 
-### 15.7 如果只做三件事，优先级应该是这样
+### 15.7 历史产品优先级（当前性能顺序以 §15.5 为准）
 
 1. 统一 AI context layer
    原因：它同时改善 AI Assistant、folder AI、未来 recap 和搜索联动，是复用价值最高的一层。
@@ -2264,18 +2468,19 @@ People layer 和 folder 工作流记忆都值得做，但更适合作为上面�
 9. 是否会影响 search、sort、AI context、project context 的复杂度？
 10. 是否需要更新测试和本文件？
 
-## 17. 验证基线
+<a id="validation-baseline"></a>
 
-当前项目约定基线：
+## 17. 验证基线与性能审查方法
 
-- 284 tests
-- 25 suites
-- 测试框架是 Swift Testing，不是 XCTest
+开发验证以 [CONTRIBUTING.md](CONTRIBUTING.md)、[project.yml](project.yml) 和当前 workflow 为准。
+使用 Swift Testing；测试数量以当次 test discovery/结果为准，不再把历史的 284 tests / 25 suites
+写作当前基线。文档更新仅检查代码引用与 diff，不触发 App 构建、安装或重启。
 
 常用命令：
 
 ```bash
-xcodebuild build -project Cadenza.xcodeproj -scheme Cadenza -destination 'platform=macOS'
+xcodebuild build -project Cadenza.xcodeproj -scheme Cadenza -destination 'platform=macOS' \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
 xcodebuild test -project Cadenza.xcodeproj -scheme Cadenza -destination 'platform=macOS' \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
@@ -2287,6 +2492,33 @@ xcodebuild test -project Cadenza.xcodeproj -scheme Cadenza -destination 'platfor
 - post-processing：`CadenzaTests/PostProcessing/*`
 - meeting detection：`CadenzaTests/Meeting/*`
 - audio writer / merge：`CadenzaTests/Utilities/AudioFileWriterTests.swift`
+
+### 17.1 后续性能审查的最小记录
+
+先记录 commit 与相关 WIP、运行实例/build 配置、OS/Swift 版本、库规模与正文/segment 分布。
+区分冷/热缓存、本地阶段/provider 网络等待；源码复杂度、功能测试、隔离探针和实机 trace 分别报告。
+Build/test 通过不证明签名、录音权限、安装或真实捕获可用。
+
+| 场景 | 指标 | 体验/完整性约束 |
+| --- | --- | --- |
+| 100/1000/5000 录音冷/热启动 | bootstrap、首屏可交互、首批数据、MCP ready、后台恢复耗时 | fail-closed、备份和恢复保留；不能把临时空列表作为最终状态 |
+| grid/list/waterfall 滚动、缩放、框选 | SwiftUI body、帧时间 P50/P95/P99、hitch、GPU、RSS | 保留目标 glass、hover/键盘、多选、排序和返回位置 |
+| 中文/英文/无匹配/高频词搜索 | 含 debounce 的响应时间、SQL rows/bytes、store 排队与取消 | 全库可达，旧结果不覆盖新结果 |
+| 连续访问 200 个长详情 | cache 字节、内存稳态、重建次数、播放 tick 成本 | 播放进度不被无关刷新重置 |
+| 15 分钟/1/4/8 小时音频 | 转换、上传、provider、diarization、首文本/summary、RTF、峰值内存/磁盘 | 质量、时间戳、speaker、分段和失败恢复保留 |
+| 2 个长转录 + 新录音 + 浏览 + 2 个 MCP 请求 | capture 启动/丢帧/写入错误、UI 帧时间、各队列等待 | 手动/自动新录音成功，原始音频持续完整保存 |
+| MCP 分页与并发、镜像/备份/同步开启 | 每页读取量、工具延迟、dirty-ID 工作量、取消后剩余工作 | cursor、权限、用户改写冲突和恢复点保留 |
+
+真实 UI 验证用虚构 fixture 和 §12.z5 的完整数据隔离；不能只改 HOME，也不能截取真实 transcript。
+预算先在同机同配置建立基线再定值。60Hz/120Hz 的 16.7/8.3ms 是单帧参照，不是本 App 已通过的指标。
+
+### 17.2 2026-09-06 已有证据及限制
+
+[审查报告](docs/reviews/performance-audit-2026-09-06.md) 保存生产 gate/digest 探针的结果和方法：
+录音 gate 允许 processing 与 capture claim 共存；AIGenerationGate 的三个模拟任务实际串行；
+logical digest 在不同合成行布局下开销不同。SwiftData 最小查询探针未支持“在 MainActor 创建
+就一定主线程查库”的假设。合成数据库不是实际 SwiftData schema，没有真实 App FPS/RSS/云端 RTF
+验收结果；不要把报告中的 warm-cache 毫秒数推广为用户库启动时间。
 
 ## 18. 维护规则
 
@@ -2308,5 +2540,8 @@ xcodebuild test -project Cadenza.xcodeproj -scheme Cadenza -destination 'platfor
 - 改对应章节
 - 更新 `Last updated`
 - 增删不再准确的 checklist / risk item
+- 同步修改受影响的总览、调用顺序、并发上限与 §14 当前问题状态；不要只在某段末尾追加新事实而保留相反的旧结论
+- 性能结论标明代码依据/实测范围；历史修复放在历史区，待做优化不能写成当前实现，测试数/吞吐等数字须附基线
 
 如果功能已经是跨模块的，就给它新开一个章节，不要把关键决策只留在某个 plan 文档里。
+一次性审查报告保留当时证据，当前行为与未解决问题回填本文件，避免产生第二份架构事实源。

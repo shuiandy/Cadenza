@@ -9,11 +9,11 @@ struct MockAIService: AIServiceProtocol {
     var errorToThrow: Error? = nil
 
     func summarize(transcript: String, language: String, model: String?, jobTitle: String?,
-                   meetingType: MeetingType?, meetingTitle: String?, knownTags: [String]) async throws -> SummaryResult {
+                   meetingType: MeetingType?, meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel) async throws -> SummaryResult {
         throw PrepGenerationError.noAPIKey // unused in these tests
     }
     func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String?,
-                         meetingType: MeetingType?, meetingTitle: String?, knownTags: [String]) -> AsyncThrowingStream<String, Error> {
+                         meetingType: MeetingType?, meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { $0.finish() }
     }
     func streamChat(systemPrompt: String, userMessage: String, model: String?) -> AsyncThrowingStream<String, Error> {

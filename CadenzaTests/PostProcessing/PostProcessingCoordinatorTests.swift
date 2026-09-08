@@ -551,6 +551,57 @@ private final class PostProcessingProviderHarness {
 @MainActor
 struct PostProcessingProviderBoundaryTests {
     @Test
+    func speakerMemoryMappingDuringSummaryDoesNotFailOrDiscardOutput() async throws {
+        let harness = try await PostProcessingProviderHarness()
+        defer { harness.cleanup() }
+        let diarizationEnabled = SpeakerDiarizer.shared.isEnabled
+        SpeakerDiarizer.shared.isEnabled = false
+        defer { SpeakerDiarizer.shared.isEnabled = diarizationEnabled }
+        harness.configure(provider: AIProvider.gemini.rawValue)
+        harness.spy.keys[.gemini] = "fictional-key"
+        let fixture = try await harness.makeRecording()
+        let profile = try #require(await harness.store.createSpeakerProfile(displayName: "Mina"))
+        let store = harness.store
+        harness.coordinator.transcriptionRunnerOverride = nil
+        harness.coordinator.transcriptionTaskFactoryOverride = { _, _ in
+            Task<TranscriptResult, Error> {
+                TranscriptResult(text: "Review the mapping.", segments: [
+                    TranscriptResultSegment(startTime: 0, endTime: 2, text: "Review the mapping.", speaker: "Speaker 1")
+                ], language: "en", duration: 60)
+            }
+        }
+        harness.coordinator.summaryTaskFactoryOverride = { generator, _ in
+            Task { @MainActor in
+                // The coordinator already captured its source. Exercise the same
+                // persisted write used by the independent speaker-memory task.
+                let applied = await store.applySpeakerMappingIfCurrent(
+                    recordingID: fixture.recordingID, rawLabel: "Speaker 1", profileID: profile.id,
+                    expectedSpeakerIdentityRevision: 1)
+                #expect(applied == .applied)
+                var result = SummaryResult(title: "Fictional review", overview: "Review the mapping.",
+                    keyPoints: ["Mapping needs review"], actionItems: [], decisions: [], followUps: [],
+                    yourTasks: [], tags: [], chapters: [], rawText: "")
+                result.generationMetadata = .init(detailLevel: "detailed", stage: .reviewed)
+                generator.completeForTesting(with: result)
+            }
+        }
+        var completed = false
+        harness.coordinator.onPostProcessingCompleted = { id in
+            if id == fixture.recordingID { completed = true }
+        }
+        await harness.coordinator.startPostProcessing(recordingID: fixture.recordingID,
+            audioURL: fixture.audioURL, meetingTitle: nil)
+        #expect(await waitForPostProcessingToFinish(harness.coordinator, recordingID: fixture.recordingID))
+        let detail = try #require(await store.fetchRecordingDetail(recordingID: fixture.recordingID))
+        #expect(detail.summary?.overview == "Review the mapping.")
+        #expect(detail.summary?.generationMetadata?.sourceChanged == false)
+        #expect(detail.summary?.generationMetadata?.speakerMappingsChanged == true)
+        #expect(harness.coordinator.postProcessingError == nil)
+        #expect(completed)
+        #expect(FileManager.default.fileExists(atPath: fixture.audioURL.path))
+    }
+
+    @Test
     func selectedOpenAIWithoutKeyDoesNotUseGemini() async throws {
         let harness = try await PostProcessingProviderHarness()
         defer { harness.cleanup() }
@@ -2392,7 +2443,7 @@ struct SaveSummaryTests {
             model: "gemini-3.5-flash",
             language: "zh"
         )
-        #expect(saved)
+        #expect(saved == .saved)
 
         let detail = await store.fetchRecordingDetail(recordingID: id)
         // SummaryDTO.provider is the AIProvider rawValue String.
@@ -2429,7 +2480,7 @@ struct SaveSummaryTests {
     }
 
     @Test @MainActor
-    func returnsFalseForNonExistentRecording() async throws {
+    func returnsUnavailableForNonExistentRecording() async throws {
         let store = try await makeIsolatedStore()
 
         let summaryResult = SummaryResult(
@@ -2442,7 +2493,7 @@ struct SaveSummaryTests {
             summary: summaryResult,
             chaptersJSON: nil
         )
-        #expect(!saved)
+        #expect(saved == .recordingUnavailable)
     }
 }
 

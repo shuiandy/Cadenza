@@ -353,6 +353,192 @@ struct WebSyncCoordinatorTests {
         ))
     }
 
+    private func probeRecord(
+        _ id: UUID, revision: Date, lastAttemptAt: Date?, audioProbeRevision: Date? = nil
+    ) -> WebSyncRecordDTO {
+        WebSyncRecordDTO(
+            syncKey: "user:\(id)",
+            userID: "user",
+            recordingID: id,
+            remoteRecordingID: "remote",
+            structuredState: WebStructuredSyncState.synced.rawValue,
+            structuredHash: String(repeating: "a", count: 64),
+            structuredSourceRevision: revision,
+            structuredAttemptRevision: revision,
+            audioState: WebAudioSyncState.synced.rawValue,
+            audioFingerprint: "10:20",
+            audioProbeRevision: audioProbeRevision,
+            uploadSessionID: nil,
+            attemptCount: 0,
+            nextAttemptAt: nil,
+            retryDomain: nil,
+            lastAttemptAt: lastAttemptAt,
+            syncedAt: nil,
+            isDeletionTombstone: false,
+            lastErrorCode: nil
+        )
+    }
+
+    @Test
+    func inProcessProbeScheduleDefersAndOrdersCandidates() {
+        let revision = Date(timeIntervalSince1970: 10)
+        let now = Date(timeIntervalSince1970: 100_000)
+        let recent = UUID(), stale = UUID(), never = UUID()
+        let candidates = [recent, stale, never].map {
+            WebSyncCandidate(
+                recordingID: $0, contentRevision: revision, trashedDate: nil,
+                awaitingHistoricalConsentBindingID: nil, hasAudioReference: true
+            )
+        }
+        // Durable state says every row is overdue. The in-process schedule
+        // knows `recent` was probed a minute ago and `stale` twenty minutes ago.
+        let records = [
+            recent: probeRecord(recent, revision: revision, lastAttemptAt: .distantPast),
+            stale: probeRecord(stale, revision: revision, lastAttemptAt: .distantPast),
+            never: probeRecord(never, revision: revision, lastAttemptAt: nil),
+        ]
+        let attempts: [UUID: Date] = [
+            recent: now.addingTimeInterval(-60),
+            stale: now.addingTimeInterval(-20 * 60),
+        ]
+        func select(budget: Int) -> Set<UUID> {
+            WebSyncCoordinator.audioProbeCandidateIDs(
+                candidates: candidates,
+                recordsByRecordingID: records,
+                globalAudioEnabled: true,
+                historicalConsent: .undecided,
+                forcePayloadRefresh: false,
+                now: now,
+                budget: budget,
+                probeAttempts: attempts
+            )
+        }
+        // Never probed sorts first, then the oldest in-process probe; the
+        // row probed a minute ago is not due at all.
+        #expect(select(budget: 1) == [never])
+        #expect(select(budget: 2) == [never, stale])
+        #expect(select(budget: 8) == [never, stale])
+
+        // Without the schedule, durable state alone would re-probe everything.
+        let durableOnly = WebSyncCoordinator.audioProbeCandidateIDs(
+            candidates: candidates,
+            recordsByRecordingID: records,
+            globalAudioEnabled: true,
+            historicalConsent: .undecided,
+            forcePayloadRefresh: false,
+            now: now
+        )
+        #expect(durableOnly == [recent, stale, never])
+    }
+
+    @Test
+    func probeEligibilityUsesTheLaterOfDurableAndInProcessDates() {
+        let revision = Date(timeIntervalSince1970: 10)
+        let now = Date(timeIntervalSince1970: 100_000)
+        let id = UUID()
+        let candidate = WebSyncCandidate(
+            recordingID: id, contentRevision: revision, trashedDate: nil,
+            awaitingHistoricalConsentBindingID: nil, hasAudioReference: true
+        )
+        let interval = WebSyncCoordinator.syncedAudioProbeInterval
+        let overdue = probeRecord(id, revision: revision, lastAttemptAt: now.addingTimeInterval(-interval - 1))
+        let fresh = probeRecord(id, revision: revision, lastAttemptAt: now.addingTimeInterval(-1))
+
+        #expect(WebSyncCoordinator.shouldProbeSyncedAudio(
+            candidate, record: overdue, audioUploadEnabled: true,
+            forcePayloadRefresh: false, now: now
+        ))
+        #expect(!WebSyncCoordinator.shouldProbeSyncedAudio(
+            candidate, record: overdue, audioUploadEnabled: true,
+            forcePayloadRefresh: false, now: now, lastProbeAt: now.addingTimeInterval(-1)
+        ))
+        #expect(!WebSyncCoordinator.shouldProbeSyncedAudio(
+            candidate, record: fresh, audioUploadEnabled: true,
+            forcePayloadRefresh: false, now: now, lastProbeAt: now.addingTimeInterval(-interval - 1)
+        ))
+        #expect(WebSyncCoordinator.shouldProbeSyncedAudio(
+            candidate, record: overdue, audioUploadEnabled: true,
+            forcePayloadRefresh: false, now: now, lastProbeAt: now.addingTimeInterval(-interval - 1)
+        ))
+    }
+
+    @Test @MainActor
+    func unchangedAudioProbeSchedulesInMemoryWithoutWritingTheStore() async throws {
+        let container = try RecordingsStore.makeContainer(inMemory: true)
+        let store = RecordingsStore(modelContainer: container)
+        await store.clearAll()
+        let recordingID = UUID()
+        let audioRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "websync-probe-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: audioRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: audioRoot) }
+        await store.setAudioRootForTesting(audioRoot)
+        let audioURL = audioRoot.appendingPathComponent("probe.m4a")
+        try Data(repeating: 7, count: 64 * 1_024).write(to: audioURL)
+        #expect(await store.importAudioFile(
+            id: recordingID, title: "Probe", startDate: Date(), duration: 10,
+            audioURL: audioURL, ownership: .appCreated
+        ))
+        let snapshot = try #require(try await store.fetchWebSyncSnapshot(recordingID: recordingID))
+        let payload = try WebSyncPayloadBuilder.build(snapshot: snapshot, audioSourceState: .eligible)
+        let fingerprint = try await WebSyncFileReader().fingerprint(url: audioURL)
+        var synced = WebSyncMutation(userID: "user-1", recordingID: recordingID)
+        synced.remoteRecordingID = "remote-1"
+        synced.structuredState = WebStructuredSyncState.synced.rawValue
+        synced.structuredHash = payload.contentHash
+        synced.structuredSourceRevision = snapshot.contentRevision
+        synced.structuredAttemptRevision = snapshot.contentRevision
+        synced.audioState = WebAudioSyncState.synced.rawValue
+        synced.audioFingerprint = fingerprint.value
+        _ = try await store.upsertWebSyncRecord(synced)
+        // Durable state: last probed an hour ago at a stale revision, so the
+        // row is due and the first probe legitimately moves the revision.
+        let seededProbe = Date().addingTimeInterval(-3600)
+        try await store.markWebSyncAudioProbe(
+            userID: "user-1", recordingID: recordingID,
+            contentRevision: Date(timeIntervalSince1970: 1), at: seededProbe
+        )
+
+        let http = FakeAuthHTTP()
+        let auth = signedIn(http: http)
+        let defaults = UserDefaults(suiteName: "WebSyncCoordinatorTests-\(UUID().uuidString)")!
+        defaults.set(true, forKey: AuthTestProfile.webSyncPreferenceKey("webSync.uploadAudio"))
+        defaults.set(true, forKey: AuthTestProfile.webSyncPreferenceKey("webSync.reconciledUploadAudio"))
+        defaults.set(
+            HistoricalSyncConsent.undecided.rawValue,
+            forKey: AuthTestProfile.webSyncPreferenceKey("webSync.reconciledHistoricalConsent")
+        )
+        let coordinator = WebSyncCoordinator(
+            store: store, auth: auth, defaults: defaults,
+            startAutomatically: false, entitlementsRefreshPolicy: .never
+        )
+        let user = try #require(auth.currentUser)
+
+        // Pass 1: the revision moved, so exactly one durable write happens.
+        await coordinator.runOnePassForTesting(user: user, entitlementResolution: .selfHostOpen)
+        let afterFirst = try #require(await store.fetchWebSyncRecord(
+            userID: "user-1", recordingID: recordingID
+        ))
+        #expect(afterFirst.audioProbeRevision == snapshot.contentRevision)
+        let persistedAt = try #require(afterFirst.lastAttemptAt)
+        #expect(persistedAt > seededProbe)
+
+        // Pass 2 and 3: nothing changed, the schedule lives in memory and the
+        // row is not touched again (no save, no history transaction).
+        for _ in 0..<2 {
+            await coordinator.runOnePassForTesting(user: user, entitlementResolution: .selfHostOpen)
+            let after = try #require(await store.fetchWebSyncRecord(
+                userID: "user-1", recordingID: recordingID
+            ))
+            #expect(after.lastAttemptAt == persistedAt)
+            #expect(after.audioProbeRevision == snapshot.contentRevision)
+            #expect(after.audioState == WebAudioSyncState.synced.rawValue)
+        }
+        #expect(http.requests.isEmpty)
+        coordinator.stop()
+    }
+
     @Test
     func syncedAudioProbeSelectionIsBoundedAndOldestFirst() {
         let revision = Date(timeIntervalSince1970: 10)
@@ -1822,5 +2008,52 @@ struct WebSyncCoordinatorTests {
 
     private func response(status: Int) -> HTTPURLResponse {
         HTTPURLResponse(url: URL(string: "https://cadenzapp.test")!, statusCode: status, httpVersion: nil, headerFields: nil)!
+    }
+
+    // The server's create fingerprint spans remote recording id, chunk size,
+    // and source fingerprint. The idempotency key must move whenever any of
+    // them moves, or the old session occupies the key with a fingerprint that
+    // can never match again and every create answers 409 session_conflict.
+    @Test
+    func audioSessionIdempotencyKeyPinsEveryFingerprintDimension() {
+        let recordingID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        func key(
+            remote: String = "remote-1",
+            fingerprint: String = "fp-1",
+            chunkSize: Int64 = 262_144
+        ) -> String {
+            WebSyncCoordinator.audioSessionIdempotencyKey(
+                userID: "user-a",
+                recordingID: recordingID,
+                remoteRecordingID: remote,
+                fingerprintValue: fingerprint,
+                chunkSize: chunkSize
+            )
+        }
+
+        #expect(key() == "user-a:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:audio:fp-1:262144:remote-1")
+        #expect(key() == key())
+        #expect(key(remote: "remote-2") != key())
+        #expect(key(fingerprint: "fp-2") != key())
+        #expect(key(chunkSize: 524_288) != key())
+    }
+
+    @Test
+    func speakerIdentityReEnableForcesPayloadRefresh() {
+        #expect(!WebSyncCoordinator.shouldForceSpeakerIdentityRefresh(
+            enabled: false, generation: 1, lastEnabled: true, lastGeneration: 0
+        ))
+        #expect(WebSyncCoordinator.shouldForceSpeakerIdentityRefresh(
+            enabled: true, generation: 1, lastEnabled: false, lastGeneration: 1
+        ))
+        #expect(WebSyncCoordinator.shouldForceSpeakerIdentityRefresh(
+            enabled: true, generation: 1, lastEnabled: true, lastGeneration: 0
+        ))
+        #expect(!WebSyncCoordinator.shouldForceSpeakerIdentityRefresh(
+            enabled: true, generation: 1, lastEnabled: true, lastGeneration: 1
+        ))
+        #expect(WebSyncCoordinator.shouldForceSpeakerIdentityRefresh(
+            enabled: true, generation: 0, lastEnabled: nil, lastGeneration: nil
+        ))
     }
 }

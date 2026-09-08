@@ -23,9 +23,15 @@ struct RecordingListRow: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(recording.title)
-                    .font(.cadenza(13, weight: .semibold, scale: uiScale))
-                    .lineLimit(1)
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(typeTint)
+                        .frame(width: 7, height: 7)
+                        .accessibilityHidden(true)
+                    Text(recording.title)
+                        .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                        .lineLimit(1)
+                }
 
                 if let preview = contentPreview {
                     Text(preview)
@@ -46,17 +52,12 @@ struct RecordingListRow: View {
 
             Spacer()
 
-            HStack(spacing: 6) {
-                if recording.hasTranscript {
-                    statusPill(icon: "text.bubble.fill")
-                }
-                if recording.hasSummary {
-                    statusPill(icon: "sparkles")
-                }
+            if !recording.hasTranscript {
+                statusPill(text: String(localized: "No transcript"))
             }
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text(dateString)
+                Text(timeString)
                     .font(.cadenza(13 - 2, scale: uiScale))
                     .foregroundStyle(.secondary)
                 statusPill(text: durationString)
@@ -89,17 +90,24 @@ struct RecordingListRow: View {
         )
     }
 
-    /// Compact tag chip for the list row — mirrors the grid card's style (shared
-    /// `RecordingCardView.tagColor`) but a touch smaller to fit the denser row.
+    /// Compact tag chip for the list row — mirrors the grid card's neutral
+    /// chip (hue survives as a small dot, shared `RecordingCardView.tagColor`)
+    /// but a touch smaller to fit the denser row.
     private func tagChip(_ tag: String) -> some View {
-        Label(tag, systemImage: "tag")
-            .font(.cadenza(13 - 4, weight: .medium, scale: uiScale))
-            .foregroundStyle(RecordingCardView.tagColor(for: tag))
-            .lineLimit(1)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Capsule(style: .continuous).fill(AppStyle.ColorToken.mutedCapsuleFill))
-            .overlay(Capsule(style: .continuous).strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 0.6))
+        HStack(spacing: 4) {
+            Circle()
+                .fill(RecordingCardView.tagColor(for: tag))
+                .frame(width: 5, height: 5)
+                .accessibilityHidden(true)
+            Text(tag)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .font(.cadenza(13 - 4, weight: .medium, scale: uiScale))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule(style: .continuous).fill(AppStyle.ColorToken.mutedCapsuleFill))
+        .overlay(Capsule(style: .continuous).strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 0.6))
     }
 
     private var contentPreview: String? {
@@ -112,8 +120,10 @@ struct RecordingListRow: View {
         return nil
     }
 
-    private var dateString: String {
-        recording.startDate.formatted(Self.dateStyle)
+    /// Time, not date: list rows sit under a day header, which already
+    /// carries the date.
+    private var timeString: String {
+        recording.startDate.formatted(Self.timeStyle)
     }
 
     private var durationString: String {
@@ -122,5 +132,13 @@ struct RecordingListRow: View {
         return "\(minutes)m"
     }
 
-    private static let dateStyle = Date.FormatStyle.dateTime.month(.abbreviated).day()
+    private var typeTint: Color {
+        guard let raw = recording.meetingType,
+              let type = MeetingType(rawValue: raw) else {
+            return Color.secondary.opacity(0.35)
+        }
+        return RecordingCardView.typeTint(for: type)
+    }
+
+    private static let timeStyle = Date.FormatStyle.dateTime.hour(.defaultDigits(amPM: .abbreviated)).minute()
 }

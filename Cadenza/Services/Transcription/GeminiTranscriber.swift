@@ -2,10 +2,19 @@
 import Foundation
 import os
 
+/// Response *shape* only — counts and outcomes, never transcript content.
+/// NSLog does not reach the unified log on current macOS, so a silent
+/// provider regression would leave no trace worth reading after the fact.
+private let geminiTranscriberLog = Logger(
+    subsystem: "com.shuiandy.Cadenza",
+    category: "GeminiTranscriber"
+)
+
 /// Post-recording transcription using the Gemini API with audio input.
 /// Supports chunked upload for long recordings (>10min or >15MB).
 final class GeminiTranscriber: @unchecked Sendable {
     private let apiClient: GeminiTranscriptionAPIClient
+    private let model: String
 
     /// Max concurrent API requests.
     private static let maxConcurrency = 5
@@ -24,11 +33,19 @@ final class GeminiTranscriber: @unchecked Sendable {
         model: String,
         transport: HardenedAITransport = .transcription
     ) {
+        self.model = model
         self.apiClient = GeminiTranscriptionAPIClient(
             apiKey: apiKey,
             model: model,
             transport: transport
         )
+    }
+
+    /// gemini-3.5-transcribe and friends speak the Interactions API and return
+    /// native diarization; flash-tier models still go through the older
+    /// prompt-and-JSON-schema `generateContent` path.
+    private var usesInteractionsAPI: Bool {
+        GeminiTranscribeInteraction.isTranscribeModel(model)
     }
 
     // MARK: - Public
@@ -59,7 +76,11 @@ final class GeminiTranscriber: @unchecked Sendable {
                 language: language
             )
         }
-        return try await transcribeSingle(at: url, language: language)
+        return try await transcribeSingleWithRetry(
+            at: url,
+            language: language,
+            audioDuration: totalDuration > 0 ? totalDuration : nil
+        )
     }
 
     /// Gemini's inline request limit is bounded by both playback duration and
@@ -81,10 +102,33 @@ final class GeminiTranscriber: @unchecked Sendable {
 
     // MARK: - Single File Transcription
 
-    private func transcribeSingle(at url: URL, language: String?) async throws -> TranscriptResult {
+    /// Returns the transcript plus, on the Interactions path, what the
+    /// provider's response actually contained. A nil quality means the legacy
+    /// generateContent path, which has no comparable signal.
+    private func transcribeSingle(
+        at url: URL,
+        language: String?,
+        audioDuration: TimeInterval?
+    ) async throws -> (result: TranscriptResult, quality: GeminiTranscribeInteraction.Quality?) {
         let fileData = try Data(contentsOf: url)
         let base64Audio = fileData.base64EncodedString()
         let mimeType = mimeTypeForExtension(url.pathExtension)
+
+        if usesInteractionsAPI {
+            let requestBody = try GeminiTranscribeInteraction.makeRequestBody(
+                model: model,
+                base64Audio: base64Audio,
+                mimeType: mimeType,
+                language: language
+            )
+            let data = try await apiClient.createInteraction(body: requestBody)
+            let parsed = try GeminiTranscribeInteraction.parse(
+                data,
+                language: language,
+                audioDuration: audioDuration
+            )
+            return (parsed.result, parsed.quality)
+        }
 
         let langInstruction = (language != nil && language != "auto") ? "Transcribe in \(language!)." : ""
         let promptText = """
@@ -172,31 +216,70 @@ final class GeminiTranscriber: @unchecked Sendable {
             }
             if !segments.isEmpty {
                 let fullTranscript = segments.map(\.text).joined(separator: " ")
-                return TranscriptResult(text: fullTranscript, segments: segments, language: language, duration: nil)
+                return (
+                    TranscriptResult(text: fullTranscript, segments: segments, language: language, duration: nil),
+                    nil
+                )
             }
         }
 
-        // Fallback: return as single plain-text segment without speaker info.
-        return TranscriptResult(
-            text: trimmedText,
-            segments: [TranscriptResultSegment(startTime: 0, endTime: 0, text: trimmedText)],
-            language: language,
-            duration: nil
+        // Fallback: the model ignored the response schema. Split the text
+        // rather than returning one block, for the same reason the
+        // Interactions path does.
+        return (
+            TranscriptResult(
+                text: trimmedText,
+                segments: GeminiTranscribeInteraction.fallbackSegments(
+                    from: trimmedText,
+                    audioDuration: audioDuration
+                ),
+                language: language,
+                duration: nil
+            ),
+            nil
         )
     }
 
     // MARK: - Retry Wrapper
 
-    private func transcribeSingleWithRetry(at url: URL, language: String?) async throws -> TranscriptResult {
+    private func transcribeSingleWithRetry(
+        at url: URL,
+        language: String?,
+        audioDuration: TimeInterval?
+    ) async throws -> TranscriptResult {
         var lastError: Error?
+        var lastDegraded: TranscriptResult?
         for attempt in 0..<Self.maxRetries {
             if attempt > 0 {
                 let delay = Double(1 << attempt) // 2s, 4s
-                NSLog("[GeminiTranscriber] retry %d after %.0fs", attempt, delay)
+                geminiTranscriberLog.notice(
+                    "retry \(attempt, privacy: .public) after \(delay, privacy: .public)s"
+                )
                 try await Task.sleep(for: .seconds(delay))
             }
             do {
-                return try await transcribeSingle(at: url, language: language)
+                let (result, quality) = try await transcribeSingle(
+                    at: url,
+                    language: language,
+                    audioDuration: audioDuration
+                )
+                // A response that dropped its word annotations is a provider
+                // regression, and the one observed in August 2026 flickered
+                // request to request: the same audio came back healthy on a
+                // later attempt. Spend the retry budget on that before
+                // accepting a chunk with interpolated timings.
+                guard let quality, quality.isDegraded else { return result }
+                lastDegraded = result
+                if attempt < Self.maxRetries - 1 {
+                    geminiTranscriberLog.notice(
+                        "degraded response (\(quality.shapeDescription, privacy: .public)), retrying"
+                    )
+                    continue
+                }
+                geminiTranscriberLog.error(
+                    "degraded response persisted across \(Self.maxRetries, privacy: .public) attempts (\(quality.shapeDescription, privacy: .public)); accepting interpolated segments"
+                )
+                return result
             } catch {
                 lastError = error
                 if Self.isRetryableRequestError(error), attempt < Self.maxRetries - 1 {
@@ -205,6 +288,7 @@ final class GeminiTranscriber: @unchecked Sendable {
                 throw error
             }
         }
+        if let lastDegraded { return lastDegraded }
         throw lastError ?? TranscriptionError.apiError("Gemini transcription failed after retries")
     }
 
@@ -285,7 +369,8 @@ final class GeminiTranscriber: @unchecked Sendable {
                     let result = try await apiPermits.withPermit {
                         try await self.transcribeSingleWithRetry(
                             at: outputURL,
-                            language: language
+                            language: language,
+                            audioDuration: chunk.duration
                         )
                     }
                     return (chunk.index, chunk.start, chunk.duration, result)
@@ -322,7 +407,15 @@ final class GeminiTranscriber: @unchecked Sendable {
                         startTime: segStart,
                         endTime: segEnd,
                         text: seg.text,
-                        speaker: seg.speaker
+                        // spk_1 in chunk 0 and spk_1 in chunk 1 are unrelated
+                        // request-local labels. Keeping them would invent a
+                        // recording-wide identity out of nothing, so split
+                        // audio defers to the later local diarization pass —
+                        // the same rule WhisperTranscriber applies.
+                        speaker: WhisperTranscriber.speakerLabelForMergedChunks(
+                            seg.speaker,
+                            totalChunkCount: chunks.count
+                        )
                     ))
                 }
             }
@@ -404,7 +497,7 @@ final class GeminiTranscriber: @unchecked Sendable {
         let exportDeadline = ContinuousClock.now.advanced(by: .seconds(30))
         let pumpTerminalAction = OSAllocatedUnfairLock(initialState: false)
         try await CancellableCallbackOperation.run(for: .seconds(30)) { complete, isActive in
-            let queue = DispatchQueue(label: "cadenza.gemini-chunk-export")
+            let queue = DispatchQueue(label: "cadenza.gemini-chunk-export", qos: .utility)
             writerInput.requestMediaDataWhenReady(on: queue) {
                 guard isActive() else { return }
                 while writerInput.isReadyForMoreMediaData, isActive() {

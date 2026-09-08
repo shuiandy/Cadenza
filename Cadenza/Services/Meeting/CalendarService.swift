@@ -32,10 +32,16 @@ struct CalendarExternalAccessPolicy: Sendable, Equatable {
 @Observable @MainActor
 final class CalendarService {
     typealias EventStoreFactory = @MainActor () -> EKEventStore
+    typealias AuthorizationStatusProvider = @MainActor () -> EKAuthorizationStatus
 
     let externalAccessEnabled: Bool
     private let defaults: UserDefaults
     private let eventStore: EKEventStore?
+    private let authorizationStatusProvider: AuthorizationStatusProvider
+    /// Set when the TCC request sheet reported granted while
+    /// `EKEventStore.authorizationStatus` still served its pre-grant value —
+    /// the class-level status can lag like that for the rest of the process.
+    private var authorizationGrantedInProcess = false
     private(set) var upcomingMeetings: [MeetingEvent] = []
     private(set) var currentMeeting: MeetingEvent?
     private(set) var isMonitoring = false
@@ -45,19 +51,34 @@ final class CalendarService {
     init(
         externalAccessEnabled: Bool = true,
         defaults: UserDefaults = .standard,
-        eventStoreFactory: EventStoreFactory = { EKEventStore() }
+        eventStoreFactory: EventStoreFactory = { EKEventStore() },
+        authorizationStatusProvider: @escaping AuthorizationStatusProvider = {
+            EKEventStore.authorizationStatus(for: .event)
+        }
     ) {
         let policy = CalendarExternalAccessPolicy(isEnabled: externalAccessEnabled)
         self.externalAccessEnabled = externalAccessEnabled
         self.defaults = defaults
         self.eventStore = policy.makeResource(using: eventStoreFactory)
+        self.authorizationStatusProvider = authorizationStatusProvider
     }
 
     // MARK: - Authorization
 
     var isAuthorized: Bool {
         guard externalAccessEnabled, eventStore != nil else { return false }
-        return EKEventStore.authorizationStatus(for: .event) == .fullAccess
+        if authorizationGrantedInProcess { return true }
+        return authorizationStatusProvider() == .fullAccess
+    }
+
+    /// The request sheet's own result is the authoritative grant signal.
+    /// Adopting it unblocks every isAuthorized-gated path in this process and
+    /// resets the store so a pre-grant instance starts returning calendars.
+    func adoptAuthorizationGrantedInProcess() {
+        guard externalAccessEnabled, let eventStore,
+              !authorizationGrantedInProcess else { return }
+        authorizationGrantedInProcess = true
+        eventStore.reset()
     }
 
     func requestAccess() async -> Bool {

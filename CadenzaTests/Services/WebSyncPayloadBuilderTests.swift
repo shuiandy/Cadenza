@@ -42,6 +42,25 @@ struct WebSyncPayloadBuilderTests {
         #expect(!json.contains("linkedCalendarEventID"))
     }
 
+    @Test func localReviewMetadataDoesNotEnterSyncPayload() throws {
+        var summary = SummaryDTO(id: UUID(), overview: "Fictional review", keyPoints: [], actionItems: [],
+            decisions: [], followUps: [], yourTasks: [], provider: "fixture", model: "fixture", language: "en", createdAt: Date(), chapters: [])
+        let plain = TestDTOFactory.makeRecordingDetailDTO(summary: summary)
+        var metadata = SummaryGenerationMetadata(detailLevel: "fullBreakdown", stage: .reviewed)
+        metadata.source = .init(transcriptID: UUID(), digest: "LOCAL_DIGEST", transcriptDigest: "LOCAL_TRANSCRIPT", mappingDigest: "LOCAL_MAPPING")
+        metadata.speakerMappingsChanged = true
+        summary.generationMetadata = metadata
+        var decorated = plain
+        decorated.summary = summary
+        let first = try WebSyncPayloadBuilder.build(snapshot: .init(detail: plain, folderPath: "", trashedDate: nil), audioSourceState: .localOnly)
+        let second = try WebSyncPayloadBuilder.build(snapshot: .init(detail: decorated, folderPath: "", trashedDate: nil), audioSourceState: .localOnly)
+        #expect(first.encodedData == second.encodedData)
+        let json = String(decoding: second.encodedData, as: UTF8.self)
+        for field in ["generationMetadata", "summarySourceVersionJSON", "transcriptDigest", "mappingDigest", "LOCAL_DIGEST"] {
+            #expect(!json.contains(field))
+        }
+    }
+
     @Test
     func missingArtifactsEncodeAsNull() throws {
         let snapshot = WebSyncSnapshot(
@@ -53,6 +72,21 @@ struct WebSyncPayloadBuilderTests {
         let json = String(decoding: built.encodedData, as: UTF8.self)
         #expect(json.contains("\"transcript\":null"))
         #expect(json.contains("\"summary\":null"))
+        #expect(!json.contains("calendar_event"))
+    }
+
+    @Test
+    func userClearedCalendarEventEncodesAsNull() throws {
+        let snapshot = WebSyncSnapshot(
+            detail: TestDTOFactory.makeRecordingDetailDTO(),
+            folderPath: "",
+            trashedDate: nil,
+            calendarEventCleared: true
+        )
+        let built = try WebSyncPayloadBuilder.build(snapshot: snapshot, audioSourceState: .localOnly)
+        let json = String(decoding: built.encodedData, as: UTF8.self)
+        #expect(json.contains("\"calendar_event\":null"))
+        #expect(built.payload.calendarEvent == .cleared)
     }
 
     @Test
@@ -97,7 +131,7 @@ struct WebSyncPayloadBuilderTests {
     @Test
     func summaryPreservesTasksChaptersAndProvenance() throws {
         let actionItemID = UUID()
-        let summary = SummaryDTO(
+        var summary = SummaryDTO(
             id: UUID(),
             overview: "Overview",
             keyPoints: [],
@@ -118,6 +152,8 @@ struct WebSyncPayloadBuilderTests {
             createdAt: Date(),
             chapters: [ChapterDTO(title: "Launch", startSeconds: 65, summary: "Release plan")]
         )
+        summary.generationMetadata = .init(detailLevel: "fullBreakdown", stage: .reviewed,
+            issues: [.init(section: "key_points", itemIndex: nil, kind: "omission", evidence: "LOCAL_ONLY_EVIDENCE", description: "local review", resolved: true)])
         let snapshot = WebSyncSnapshot(
             detail: TestDTOFactory.makeRecordingDetailDTO(summary: summary),
             folderPath: "",
@@ -125,6 +161,16 @@ struct WebSyncPayloadBuilderTests {
         )
 
         let built = try WebSyncPayloadBuilder.build(snapshot: snapshot, audioSourceState: .unavailable)
+        let encoded = try JSONEncoder().encode(built.payload)
+        let wire = String(decoding: encoded, as: UTF8.self)
+        #expect(!wire.contains("generationMetadata"))
+        #expect(!wire.contains("LOCAL_ONLY_EVIDENCE"))
+        let json = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let summaryWire = try #require(json["summary"] as? [String: Any])
+        let structuredWire = try #require(summaryWire["structured"] as? [String: Any])
+        // Match a strict server: reject any newly introduced nested field.
+        let allowed: Set<String> = ["overview", "key_points", "action_items", "decisions", "follow_ups", "your_tasks", "language", "chapters"]
+        #expect(Set(structuredWire.keys).isSubset(of: allowed))
         let markdown = built.payload.summary?.markdown ?? ""
         let structured = try #require(built.payload.summary?.structured)
         let actionItem = try #require(structured.actionItems.first)
@@ -145,6 +191,9 @@ struct WebSyncPayloadBuilderTests {
         #expect(actionItem.deadline == "Friday")
         #expect(!actionItem.completed)
         #expect(actionItem.priority == "high")
+        let fallback = Int64((snapshot.detail.createdAt ?? snapshot.detail.startDate).timeIntervalSince1970.rounded())
+        #expect(actionItem.createdAt == fallback)
+        #expect(actionItem.updatedAt == fallback)
         #expect(chapter.title == "Launch")
         #expect(chapter.startSeconds == 65)
         #expect(chapter.summary == "Release plan")
@@ -160,6 +209,8 @@ struct WebSyncPayloadBuilderTests {
         let chaptersJSON = try #require(structuredJSON["chapters"] as? [[String: Any]])
         #expect(actionItemsJSON.first?["id"] as? String == actionItemID.uuidString.lowercased())
         #expect(actionItemsJSON.first?["completed"] as? Bool == false)
+        #expect((actionItemsJSON.first?["created_at"] as? NSNumber)?.int64Value == fallback)
+        #expect((actionItemsJSON.first?["updated_at"] as? NSNumber)?.int64Value == fallback)
         #expect(chaptersJSON.first?["start_seconds"] as? Double == 65)
         #expect(structuredJSON["your_tasks"] as? [String] == ["Review the launch"])
     }
@@ -181,9 +232,7 @@ struct WebSyncPayloadBuilderTests {
         let built = try WebSyncPayloadBuilder.build(
             snapshot: snapshot, audioSourceState: .unavailable
         )
-        #expect(built.payload.calendarEvent?.title == calendarEvent.title)
-        #expect(built.payload.calendarEvent?.startAt == calendarEvent.startAt)
-        #expect(built.payload.calendarEvent?.endAt == calendarEvent.endAt)
+        #expect(built.payload.calendarEvent == .value(calendarEvent))
 
         let root = try #require(
             JSONSerialization.jsonObject(with: built.encodedData) as? [String: Any]

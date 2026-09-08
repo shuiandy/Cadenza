@@ -48,6 +48,8 @@ final class WebSyncCoordinator {
     /// Entitlement knowledge and local pauses for the bound account. Read-only
     /// to callers: the surface that presents it is not this task's to design.
     let entitlements = EntitlementsGate()
+    /// Last prefs snapshot fetched at a session boundary. Nil until then.
+    private(set) var mcpPrefs: MCPPrefsSnapshot?
     private let auth: CadenzaAuthService
     private let entitlementsRefreshPolicy: EntitlementsRefreshPolicy
 
@@ -101,6 +103,10 @@ final class WebSyncCoordinator {
         // suspended one: a transition must not leave the previous account's
         // knowledge readable.
         entitlements.bind(to: authority)
+        if authority == nil { mcpPrefs = nil }
+        if activeUser?.id != candidate?.id || authority == nil {
+            audioProbeAttempts = [:]
+        }
         activeUser = authority == nil ? nil : candidate
         guard !isSuspended else { return }
         sessionStateTask?.cancel()
@@ -183,14 +189,19 @@ final class WebSyncCoordinator {
         entitlementsTask = Task { [weak self] in
             guard let self else { return }
             let resolution = await api.fetchEntitlements(service: authority.service)
+            let prefs = await api.fetchMCPPrefs()
             guard !Task.isCancelled, isActiveUser(authority.bound.userID) else { return }
+            let previousPrefs = mcpPrefs
+            if let prefs { mcpPrefs = prefs }
+            let prefsChanged = prefs != nil && prefs != previousPrefs
             let applied = entitlements.apply(resolution, for: authority)
             if !applied.reopened.isEmpty {
                 await requeueEntitlementFailures(applied.reopened, userID: authority.bound.userID)
             }
-            // New knowledge and a lifted refusal can each make work runnable,
-            // even when the authoritative snapshot itself did not change.
-            guard (applied.learned || !applied.reopened.isEmpty),
+            // New knowledge, a lifted refusal, or a prefs generation change
+            // can each make work runnable — identity re-enable must not wait
+            // for an entitlement delta that never comes.
+            guard (applied.learned || !applied.reopened.isEmpty || prefsChanged),
                   isActiveUser(authority.bound.userID),
                   !Task.isCancelled else {
                 return
@@ -351,6 +362,11 @@ final class WebSyncCoordinator {
                     count += try await store.requeueInitialWebSyncServerFailures(userID: userID)
                     defaults.set(true, forKey: serverRecoveryKey)
                 }
+                if let schemaRecoveryKey = self.schemaRejectionRecoveryKey(userID),
+                   !defaults.bool(forKey: schemaRecoveryKey) {
+                    count += try await store.requeueWebSyncSchemaRejectionFailures(userID: userID)
+                    defaults.set(true, forKey: schemaRecoveryKey)
+                }
                 guard isActiveUser(userID), !Task.isCancelled else { return }
                 if count > 0 {
                     NSLog("[WebSync] requeued %d rollout failures for active account", count)
@@ -418,8 +434,17 @@ final class WebSyncCoordinator {
         let reconciledConsent = reconciledHistoricalConsentKey(userID).flatMap {
             defaults.string(forKey: $0)
         }
+        var prefsRefreshedThisPass = false
+        let prefsAtStart = mcpPrefs
+        let forceIdentityRefresh = Self.shouldForceSpeakerIdentityRefresh(
+            enabled: prefsAtStart?.speakerIdentityEnabled ?? false,
+            generation: prefsAtStart?.speakerIdentityGeneration ?? 0,
+            lastEnabled: reconciledSpeakerIdentityEnabled(userID),
+            lastGeneration: reconciledSpeakerIdentityGeneration(userID)
+        )
         let forcePayloadRefresh = reconciledPreference != audioEnabled
             || reconciledConsent != consent.rawValue
+            || forceIdentityRefresh
         let audioProbeCandidateIDs = Self.audioProbeCandidateIDs(
             candidates: candidates,
             recordsByRecordingID: syncRecordsByRecordingID,
@@ -427,7 +452,8 @@ final class WebSyncCoordinator {
             historicalConsent: consent,
             structuredSyncAllowed: structuredSyncAllowed,
             forcePayloadRefresh: forcePayloadRefresh,
-            now: now
+            now: now,
+            probeAttempts: audioProbeAttempts
         )
         let deletionWork = userInitiatedRetry
             ? syncRecords.filter {
@@ -490,10 +516,22 @@ final class WebSyncCoordinator {
                     continue
                 }
             }
+            // Refresh prefs once per pass, and only when the pass is
+            // actually about to build a payload — a pass with no sync work
+            // must not generate requests, and fetching inside
+            // sync(recordingID:) would multiply the request by the
+            // candidate count.
+            if !prefsRefreshedThisPass {
+                prefsRefreshedThisPass = true
+                if let passPrefs = await api.fetchMCPPrefs() {
+                    mcpPrefs = passPrefs
+                }
+            }
             let succeeded = await sync(
                 recordingID: candidate.recordingID,
                 userID: userID,
                 policyRefreshRequired: forcePayloadRefresh,
+                identityRefreshRequired: forceIdentityRefresh,
                 bypassRetryBackoff: bypassRetryBackoff
             )
             if forcePayloadRefresh, !succeeded {
@@ -507,6 +545,14 @@ final class WebSyncCoordinator {
             }
             if let key = reconciledHistoricalConsentKey(userID) {
                 defaults.set(consent.rawValue, forKey: key)
+            }
+            if let prefsAtStart {
+                if let key = reconciledSpeakerIdentityEnabledKey(userID) {
+                    defaults.set(prefsAtStart.speakerIdentityEnabled, forKey: key)
+                }
+                if let key = reconciledSpeakerIdentityGenerationKey(userID) {
+                    defaults.set(prefsAtStart.speakerIdentityGeneration, forKey: key)
+                }
             }
         }
         await clearErrorIfPassResolved(
@@ -705,6 +751,15 @@ final class WebSyncCoordinator {
     nonisolated static let syncedAudioProbeInterval: TimeInterval = 15 * 60
     nonisolated static let syncedAudioProbeBudgetPerPass = 8
 
+    /// In-process schedule of synced-audio probes for the active account.
+    /// A probe that found nothing changed used to persist `lastAttemptAt`
+    /// through a full store save on every pass: eight rows a minute, each a
+    /// persistent-history transaction plus a detail-cache flush, forever. The
+    /// schedule only has to hold within one process; after a relaunch the
+    /// rows are simply due again, bounded by the per-pass budget. Cleared on
+    /// every account boundary so one account's cadence never shapes another's.
+    @ObservationIgnored private var audioProbeAttempts: [UUID: Date] = [:]
+
     nonisolated static func audioProbeCandidateIDs(
         candidates: [WebSyncCandidate],
         recordsByRecordingID: [UUID: WebSyncRecordDTO],
@@ -713,9 +768,16 @@ final class WebSyncCoordinator {
         structuredSyncAllowed: Bool = true,
         forcePayloadRefresh: Bool,
         now: Date,
-        budget: Int = syncedAudioProbeBudgetPerPass
+        budget: Int = syncedAudioProbeBudgetPerPass,
+        probeAttempts: [UUID: Date] = [:]
     ) -> Set<UUID> {
         guard budget > 0 else { return [] }
+        func lastProbe(_ recordingID: UUID) -> Date? {
+            latestProbeDate(
+                recordsByRecordingID[recordingID]?.lastAttemptAt,
+                probeAttempts[recordingID]
+            )
+        }
         let due = candidates.filter { candidate in
             shouldProbeSyncedAudio(
                 candidate,
@@ -727,16 +789,29 @@ final class WebSyncCoordinator {
                 ),
                 structuredSyncAllowed: structuredSyncAllowed,
                 forcePayloadRefresh: forcePayloadRefresh,
-                now: now
+                now: now,
+                lastProbeAt: probeAttempts[candidate.recordingID]
             )
         }
         let oldestFirst = due.sorted { lhs, rhs in
-            let left = recordsByRecordingID[lhs.recordingID]?.lastAttemptAt ?? .distantPast
-            let right = recordsByRecordingID[rhs.recordingID]?.lastAttemptAt ?? .distantPast
+            let left = lastProbe(lhs.recordingID) ?? .distantPast
+            let right = lastProbe(rhs.recordingID) ?? .distantPast
             if left != right { return left < right }
             return lhs.recordingID.uuidString < rhs.recordingID.uuidString
         }
         return Set(oldestFirst.prefix(budget).map(\.recordingID))
+    }
+
+    /// The durable `lastAttemptAt` and the in-process schedule are two views
+    /// of the same cadence; the later one is authoritative for both the
+    /// interval check and the oldest-first ordering.
+    nonisolated static func latestProbeDate(_ durable: Date?, _ inProcess: Date?) -> Date? {
+        switch (durable, inProcess) {
+        case let (d?, m?): return max(d, m)
+        case let (d?, nil): return d
+        case let (nil, m?): return m
+        case (nil, nil): return nil
+        }
     }
 
     nonisolated static func shouldProbeSyncedAudio(
@@ -746,7 +821,8 @@ final class WebSyncCoordinator {
         structuredSyncAllowed: Bool = true,
         forcePayloadRefresh: Bool,
         now: Date,
-        interval: TimeInterval = syncedAudioProbeInterval
+        interval: TimeInterval = syncedAudioProbeInterval,
+        lastProbeAt: Date? = nil
     ) -> Bool {
         guard !forcePayloadRefresh,
               audioUploadEnabled,
@@ -766,8 +842,30 @@ final class WebSyncCoordinator {
            record.audioProbeRevision != candidate.contentRevision {
             return true
         }
-        guard let lastAttemptAt = record.lastAttemptAt else { return true }
+        guard let lastAttemptAt = latestProbeDate(record.lastAttemptAt, lastProbeAt) else {
+            return true
+        }
         return now.timeIntervalSince(lastAttemptAt) >= interval
+    }
+
+    /// Records a probe whose result changed nothing. The cadence lives in
+    /// `audioProbeAttempts`; durable state is touched only when the probe
+    /// revision itself moved, because `shouldProbeSyncedAudio` reads
+    /// `audioProbeRevision` from the row while structured sync is paused.
+    private func noteUnchangedAudioProbe(
+        candidate: WebSyncCandidate,
+        record: WebSyncRecordDTO,
+        userID: String,
+        at now: Date
+    ) async throws {
+        audioProbeAttempts[candidate.recordingID] = now
+        guard record.audioProbeRevision != candidate.contentRevision else { return }
+        try await store.markWebSyncAudioProbe(
+            userID: userID,
+            recordingID: candidate.recordingID,
+            contentRevision: candidate.contentRevision,
+            at: now
+        )
     }
 
     private func audioProbeRequiresFullSync(
@@ -781,11 +879,8 @@ final class WebSyncCoordinator {
             guard let url = try await store.fetchWebSyncAudioProbeURL(
                 recordingID: candidate.recordingID
             ) else {
-                try await store.markWebSyncAudioProbe(
-                    userID: userID,
-                    recordingID: candidate.recordingID,
-                    contentRevision: candidate.contentRevision,
-                    at: now
+                try await noteUnchangedAudioProbe(
+                    candidate: candidate, record: record, userID: userID, at: now
                 )
                 return false
             }
@@ -805,13 +900,11 @@ final class WebSyncCoordinator {
                 mutation.clearUploadSessionID = true
                 mutation.nextAttemptAt = record.nextAttemptAt
                 _ = try await store.upsertWebSyncRecord(mutation)
+                audioProbeAttempts[candidate.recordingID] = now
                 return true
             }
-            try await store.markWebSyncAudioProbe(
-                userID: userID,
-                recordingID: candidate.recordingID,
-                contentRevision: candidate.contentRevision,
-                at: now
+            try await noteUnchangedAudioProbe(
+                candidate: candidate, record: record, userID: userID, at: now
             )
             return false
         } catch is CancellationError {
@@ -825,11 +918,8 @@ final class WebSyncCoordinator {
             }
             if record.audioState == WebAudioSyncState.unavailable.rawValue {
                 do {
-                    try await store.markWebSyncAudioProbe(
-                        userID: userID,
-                        recordingID: candidate.recordingID,
-                        contentRevision: candidate.contentRevision,
-                        at: now
+                    try await noteUnchangedAudioProbe(
+                        candidate: candidate, record: record, userID: userID, at: now
                     )
                 } catch {
                     NSLog("[WebSync] audio probe state failed: %@", error.localizedDescription)
@@ -848,6 +938,7 @@ final class WebSyncCoordinator {
         recordingID: UUID,
         userID: String,
         policyRefreshRequired: Bool,
+        identityRefreshRequired: Bool,
         bypassRetryBackoff: Bool
     ) async -> Bool {
         // The lease covers reference resolution itself: the snapshot is
@@ -860,10 +951,19 @@ final class WebSyncCoordinator {
             return false
         }
         defer { migrationGate.releaseActivity(migrationLease) }
-        let snapshot: WebSyncSnapshot
+        var snapshot: WebSyncSnapshot
         do {
-            guard let fetched = try await store.fetchWebSyncSnapshot(recordingID: recordingID) else {
+            guard var fetched = try await store.fetchWebSyncSnapshot(recordingID: recordingID) else {
                 return true
+            }
+            if mcpPrefs?.speakerIdentityEnabled == true {
+                fetched.speakerMappings = fetched.detail.speakerMappings.map {
+                    WebSyncSpeakerMapping(
+                        rawLabel: $0.rawLabel,
+                        profileID: $0.profileID.uuidString.lowercased(),
+                        displayName: $0.profileName
+                    )
+                }
             }
             snapshot = fetched
         } catch {
@@ -929,8 +1029,11 @@ final class WebSyncCoordinator {
                 }
                 return !policyRefreshRequired
             }
-            let payloadBuildTask = Task.detached(priority: .utility) {
-                try WebSyncPayloadBuilder.build(snapshot: snapshot, audioSourceState: audioSource)
+            // `snapshot` is a mutated local; hand the builder an immutable copy
+            // so the detached closure's captures stay Sendable-checkable.
+            let payloadSnapshot = snapshot
+            let payloadBuildTask = Task.detached(priority: .utility) { @Sendable in
+                try WebSyncPayloadBuilder.build(snapshot: payloadSnapshot, audioSourceState: audioSource)
             }
             let built = try await withTaskCancellationHandler {
                 try await payloadBuildTask.value
@@ -941,6 +1044,7 @@ final class WebSyncCoordinator {
             attemptedHash = built.contentHash
             var structuredRetryDeferred = false
             if !bypassRetryBackoff,
+               !identityRefreshRequired,
                let nextAttemptAt = existing?.nextAttemptAt,
                nextAttemptAt > Date(),
                existing?.structuredHash == built.contentHash {
@@ -972,7 +1076,11 @@ final class WebSyncCoordinator {
             var remoteID = existing?.remoteRecordingID
             let structuredWorkPending = !structuredRetryDeferred
                 && (existing?.structuredHash != built.contentHash
-                    || existing?.structuredState != WebStructuredSyncState.synced.rawValue)
+                    || existing?.structuredState != WebStructuredSyncState.synced.rawValue
+                    // Identity toggles can require re-pushing an identical
+                    // payload (the server purges mappings on disable), so the
+                    // hash comparison alone cannot see the work.
+                    || identityRefreshRequired)
             if structuredAllowed && structuredWorkPending {
                 isInitialStructuredUpsert = remoteID == nil
                 structuredUpsertPendingAcknowledgement = true
@@ -1158,7 +1266,13 @@ final class WebSyncCoordinator {
             // upload, which current entitlement has to permit.
             guard mayOpenNewSession else { return }
             let request = WebSyncAudioSessionRequest(
-                idempotencyKey: "\(userID):\(recordingID.uuidString.lowercased()):audio:\(fingerprint.value)",
+                idempotencyKey: Self.audioSessionIdempotencyKey(
+                    userID: userID,
+                    recordingID: recordingID,
+                    remoteRecordingID: remoteID,
+                    fingerprintValue: fingerprint.value,
+                    chunkSize: protocolChunkSize
+                ),
                 totalSize: fingerprint.size,
                 chunkSize: protocolChunkSize,
                 codec: "aac",
@@ -1517,7 +1631,58 @@ final class WebSyncCoordinator {
     private func reconciledHistoricalConsentKey(_ userID: String) -> String? {
         accountScopedPreferenceKey(base: "webSync.reconciledHistoricalConsent", userID: userID)
     }
+    private func reconciledSpeakerIdentityEnabledKey(_ userID: String) -> String? {
+        accountScopedPreferenceKey(base: "webSync.reconciledSpeakerIdentityEnabled", userID: userID)
+    }
+    private func reconciledSpeakerIdentityGenerationKey(_ userID: String) -> String? {
+        accountScopedPreferenceKey(base: "webSync.reconciledSpeakerIdentityRev", userID: userID)
+    }
+    private func reconciledSpeakerIdentityEnabled(_ userID: String) -> Bool? {
+        reconciledSpeakerIdentityEnabledKey(userID).flatMap { defaults.object(forKey: $0) as? Bool }
+    }
+    private func reconciledSpeakerIdentityGeneration(_ userID: String) -> Int64? {
+        guard let key = reconciledSpeakerIdentityGenerationKey(userID),
+              defaults.object(forKey: key) != nil else { return nil }
+        return Int64(defaults.integer(forKey: key))
+    }
+
+    /// Re-enable (or first enable) must force-refresh mappings. Generation
+    /// only increments on disable, so both the flag and the rev are compared.
+    nonisolated static func shouldForceSpeakerIdentityRefresh(
+        enabled: Bool,
+        generation: Int64,
+        lastEnabled: Bool?,
+        lastGeneration: Int64?
+    ) -> Bool {
+        guard enabled else { return false }
+        return lastEnabled != true || lastGeneration != generation
+    }
     private func serverFailureRecoveryKey(_ userID: String) -> String? {
         accountScopedPreferenceKey(base: "webSync.initialServerRecovery", userID: userID)
+    }
+    /// v1: the 2026-08 calendar_event / structured-summary rollout, where the
+    /// client shipped the fields before the backend accepted them. Bump the
+    /// suffix if a future rollout needs to revive schema-rejected rows again.
+    private func schemaRejectionRecoveryKey(_ userID: String) -> String? {
+        accountScopedPreferenceKey(base: "webSync.schemaRejectionRecovery.v1", userID: userID)
+    }
+
+    /// The create idempotency key must pin every dimension the server folds
+    /// into its session fingerprint (remote recording id, chunk size, source
+    /// fingerprint). A key that pins fewer dimensions turns any drift — a
+    /// re-created remote recording, a contract-driven chunk-size change — into
+    /// an eternal 409 session_conflict: the old session occupies the key with
+    /// a fingerprint that can never match again, and the server's supersede
+    /// path never runs because the idempotency check fires first. A widened
+    /// key simply opens a fresh session, and creating it aborts the stale
+    /// active one server-side.
+    nonisolated static func audioSessionIdempotencyKey(
+        userID: String,
+        recordingID: UUID,
+        remoteRecordingID: String,
+        fingerprintValue: String,
+        chunkSize: Int64
+    ) -> String {
+        "\(userID):\(recordingID.uuidString.lowercased()):audio:\(fingerprintValue):\(chunkSize):\(remoteRecordingID)"
     }
 }

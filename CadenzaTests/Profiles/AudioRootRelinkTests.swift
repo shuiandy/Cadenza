@@ -1048,7 +1048,7 @@ struct LegacyAudioRelinkCoordinatorTests {
                 .appendingPathComponent("Cadenza/Views/Recordings/RecordingDetailView.swift"),
             encoding: .utf8
         )
-        let player = try #require(source.range(of: "audioPlayerSection\n"))
+        let player = try #require(source.range(of: "audioPlayerSection(detail)\n"))
         let residual = try #require(
             source.range(of: "legacyRelinkSection(audioFile, style: .residualLocation)")
         )

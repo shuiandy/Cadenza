@@ -516,7 +516,7 @@ private final class LocalWhisperKitPipeline: LocalWhisperPipeline {
             throwing: Error.self
         )
 
-        let workerTask = Task.detached(priority: .userInitiated) {
+        let workerTask = Task.detached(priority: ProcessingWorkPriority.shared.current) {
             do {
                 let config = WhisperKitConfig(
                     modelFolder: modelFolderPath,

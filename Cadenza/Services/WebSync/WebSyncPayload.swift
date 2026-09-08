@@ -18,7 +18,8 @@ struct WebSyncPayload: Codable, Sendable {
     let audioSourceState: WebSyncAudioSourceState
     let transcript: WebSyncTranscript?
     let summary: WebSyncSummary?
-    let calendarEvent: WebSyncCalendarEvent?
+    let calendarEvent: WebSyncCalendarEventWire
+    let speakerMappings: [WebSyncSpeakerMapping]?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -33,6 +34,7 @@ struct WebSyncPayload: Codable, Sendable {
         case transcript
         case summary
         case calendarEvent = "calendar_event"
+        case speakerMappings = "speaker_mappings"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -51,9 +53,91 @@ struct WebSyncPayload: Codable, Sendable {
         else { try container.encodeNil(forKey: .transcript) }
         if let summary { try container.encode(summary, forKey: .summary) }
         else { try container.encodeNil(forKey: .summary) }
-        if let calendarEvent { try container.encode(calendarEvent, forKey: .calendarEvent) }
-        else { try container.encodeNil(forKey: .calendarEvent) }
+        switch calendarEvent {
+        case .omitted:
+            break
+        case .cleared:
+            try container.encodeNil(forKey: .calendarEvent)
+        case .value(let event):
+            try container.encode(event, forKey: .calendarEvent)
+        }
+        if let speakerMappings {
+            try container.encode(speakerMappings, forKey: .speakerMappings)
+        }
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        protocolVersion = try container.decode(Int.self, forKey: .protocolVersion)
+        contentHash = try container.decode(String.self, forKey: .contentHash)
+        title = try container.decode(String.self, forKey: .title)
+        createdAtLocal = try container.decode(Int64.self, forKey: .createdAtLocal)
+        durationMs = try container.decode(Int64.self, forKey: .durationMs)
+        folder = try container.decode(String.self, forKey: .folder)
+        tags = try container.decode([String].self, forKey: .tags)
+        trashedAt = try container.decodeIfPresent(Int64.self, forKey: .trashedAt)
+        audioSourceState = try container.decode(WebSyncAudioSourceState.self, forKey: .audioSourceState)
+        transcript = try container.decodeIfPresent(WebSyncTranscript.self, forKey: .transcript)
+        summary = try container.decodeIfPresent(WebSyncSummary.self, forKey: .summary)
+        if container.contains(.calendarEvent) {
+            if try container.decodeNil(forKey: .calendarEvent) {
+                calendarEvent = .cleared
+            } else {
+                calendarEvent = .value(try container.decode(WebSyncCalendarEvent.self, forKey: .calendarEvent))
+            }
+        } else {
+            calendarEvent = .omitted
+        }
+        speakerMappings = try container.decodeIfPresent([WebSyncSpeakerMapping].self, forKey: .speakerMappings)
+    }
+
+    init(
+        protocolVersion: Int,
+        contentHash: String,
+        title: String,
+        createdAtLocal: Int64,
+        durationMs: Int64,
+        folder: String,
+        tags: [String],
+        trashedAt: Int64?,
+        audioSourceState: WebSyncAudioSourceState,
+        transcript: WebSyncTranscript?,
+        summary: WebSyncSummary?,
+        calendarEvent: WebSyncCalendarEventWire,
+        speakerMappings: [WebSyncSpeakerMapping]? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.contentHash = contentHash
+        self.title = title
+        self.createdAtLocal = createdAtLocal
+        self.durationMs = durationMs
+        self.folder = folder
+        self.tags = tags
+        self.trashedAt = trashedAt
+        self.audioSourceState = audioSourceState
+        self.transcript = transcript
+        self.summary = summary
+        self.calendarEvent = calendarEvent
+        self.speakerMappings = speakerMappings
+    }
+}
+
+struct WebSyncSpeakerMapping: Codable, Sendable, Equatable {
+    let rawLabel: String
+    let profileID: String
+    let displayName: String
+
+    enum CodingKeys: String, CodingKey {
+        case rawLabel = "raw_label"
+        case profileID = "profile_id"
+        case displayName = "display_name"
+    }
+}
+
+enum WebSyncCalendarEventWire: Sendable, Equatable {
+    case omitted
+    case cleared
+    case value(WebSyncCalendarEvent)
 }
 
 struct WebSyncTranscript: Codable, Sendable {
@@ -129,6 +213,14 @@ struct WebSyncActionItem: Codable, Sendable {
     let deadline: String
     let completed: Bool
     let priority: String
+    let createdAt: Int64
+    let updatedAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case id, task, assignee, deadline, completed, priority
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
 }
 
 struct WebSyncChapter: Codable, Sendable {
@@ -149,7 +241,7 @@ struct WebSyncChapter: Codable, Sendable {
 /// addresses, calendar identifiers and colors; naming the meeting on a web
 /// recording page needs none of it, and syncing it would widen what the server
 /// knows about the user's calendar for nothing they would see.
-struct WebSyncCalendarEvent: Codable, Sendable {
+struct WebSyncCalendarEvent: Codable, Sendable, Equatable {
     let title: String
     let startAt: Int64
     let endAt: Int64

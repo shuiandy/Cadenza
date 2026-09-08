@@ -24,19 +24,20 @@ final class OpenAIService: AIServiceProtocol {
         self.transport = transport
     }
 
-    func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String]) async throws -> SummaryResult {
+    func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) async throws -> SummaryResult {
         let modelID = model ?? provider.summaryModel
 
-        let body = Self.makeRequestBody(
+        var body = Self.makeRequestBody(
             provider: provider,
             modelID: modelID,
             messages: [
-                ["role": "system", "content": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags)],
+                ["role": "system", "content": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel)],
                 ["role": "user", "content": SummaryPrompt.user(transcript: transcript)]
             ],
             purpose: .summary
         )
 
+        if provider == .openai { body["max_completion_tokens"] = Self.summaryBudget(detailLevel) }
         let data = try await postJSON(body)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = json["choices"] as? [[String: Any]],
@@ -45,48 +46,54 @@ final class OpenAIService: AIServiceProtocol {
             throw AIServiceError.invalidResponse
         }
 
+        guard choices.first?["finish_reason"] as? String == "stop" else { throw AIServiceError.incompleteResponse }
         return SummaryPrompt.parseResponse(content)
     }
 
-    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String]) -> AsyncThrowingStream<String, Error> {
-        let modelID = model ?? provider.summaryModel
+    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) -> AsyncThrowingStream<String, Error> {
+        streamSummary(systemPrompt: SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel),
+            userMessage: SummaryPrompt.user(transcript: transcript), model: model, detailLevel: detailLevel, purpose: .summary)
+    }
 
-        return AsyncThrowingStream { continuation in
+    func streamSummaryCompletion(systemPrompt: String, userMessage: String, model: String?, detailLevel: SummaryDetailLevel) -> AsyncThrowingStream<String, Error> {
+        // Preserve the existing two-stage completion sampling/reasoning settings.
+        streamSummary(systemPrompt: systemPrompt, userMessage: userMessage, model: model, detailLevel: detailLevel, purpose: .chat)
+    }
+
+    private static func summaryBudget(_ detail: SummaryDetailLevel) -> Int {
+        switch detail { case .highlights: 4096; case .detailed: 8192; case .fullBreakdown: 16384 }
+    }
+
+    private func streamSummary(systemPrompt: String, userMessage: String, model: String?, detailLevel: SummaryDetailLevel, purpose: RequestPurpose) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let body = Self.makeRequestBody(
-                        provider: provider,
-                        modelID: modelID,
-                        messages: [
-                            ["role": "system", "content": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags)],
-                            ["role": "user", "content": SummaryPrompt.user(transcript: transcript)]
-                        ],
-                        purpose: .summary,
-                        stream: true
-                    )
-
-                    let events = try postStreamJSON(body)
-
-                    for try await payload in events {
+                    var body = Self.makeRequestBody(provider: provider, modelID: model ?? provider.summaryModel,
+                        messages: [["role": "system", "content": systemPrompt], ["role": "user", "content": userMessage]],
+                        purpose: purpose, stream: true)
+                    // This parameter is part of OpenAI's contract; do not assume
+                    // every compatible provider accepts its newer budget field.
+                    if provider == .openai { body["max_completion_tokens"] = Self.summaryBudget(detailLevel) }
+                    var reason: String?
+                    var done = false
+                    for try await payload in try postStreamJSON(body) {
                         try Task.checkCancellation()
-                        guard payload != "[DONE]",
-                              let lineData = payload.data(using: .utf8),
-                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                              let choices = json["choices"] as? [[String: Any]],
-                              let delta = choices.first?["delta"] as? [String: Any],
-                              let content = delta["content"] as? String else { continue }
-                        continuation.yield(content)
+                        if payload == "[DONE]" { done = true; break }
+                        guard let data = payload.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                        if json["error"] != nil { throw AIServiceError.invalidResponse }
+                        guard let choice = (json["choices"] as? [[String: Any]])?.first else { continue }
+                        if let terminal = choice["finish_reason"] as? String { reason = terminal }
+                        if let delta = choice["delta"] as? [String: Any], let content = delta["content"] as? String {
+                            continuation.yield(content)
+                        }
                     }
+                    try Task.checkCancellation()
+                    guard done, reason == "stop" else { throw AIServiceError.incompleteResponse }
                     continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+                } catch { continuation.finish(throwing: error) }
             }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
         }
     }
 
@@ -197,6 +204,9 @@ final class OpenAIService: AIServiceProtocol {
         ]
         if stream {
             body["stream"] = true
+            if provider == .openai, AIGenerationObservation.trace != nil {
+                body["stream_options"] = ["include_usage": true]
+            }
         }
 
         let isOpenAIGPT56 = provider == .openai

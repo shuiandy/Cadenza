@@ -1,7 +1,7 @@
 import Foundation
 
 /// Calendar event for UI display (mirrors MeetingEvent without EventKit dependency).
-struct MeetingEventDTO: Codable, Sendable, Identifiable {
+struct MeetingEventDTO: Codable, Sendable, Identifiable, Equatable {
     let id: String
     var title: String
     var startDate: Date
@@ -93,7 +93,7 @@ extension MeetingEventDTO {
     }
 }
 
-struct EventAttendeeDTO: Codable, Sendable, Identifiable {
+struct EventAttendeeDTO: Codable, Sendable, Identifiable, Equatable {
     var id: String { email }
     let name: String
     let email: String

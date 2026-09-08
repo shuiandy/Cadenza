@@ -291,6 +291,40 @@ class CandidateFileTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
 
+    def test_signing_template_placeholder_team_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self.initialize_repository(repository)
+            (repository / "Signing.local.xcconfig.example").write_text(
+                "// DEVELOPMENT_TEAM = ABCDE12345\n"
+                "// CODE_SIGN_IDENTITY = Apple Development\n",
+                encoding="utf-8",
+            )
+
+            result, output = self.run_check(repository)
+
+            self.assertEqual(result, 0)
+            self.assertNotIn("development team", output)
+
+    def test_real_team_identifier_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory)
+            self.initialize_repository(repository)
+            # Assembled at runtime so this test file does not itself trip
+            # the pattern it exercises.
+            setting = "DEVELOPMENT_" + "TEAM"
+            team = "Q1W2E3R4T5"
+            (repository / "Signing.local.xcconfig").write_text(
+                f"{setting} = {team}\n",
+                encoding="utf-8",
+            )
+
+            result, output = self.run_check(repository)
+
+            self.assertEqual(result, 1)
+            self.assertIn("hard-coded Apple development team", output)
+            self.assertNotIn(team, output)
+
 
 if __name__ == "__main__":
     unittest.main()

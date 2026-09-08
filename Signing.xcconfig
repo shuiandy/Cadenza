@@ -1,0 +1,15 @@
+// Code-signing identity for local builds.
+//
+// Debug builds that are not signed with a stable certificate fall back to
+// ad-hoc signing, whose code identity changes on every rebuild. macOS then
+// treats each rebuild as a brand-new application: TCC grants stop matching
+// and the keychain re-prompts for every item the production app created,
+// with "Always Allow" unable to stick because the identity is different
+// again next time.
+//
+// The team ID is personal and this repository is being prepared for public
+// release, so it lives in an untracked file instead. Copy
+// Signing.local.xcconfig.example to Signing.local.xcconfig and fill in your
+// own DEVELOPMENT_TEAM. The optional include below keeps a fresh clone
+// building (ad-hoc, with the caveats above) when that file is absent.
+#include? "Signing.local.xcconfig"

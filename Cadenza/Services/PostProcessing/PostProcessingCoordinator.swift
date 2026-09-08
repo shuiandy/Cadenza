@@ -310,7 +310,28 @@ final class PostProcessingCoordinator {
         let task: Task<Void, Never>
     }
 
-    private var jobs: [UUID: ActiveJob] = [:]
+    /// Raw job table. Rewritten on every chunk progress callback, so it must
+    /// never be a view input: with `@Observable` tracking, each rewrite would
+    /// invalidate every card that asked for its phase (ARCHITECTURE §12.1).
+    /// Views read the projections below, which change only on real transitions.
+    @ObservationIgnored private var jobs: [UUID: ActiveJob] = [:] {
+        didSet { syncJobProjection() }
+    }
+    /// Per-recording phase, written only when a phase actually changes.
+    private(set) var jobPhases: [UUID: JobPhase] = [:]
+    /// Chunk progress of the single transcribing job, for the toolbar pill.
+    private(set) var activeTranscriptionChunksDone = 0
+    private(set) var activeTranscriptionChunksTotal = 0
+
+    private func syncJobProjection() {
+        let phases = jobs.mapValues(\.phase)
+        if phases != jobPhases { jobPhases = phases }
+        let transcribing = jobs.values.filter { $0.phase == .transcribing }
+        let done = transcribing.count == 1 ? transcribing[0].chunksDone : 0
+        let total = transcribing.count == 1 ? transcribing[0].chunksTotal : 0
+        if done != activeTranscriptionChunksDone { activeTranscriptionChunksDone = done }
+        if total != activeTranscriptionChunksTotal { activeTranscriptionChunksTotal = total }
+    }
     private var transcriptionSlotsAvailable = maxTranscriptionSlots
     private var summarySlotsAvailable = maxSummarySlots
     private var transcriptionWaiters: [SlotWaiter] = []
@@ -352,14 +373,14 @@ final class PostProcessingCoordinator {
 
     // MARK: - Backward-Compatible Computed Properties
 
-    var isPostProcessing: Bool { !jobs.isEmpty }
+    var isPostProcessing: Bool { !jobPhases.isEmpty }
 
     var postProcessingPhase: String? {
         if isRetryingTranscription { return "transcribing" }
         if isGeneratingSummary { return "summarizing" }
-        if jobs.values.contains(where: { $0.phase == .transcribing }) { return "transcribing" }
-        if jobs.values.contains(where: { $0.phase == .summarizing }) { return "summarizing" }
-        if jobs.values.contains(where: { $0.phase == .pendingTranscription || $0.phase == .pendingSummary }) { return "transcribing" }
+        if jobPhases.values.contains(.transcribing) { return "transcribing" }
+        if jobPhases.values.contains(.summarizing) { return "summarizing" }
+        if jobPhases.values.contains(where: { $0 == .pendingTranscription || $0 == .pendingSummary }) { return "transcribing" }
         return nil
     }
 
@@ -367,16 +388,14 @@ final class PostProcessingCoordinator {
         if isRetryingTranscription && manualRetryChunksTotal > 0 {
             return manualRetryChunksDone
         }
-        let transcribing = jobs.values.filter { $0.phase == .transcribing }
-        return transcribing.count == 1 ? transcribing.first!.chunksDone : 0
+        return activeTranscriptionChunksDone
     }
 
     var transcriptionChunksTotal: Int {
         if isRetryingTranscription && manualRetryChunksTotal > 0 {
             return manualRetryChunksTotal
         }
-        let transcribing = jobs.values.filter { $0.phase == .transcribing }
-        return transcribing.count == 1 ? transcribing.first!.chunksTotal : 0
+        return activeTranscriptionChunksTotal
     }
 
     var transcriptionProgress: Double {
@@ -421,7 +440,12 @@ final class PostProcessingCoordinator {
     }
 
     func isProcessing(recordingID: UUID) -> Bool {
-        jobs[recordingID] != nil
+        jobPhases[recordingID] != nil
+    }
+
+    /// Per-recording job phase for collection status chips (nil when idle).
+    func jobPhase(for recordingID: UUID) -> JobPhase? {
+        jobPhases[recordingID]
     }
 
     /// Exclusivity signal for operations that require a stable storage root
@@ -429,7 +453,7 @@ final class PostProcessingCoordinator {
     /// retry, or summary generation is running.
     var hasActiveWork: Bool {
         recordingProcessingGate.hasProcessingLeases
-            || !jobs.isEmpty
+            || !jobPhases.isEmpty
             || !jobTaskLifetimes.isEmpty
             || !deferredSubmissions.isEmpty
             || !submissionReservations.isEmpty
@@ -1150,7 +1174,7 @@ final class PostProcessingCoordinator {
                     let transcriptionTask = if let transcriptionTaskFactoryOverride {
                         transcriptionTaskFactoryOverride(transcriptionManager, request)
                     } else {
-                        Task.detached { [transcriptionManager] in
+                        Task.detached(priority: ProcessingWorkPriority.shared.current) { [transcriptionManager] in
                             try await transcriptionManager.transcribeFile(
                                 at: request.audioURL,
                                 provider: request.provider,
@@ -1205,50 +1229,13 @@ final class PostProcessingCoordinator {
             }
         }
 
-        // Step 1.5: Speaker diarization — per-entry skip logic handles partial labels
-        let diarizationEnabled = SpeakerDiarizer.shared.isEnabled
-        postProcessLog.info(
-            "diarization gate: enabled=\(diarizationEnabled, privacy: .public), didFail=\(didFail, privacy: .public), entries=\((entries ?? []).count, privacy: .public), provider=\(String(describing: actualProvider), privacy: .public)"
-        )
-        if diarizationEnabled, !didFail, !(entries ?? []).isEmpty {
-            do {
-                let diarizer = SpeakerDiarizer.shared
-                let diarizationResult = try await diarizer.diarize(audioURL: audioURL)
-
-                var mutableEntries = entries ?? []
-                if actualProvider == .whisperLocal, let rawResults = whisperRawResults {
-                    diarizer.applySpeakersAligned(
-                        diarization: diarizationResult,
-                        whisperResults: rawResults,
-                        entries: &mutableEntries,
-                        replaceExistingSpeakers: false
-                    )
-                } else {
-                    diarizer.applySpeakers(
-                        diarization: diarizationResult,
-                        entries: &mutableEntries,
-                        replaceExistingSpeakers: true
-                    )
-                }
-                diarizer.mergeConsecutiveSpeakers(entries: &mutableEntries)
-                entries = mutableEntries
-                let withSpeaker = mutableEntries.filter { $0.speaker != nil }.count
-                postProcessLog.info(
-                    "diarization: \(diarizationResult.speakerCount, privacy: .public) speakers, \(withSpeaker, privacy: .public)/\(mutableEntries.count, privacy: .public) entries labelled after merge"
-                )
-            } catch {
-                postProcessLog.error(
-                    "diarization failed (non-fatal): \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
-                )
-            }
-        }
-
-        // Check cancellation
-        guard isCurrentJob(recordingID: recordingID, generation: generation), !Task.isCancelled else {
-            return
-        }
-
-        // Step 2: Save transcript
+        // Step 1.5: Shape entries BEFORE speaker assignment. The readable-text
+        // fallback and the >60s subdivision must precede diarization: the
+        // IoU/dominance gate can only label fine-grained entries, and a
+        // provider response that collapsed into per-chunk monoliths (or into
+        // plain text) would otherwise take one winner-takes-all label per
+        // multi-minute block, or none at all. The retry path already ran in
+        // this order; this brings first-pass processing in line with it.
         var finalEntries = entries ?? []
         let duration = await store.fetchRecordingDuration(recordingID: recordingID)
         guard isCurrentJob(recordingID: recordingID, generation: generation), !Task.isCancelled else {
@@ -1269,6 +1256,53 @@ final class PostProcessingCoordinator {
         }
         // Subdivide any segments >60s at sentence boundaries for timeline usability
         finalEntries = Self.subdivideCoarseSegments(finalEntries)
+
+        // Speaker diarization on the shaped entries. Per-entry skip logic
+        // handles partial labels. Notice level: .info is unpersisted by
+        // default, so these outcomes were invisible in `log show`.
+        let diarizationEnabled = SpeakerDiarizer.shared.isEnabled
+        postProcessLog.notice(
+            "diarization gate: enabled=\(diarizationEnabled, privacy: .public), didFail=\(didFail, privacy: .public), entries=\(finalEntries.count, privacy: .public), provider=\(String(describing: actualProvider), privacy: .public)"
+        )
+        // Kept for speaker memory so it never diarizes the same audio twice.
+        var reusableEmbeddings: SpeakerEmbeddingResult?
+        if diarizationEnabled, !didFail, !finalEntries.isEmpty {
+            do {
+                let diarizer = SpeakerDiarizer.shared
+                let diarizationResult = try await diarizer.diarize(audioURL: audioURL)
+                reusableEmbeddings = SpeakerKitEmbeddingExtractor.makeResult(from: diarizationResult)
+
+                if actualProvider == .whisperLocal, let rawResults = whisperRawResults {
+                    diarizer.applySpeakersAligned(
+                        diarization: diarizationResult,
+                        whisperResults: rawResults,
+                        entries: &finalEntries,
+                        replaceExistingSpeakers: false
+                    )
+                } else {
+                    finalEntries = await SpeakerDiarizer.assignSpeakersOffMain(
+                        entries: finalEntries,
+                        diarization: diarizationResult,
+                        replaceExistingSpeakers: true
+                    )
+                }
+                let withSpeaker = finalEntries.filter { $0.speaker != nil }.count
+                postProcessLog.notice(
+                    "diarization: \(diarizationResult.speakerCount, privacy: .public) speakers, \(withSpeaker, privacy: .public)/\(finalEntries.count, privacy: .public) entries labelled"
+                )
+            } catch {
+                postProcessLog.error(
+                    "diarization failed (non-fatal): \(String(describing: type(of: error)), privacy: .public) — \(error.localizedDescription, privacy: .private)"
+                )
+            }
+        }
+
+        // Check cancellation
+        guard isCurrentJob(recordingID: recordingID, generation: generation), !Task.isCancelled else {
+            return
+        }
+
+        // Step 2: Save transcript
         // Merge consecutive same-speaker segments (caps at 30s/500chars per merged segment)
         if finalEntries.contains(where: { $0.speaker != nil }) {
             SpeakerDiarizer.shared.mergeConsecutiveSpeakers(entries: &finalEntries)
@@ -1295,7 +1329,8 @@ final class PostProcessingCoordinator {
                     recordingID: recordingID,
                     audioURL: audioURL,
                     entries: finalEntries,
-                    speakerIdentityRevision: speakerIdentityRevision
+                    speakerIdentityRevision: speakerIdentityRevision,
+                    precomputedEmbeddings: reusableEmbeddings
                 )
             }
             onRecordingsChanged?()
@@ -1332,6 +1367,8 @@ final class PostProcessingCoordinator {
             let summaryGenerator = SummaryGenerator()
             let providerRaw = UserDefaults.standard.string(forKey: "defaultAIProvider") ?? AIProvider.apple.rawValue
             let provider = AIProvider(rawValue: providerRaw) ?? .apple
+            let summaryModel = provider.summaryModel
+            var summarySource: SummarySourceVersion?
             let requestedSummaryLanguage = UserDefaults.standard.string(forKey: "summaryLanguage") ?? "auto"
             let summaryLanguage = SummaryLanguageResolver.resolve(
                 requestedSummaryLanguage: requestedSummaryLanguage,
@@ -1353,15 +1390,12 @@ final class PostProcessingCoordinator {
                 // Speaker memory runs independently. Use any mappings that are
                 // already available after waiting for the summary slot, but do
                 // not block summary generation on the full-audio embedding pass.
-                let speakerMappings = await store.speakerMappings(forRecordingID: recordingID)
-                let summaryEntries = finalEntries
-                let transcriptFullText = fullText
+                guard let summaryDetail = await store.fetchRecordingDetail(recordingID: recordingID),
+                      let summaryInput = summaryDetail.transcript else { return }
+                summarySource = SummarySourceVersion.capture(summaryInput, mappings: summaryDetail.speakerMappings)
                 let summaryTranscript = await Task.detached {
-                    SummaryTranscriptFormatter.format(
-                        fullText: transcriptFullText,
-                        segments: summaryEntries,
-                        speakerMappings: speakerMappings
-                    )
+                    SummaryTranscriptFormatter.format(fullText: summaryInput.fullText,
+                        segments: summaryInput.segments, speakerMappings: summaryDetail.speakerMappings)
                 }.value
                 guard isCurrentJob(recordingID: recordingID, generation: generation),
                       !Task.isCancelled else { return }
@@ -1375,14 +1409,17 @@ final class PostProcessingCoordinator {
                 let summaryTask = if let summaryTaskFactoryOverride {
                     summaryTaskFactoryOverride(summaryGenerator, request)
                 } else {
-                    Task.detached { [summaryGenerator] in
-                        await summaryGenerator.streamGenerate(
-                            transcript: request.transcript,
-                            provider: request.provider,
-                            language: request.language,
-                            meetingTitle: request.meetingTitle,
-                            knownTags: request.knownTags
-                        )
+                    Task.detached(priority: ProcessingWorkPriority.shared.current) { [summaryGenerator] in
+                        await AIGenerationGate.$priority.withValue(.foreground) {
+                            await summaryGenerator.streamGenerate(
+                                transcript: request.transcript,
+                                provider: request.provider,
+                                model: summaryModel,
+                                language: request.language,
+                                meetingTitle: request.meetingTitle,
+                                knownTags: request.knownTags
+                            )
+                        }
                     }
                 }
                 updateCurrentJob(recordingID: recordingID, generation: generation) {
@@ -1437,11 +1474,20 @@ final class PostProcessingCoordinator {
                     summary: result,
                     chaptersJSON: nil,
                     provider: provider,
-                    model: provider.summaryModel,
+                    model: summaryModel,
                     language: summaryLanguage,
-                    meetingType: classifiedType
+                    meetingType: classifiedType,
+                    expectedSource: summarySource
                 )
-                if !summarySaved {
+                switch summarySaved {
+                case .saved, .keptReviewedSummary:
+                    break
+                case .cancelled, .recordingUnavailable, .sourceSuperseded:
+                    // This job no longer owns the input. Do not call a normal
+                    // supersession a database failure or export a stale result.
+                    await finishJob(recordingID: recordingID, generation: generation, didFail: false)
+                    return
+                case .failed:
                     NSLog("[PostProcessCoord] saveSummary failed for %@", recordingID.uuidString)
                     postProcessingError = String(localized: "The summary could not be saved.")
                     didFail = true
@@ -1514,6 +1560,8 @@ final class PostProcessingCoordinator {
               let transcript = detail.transcript else { return }
 
         let aiProvider = AIProvider(rawValue: provider) ?? .apple
+        let summaryModel = aiProvider.summaryModel
+        let summarySource = SummarySourceVersion.capture(transcript, mappings: detail.speakerMappings)
         let summaryLanguage = SummaryLanguageResolver.resolve(
             requestedSummaryLanguage: language,
             detectedTranscriptLanguage: transcript.detectedLanguage,
@@ -1542,14 +1590,18 @@ final class PostProcessingCoordinator {
                 speakerMappings: speakerMappings
             )
         }.value
-        await manualSummaryGenerator.streamGenerate(
-            transcript: summaryTranscript,
-            provider: aiProvider,
-            language: summaryLanguage,
-            meetingTitle: detail.title,
-            knownTags: knownTags
-        )
+        await AIGenerationGate.$priority.withValue(.foreground) {
+            await manualSummaryGenerator.streamGenerate(
+                transcript: summaryTranscript,
+                provider: aiProvider,
+                model: summaryModel,
+                language: summaryLanguage,
+                meetingTitle: detail.title,
+                knownTags: knownTags
+            )
+        }
         streamTask.cancel()
+        guard !Task.isCancelled else { return }
 
         if let error = manualSummaryGenerator.error {
             postProcessingError = String(localized: "Summary failed: \(error)")
@@ -1566,11 +1618,17 @@ final class PostProcessingCoordinator {
                 summary: result,
                 chaptersJSON: nil,
                 provider: aiProvider,
-                model: aiProvider.summaryModel,
+                model: summaryModel,
                 language: summaryLanguage,
-                meetingType: classifiedType
+                meetingType: classifiedType,
+                expectedSource: summarySource
             )
-            if !saved {
+            switch saved {
+            case .saved, .keptReviewedSummary, .cancelled, .recordingUnavailable:
+                break
+            case .sourceSuperseded:
+                postProcessingError = String(localized: "Transcript changed. Regenerate summary.")
+            case .failed:
                 NSLog("[PostProcessCoord] generateSummary: saveSummary failed for %@", recordingID.uuidString)
                 postProcessingError = String(localized: "The summary could not be saved.")
             }
@@ -1593,12 +1651,13 @@ final class PostProcessingCoordinator {
             guard let detail = await store.fetchRecordingDetail(recordingID: recordingID),
                   let transcript = detail.transcript,
                   let summary = detail.summary,
-                  summary.chapters.isEmpty else { return }
+                  summary.chapters.isEmpty, summary.generationMetadata?.sourceChanged != true else { return }
 
             let provider = AIProvider(rawValue: summary.provider) ?? .apple
             if provider.requiresAPIKey, (manualSummaryGenerator.apiKeyResolver(provider) ?? "").isEmpty { return }
 
-            let summaryID = await store.currentSummaryID(for: recordingID)
+            let summaryID = summary.id
+            let source = SummarySourceVersion.capture(transcript, mappings: detail.speakerMappings)
             let transcriptFullText = transcript.fullText
             let transcriptSegments = transcript.segments
             let speakerMappings = detail.speakerMappings
@@ -1612,7 +1671,8 @@ final class PostProcessingCoordinator {
             let chapters = await manualSummaryGenerator.generateChapters(
                 transcript: summaryTranscript,
                 provider: provider,
-                language: summary.language
+                language: summary.language,
+                summaryContext: ([summary.overview] + summary.keyPoints + summary.decisions + summary.followUps).joined(separator: "\n")
             )
             guard !chapters.isEmpty else { return }
 
@@ -1622,7 +1682,7 @@ final class PostProcessingCoordinator {
             guard let encoded = try? JSONSerialization.data(withJSONObject: chaptersData),
                   let jsonStr = String(data: encoded, encoding: .utf8) else { return }
 
-            let updated = await store.updateChapters(recordingID: recordingID, chaptersJSON: jsonStr, expectedSummaryID: summaryID)
+            let updated = await store.updateChapters(recordingID: recordingID, chaptersJSON: jsonStr, expectedSummaryID: summaryID, expectedSource: source)
             if updated { self?.onRecordingsChanged?() }
             NSLog("[PostProcessCoord] on-demand chapters generated for %@ (applied=%d)", recordingID.uuidString, updated ? 1 : 0)
         }
@@ -1781,13 +1841,15 @@ final class PostProcessingCoordinator {
 
             // Speaker diarization
             let diarizationEnabled = SpeakerDiarizer.shared.isEnabled
-            postProcessLog.info(
+            postProcessLog.notice(
                 "retryTranscription diarization gate: enabled=\(diarizationEnabled, privacy: .public), entries=\(entries.count, privacy: .public), provider=\(String(describing: selection.provider), privacy: .public)"
             )
+            var reusableEmbeddings: SpeakerEmbeddingResult?
             if diarizationEnabled, !entries.isEmpty {
                 do {
                     let diarizer = SpeakerDiarizer.shared
                     let diarizationResult = try await diarizer.diarize(audioURL: url)
+                    reusableEmbeddings = SpeakerKitEmbeddingExtractor.makeResult(from: diarizationResult)
 
                     if selection.provider == .whisperLocal, let rawResults = manualTranscriptionManager.lastWhisperResults {
                         diarizer.applySpeakersAligned(
@@ -1797,14 +1859,14 @@ final class PostProcessingCoordinator {
                             replaceExistingSpeakers: false
                         )
                     } else {
-                        diarizer.applySpeakers(
+                        entries = await SpeakerDiarizer.assignSpeakersOffMain(
+                            entries: entries,
                             diarization: diarizationResult,
-                            entries: &entries,
                             replaceExistingSpeakers: true
                         )
                     }
                     let withSpeaker = entries.filter { $0.speaker != nil }.count
-                    postProcessLog.info(
+                    postProcessLog.notice(
                         "retryTranscription diarization: \(diarizationResult.speakerCount, privacy: .public) speakers, \(withSpeaker, privacy: .public)/\(entries.count, privacy: .public) entries"
                     )
                 } catch {
@@ -1837,7 +1899,8 @@ final class PostProcessingCoordinator {
                     recordingID: recordingID,
                     audioURL: url,
                     entries: entries,
-                    speakerIdentityRevision: speakerIdentityRevision
+                    speakerIdentityRevision: speakerIdentityRevision,
+                    precomputedEmbeddings: reusableEmbeddings
                 )
                 await store.markBackfillCompleted(recordingID: recordingID)
             }
@@ -1848,11 +1911,15 @@ final class PostProcessingCoordinator {
         manualRetryChunksTotal = 0
     }
 
+    /// `precomputedEmbeddings` is the transcription pass's own diarization,
+    /// mapped once; when present, speaker memory analyzes it instead of
+    /// decoding and diarizing the file again.
     func runSpeakerMemoryIfNeeded(
         recordingID: UUID,
         audioURL: URL,
         entries: [TranscriptEntry],
-        speakerIdentityRevision: UInt64
+        speakerIdentityRevision: UInt64,
+        precomputedEmbeddings: SpeakerEmbeddingResult? = nil
     ) {
         guard SpeakerDiarizer.shared.isEnabled else { return }
         guard SpeakerMemoryConsent.isEnabled(in: transcriptionDependencies.defaults) else { return }
@@ -1876,12 +1943,16 @@ final class PostProcessingCoordinator {
 
             do {
                 let service = SpeakerMemoryService()
+                let extractor: SpeakerEmbeddingExtractorProtocol = precomputedEmbeddings.map {
+                    PrecomputedSpeakerEmbeddingExtractor(result: $0)
+                } ?? SpeakerKitEmbeddingExtractor()
                 try await service.analyze(
                     recordingID: recordingID,
                     audioURL: audioURL,
                     speakerSpans: speakerSpans,
                     speakerIdentityRevision: speakerIdentityRevision,
-                    store: memoryStore
+                    store: memoryStore,
+                    extractor: extractor
                 )
                 await MainActor.run {
                     self?.onRecordingsChanged?()

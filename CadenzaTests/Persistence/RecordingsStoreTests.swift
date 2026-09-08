@@ -979,6 +979,35 @@ struct RecordingsStoreTests {
     }
 
     @Test @MainActor
+    func webSyncSnapshotUsesPersistedCalendarEventNotLiveLookup() async throws {
+        let container = try RecordingsStore.makeContainer(inMemory: true)
+        let context = container.mainContext
+        let recording = TestRecordingFactory.makeRecording(title: "Linked")
+        context.insert(recording)
+        try context.save()
+        let store = RecordingsStore(modelContainer: container)
+        let start = Date(timeIntervalSince1970: 1_780_000_000)
+        let end = Date(timeIntervalSince1970: 1_780_001_800)
+
+        #expect(await store.linkCalendarEvent(
+            recordingID: recording.id,
+            calendarEventID: "evt-1",
+            snapshot: RecordingsStore.CalendarEventSnapshot(
+                title: "Weekly sales sync", startAt: start, endAt: end
+            )
+        ))
+        let linked = try #require(try await store.fetchWebSyncSnapshot(recordingID: recording.id))
+        #expect(linked.calendarEvent?.title == "Weekly sales sync")
+        #expect(linked.calendarEvent?.startAt == 1_780_000_000)
+        #expect(linked.calendarEventCleared == false)
+
+        #expect(await store.linkCalendarEvent(recordingID: recording.id, calendarEventID: nil))
+        let cleared = try #require(try await store.fetchWebSyncSnapshot(recordingID: recording.id))
+        #expect(cleared.calendarEvent == nil)
+        #expect(cleared.calendarEventCleared == true)
+    }
+
+    @Test @MainActor
     func webSyncCandidatesContainOnlyQueueMetadataInNewestFirstOrder() async throws {
         let container = try RecordingsStore.makeContainer(inMemory: true)
         let context = container.mainContext

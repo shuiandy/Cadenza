@@ -26,7 +26,12 @@ enum GeminiRealtimeHandshakeError: Error, LocalizedError {
 
 enum GeminiRealtimeHandshake {
     static let host = "generativelanguage.googleapis.com"
-    static let path = "/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained"
+    /// v1beta is required for ephemeral-token auth; the v1alpha variant this
+    /// used to point at predates the Live transcription models and rejects
+    /// gemini-3.5-transcribe-live. Tokens still arrive as an `Authorization:
+    /// Token ...` header rather than an `access_token` query parameter, so
+    /// the credential never lands in a URL or a log line.
+    static let path = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"
 
     private static let allowedModelCharacters = CharacterSet(
         charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"

@@ -19,7 +19,163 @@ final class QualityComparisonRunner {
     private static let testTimeout: TimeInterval = 180
     private static let realtimeConnectTimeout: Duration = .seconds(10)
 
-    private init() {}
+    init() {}
+
+    private var evaluationTask: Task<Void, Never>?
+    var isEvaluatingSummary: Bool { evaluationTask != nil }
+#if DEBUG
+    @ObservationIgnored var summaryEvaluationOverride: (() async -> Void)?
+    func waitForSummaryEvaluationForTesting() async { await evaluationTask?.value }
+#endif
+
+    func startSummaryEvaluation(personalOnly: Bool = false, focused: Bool = false) {
+#if DEBUG
+        // Claim synchronously before scheduling: repeated clicks must not replace
+        // the only cancellable handle while the first task is waiting to start.
+        guard !isRunning, evaluationTask == nil else { return }
+        isRunning = true
+        evaluationTask = Task {
+            defer { evaluationTask = nil; isRunning = false; currentStatus = "" }
+            if let summaryEvaluationOverride { await summaryEvaluationOverride() }
+            else if personalOnly { await runPersonalSummaryEvaluation() }
+            else { await runSummaryEvaluation(focused: focused) }
+        }
+#endif
+    }
+
+    func cancelSummaryEvaluation() { evaluationTask?.cancel() }
+
+    /// Uses fictional transcripts only. Does not read the recording library or calendar.
+    private func runSummaryEvaluation(focused: Bool = false) async {
+        report = ""
+        let provider = AIProvider(rawValue: UserDefaults.standard.string(forKey: "defaultAIProvider") ?? "") ?? .apple
+        guard let key = provider.requiresAPIKey ? KeychainManager.shared.apiKey(for: provider) : "" else {
+            report = AIServiceError.noAPIKey.localizedDescription
+            return
+        }
+        var models = [provider.summaryModel]
+        if provider.requiresAPIKey, provider.defaultChatModel != models[0] { models.append(provider.defaultChatModel) }
+        var evaluation = SummaryQualityEvaluation.Report(fixtureVersion: SummaryQualityEvaluation.fixtureVersion,
+                                                        codeVersion: "summary-review-v3 / post-P0", samples: SummaryQualityEvaluation.samples)
+        evaluation.outputLanguage = "en + zh"
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        func save() {
+            do {
+                let data = try encoder.encode(evaluation)
+                _ = try DiagnosticArtifactStore.shared.writeReport(prefix: "summary-evaluation", contents: String(decoding: data, as: UTF8.self), maximumBytes: 8 * 1_024 * 1_024)
+            } catch { log("Evaluation report could not be saved.") }
+        }
+        save()
+        for language in ["en", "zh"] {
+        for model in models {
+            var consecutiveFailures = 0
+            // Legacy comparison isolates the review stage on representative failure cases.
+            let strategies = ["current"]
+            for strategy in strategies {
+                let samples = focused ? SummaryQualityEvaluation.samples.filter { ["view-versus-decision", "execution-versus-oversight", "secondary-updates"].contains($0.id) } : SummaryQualityEvaluation.samples
+                for sample in samples {
+                    for repetition in 1...3 {
+                        if Task.isCancelled { evaluation.status = "cancelled"; save(); return }
+                        currentStatus = "\(language) · \(model) · \(sample.id) · \(repetition)/3 · \(strategy)"
+                        let start = ContinuousClock.now
+                        var firstReadable: Double?
+                        var draft: String?
+                        let trace = AIGenerationTrace()
+                        let result: (String, SummaryResult?, String?) = await SummaryPrompt.$evaluationUserName.withValue("") {
+                            await AIGenerationObservation.$trace.withValue(trace) {
+                                if strategy == "enrich-only-ablation" {
+                                    guard let service = provider.makeChatService(apiKey: key) else { return ("", nil, "Unavailable provider") }
+                                    do {
+                                        let quick = try await AIGenerationGate.shared.run(provider: provider) {
+                                            var text = ""
+                                            for try await delta in service.streamSummaryCompletion(systemPrompt: SummaryPrompt.quickSystem(language: language, detailLevel: .fullBreakdown), userMessage: SummaryPrompt.user(transcript: sample.transcript), model: model, detailLevel: .fullBreakdown) { text += delta }
+                                            return text
+                                        }
+                                        firstReadable = AIGenerationTrace.seconds(start.duration(to: .now))
+                                        draft = quick
+                                        let enrichment = try await AIGenerationGate.shared.run(provider: provider) {
+                                            var text = ""
+                                            for try await delta in service.streamSummaryCompletion(systemPrompt: SummaryQualityEvaluation.legacyEnrichPrompt(language: language), userMessage: SummaryPrompt.enrichUser(transcript: sample.transcript, quickSummaryText: quick), model: model, detailLevel: .fullBreakdown) { text += delta }
+                                            return text
+                                        }
+                                        return (quick + "\n\n" + enrichment, SummaryPrompt.parseQuickResponse(quick), nil)
+                                    } catch { return (draft ?? "", nil, error.localizedDescription) }
+                                }
+                                return await SummaryGenerator.runStreamGenerate(
+                                    provider: provider, apiKey: key, transcript: sample.transcript, language: language, model: model,
+                                    jobTitle: nil, meetingType: .general, meetingTitle: "Fictional evaluation", knownTags: [], detailLevel: .fullBreakdown,
+                                    onChunk: { _ in },
+                                    onQuickDone: { quick in
+                                        if firstReadable == nil { firstReadable = AIGenerationTrace.seconds(start.duration(to: .now)) }
+                                        draft = quick.rawText
+                                    }, onEnrichStart: {}
+                                )
+                            }
+                        }
+                        let elapsed = AIGenerationTrace.seconds(start.duration(to: .now))
+                        let reviewFallback = provider.requiresAPIKey && strategy == "current"
+                            && SummaryPrompt.splitForMapReduce(sample.transcript).count == 1 && result.0 == draft
+                        let error = result.2 ?? (result.1 == nil ? "No usable summary" : reviewFallback ? "Review incomplete; quick draft retained" : nil)
+                        if error != nil { consecutiveFailures += 1 } else { consecutiveFailures = 0 }
+                        evaluation.results.append(.init(sampleID: sample.id, model: model, provider: provider.rawValue, strategy: strategy,
+                                                        repetition: repetition, detail: SummaryDetailLevel.fullBreakdown.rawValue,
+                                                        elapsedSeconds: elapsed, firstReadableSeconds: firstReadable,
+                                                        quickDraft: draft, output: result.0, error: error, telemetry: trace.snapshot(), outputLanguage: language))
+                        log("\(model) / \(sample.id) / \(strategy) / \(repetition): \(error == nil ? "completed" : "failed") (\(String(format: "%.1f", elapsed))s)")
+                        save()
+                        if consecutiveFailures >= 3 {
+                            evaluation.status = "stopped_after_repeated_failure"
+                            save()
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        }
+        evaluation.status = "completed_requires_human_review"
+        save()
+    }
+
+    /// Reuses the same diagnostic entry and report format with fictional profile/history data.
+    private func runPersonalSummaryEvaluation() async {
+        report = ""
+        let provider = AIProvider(rawValue: UserDefaults.standard.string(forKey: "defaultAIProvider") ?? "") ?? .apple
+        guard let key = provider.requiresAPIKey ? KeychainManager.shared.apiKey(for: provider) : "" else { return }
+        var models = [provider.summaryModel]
+        if provider.requiresAPIKey, provider.defaultChatModel != models[0] { models.append(provider.defaultChatModel) }
+        var evaluation = SummaryQualityEvaluation.Report(fixtureVersion: "context-v1", codeVersion: "personal-context-v2", samples: [])
+        evaluation.outputLanguage = "zh"
+        func save() {
+            guard let data = try? JSONEncoder().encode(evaluation) else { return }
+            _ = try? DiagnosticArtifactStore.shared.writeReport(prefix: "summary-context-evaluation",
+                contents: String(decoding: data, as: UTF8.self), maximumBytes: 8 * 1_024 * 1_024)
+        }
+        for model in models {
+            for focus in ["access", "storage costs", "historical pilot status"] {
+                let source = SummaryContextEvaluationFixture.snapshot(focus: focus)
+                for repetition in 1...3 {
+                    guard !Task.isCancelled else { evaluation.status = "cancelled"; save(); return }
+                    currentStatus = "\(model) · \(focus) · \(repetition)/3"
+                    let trace = AIGenerationTrace(); let start = ContinuousClock.now
+                    var text = ""; var failure: String?
+                    do {
+                        let value = try await AIGenerationObservation.$trace.withValue(trace) {
+                            try await PersonalRelevanceGenerator.generate(snapshot: source, provider: provider, apiKey: key, model: model, language: "zh")
+                        }
+                        text = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+                    } catch { failure = error.localizedDescription }
+                    evaluation.results.append(.init(sampleID: focus, model: model, provider: provider.rawValue,
+                        strategy: "personal-context", repetition: repetition, detail: "detailed",
+                        elapsedSeconds: AIGenerationTrace.seconds(start.duration(to: .now)), firstReadableSeconds: nil,
+                        quickDraft: nil, output: text, error: failure, telemetry: trace.snapshot(), outputLanguage: "zh"))
+                    save()
+                }
+            }
+        }
+        evaluation.status = "completed_requires_human_review"; save()
+    }
 
     /// Run only the realtime transcription test — much faster than full comparison.
     func runRealtimeOnly(audioURL: URL) async {

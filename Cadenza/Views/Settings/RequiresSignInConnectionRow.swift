@@ -43,7 +43,13 @@ struct RequiresSignInConnectionRow<Detail: View>: View {
                 iconView
                     .frame(width: iconSize, height: iconSize)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.cadenza(.headline, scale: uiScale))
+                    HStack(spacing: 7) {
+                        Text(title).font(.cadenza(.headline, scale: uiScale))
+                        SettingsStatusCapsule(
+                            kind: isConnected ? .connected : .disconnected,
+                            label: isConnected ? "Connected" : "Not Connected"
+                        )
+                    }
                     Text(subtitle)
                         .font(.cadenza(.subheadline, scale: uiScale))
                         .foregroundStyle(.secondary)
@@ -74,7 +80,11 @@ struct RequiresSignInConnectionRow<Detail: View>: View {
                             in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
             if isConnected {
-                connectedDetail()
+                // Concept P: the destination's own settings ride a dependency
+                // rail so their ownership is visible at a glance.
+                SettingsDependentRow {
+                    connectedDetail()
+                }
             }
         }
         .opacity(isSignedIn ? 1 : 0.5)

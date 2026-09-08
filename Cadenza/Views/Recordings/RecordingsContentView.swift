@@ -41,6 +41,9 @@ enum RecordingsContentGenerationBoundary {
 
 private enum RecordingsPerformance {
     static let cardMinimumWidth: CGFloat = 220
+    /// The day-grouped grid breathes more than the waterfall: roomier cards
+    /// (three to four columns at typical widths) per the concept layout.
+    static let gridCardMinimumWidth: CGFloat = 300
     static let cardSpacing: CGFloat = 12
 }
 
@@ -244,35 +247,45 @@ struct RecordingsContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ZStack(alignment: .bottom) {
-                ZStack {
-                    ScrollView {
-                        recordingsLayout
-                            .padding(.top, scrollContentTopPadding)
-                            // Keep the last row clear of the persistent AI button and,
-                            // when active, the batch toolbar layered above the scroll view.
-                            .padding(.bottom, selectedIDs.isEmpty ? 72 : 96)
-                    }
-                    .cadenzaSoftTopScrollEdgeEffect()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-
-                    // Rubber band visual overlay
-                    if let rect = rubberBandRect {
-                        Canvas { context, _ in
-                            context.fill(Path(rect), with: .color(Color.accentColor.opacity(0.12)))
-                            context.stroke(Path(rect), with: .color(Color.accentColor.opacity(0.4)), lineWidth: 1)
+                VStack(spacing: 0) {
+                    // The strip lives OUTSIDE the ScrollView on purpose: the
+                    // marquee overlay consumes mouse-downs on the scroll document
+                    // background, so an in-document button would never receive
+                    // its click. As fixed chrome it also stays visible while
+                    // scrolling, matching the calendar-entry concept.
+                    // Isolated struct: it is the only reader of the 5 s calendar
+                    // mirror and owns its own clock, so neither reaches this body.
+                    TodayMeetingStrip(smartFolder: smartFolder)
+                    ZStack {
+                        ScrollView {
+                            recordingsLayout
+                                .padding(.top, scrollContentTopPadding)
+                                // Keep the last row clear of the persistent AI button and,
+                                // when active, the batch toolbar layered above the scroll view.
+                                .padding(.bottom, selectedIDs.isEmpty ? 72 : 96)
                         }
+                        .cadenzaSoftTopScrollEdgeEffect()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                        // Rubber band visual overlay
+                        if let rect = rubberBandRect {
+                            Canvas { context, _ in
+                                context.fill(Path(rect), with: .color(Color.accentColor.opacity(0.12)))
+                                context.stroke(Path(rect), with: .color(Color.accentColor.opacity(0.4)), lineWidth: 1)
+                            }
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .overlay {
+                        RubberBandGestureOverlay(
+                            frameRegistry: cardFrameRegistry,
+                            isActive: !isShowingRecordingDetail,
+                            selectedIDs: $selectedIDs,
+                            rubberBandRect: $rubberBandRect
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .allowsHitTesting(false)
                     }
-                }
-                .overlay {
-                    RubberBandGestureOverlay(
-                        frameRegistry: cardFrameRegistry,
-                        isActive: !isShowingRecordingDetail,
-                        selectedIDs: $selectedIDs,
-                        rubberBandRect: $rubberBandRect
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .allowsHitTesting(false)
                 }
 
                 // Floating batch toolbar
@@ -312,35 +325,60 @@ struct RecordingsContentView: View {
                 contentForSection(recordings)
                     .padding()
             } else {
-                LazyVStack(alignment: .leading, spacing: 20, pinnedViews: .sectionHeaders) {
-                    ForEach(groupedRecordings, id: \.period) { group in
+                LazyVStack(alignment: .leading, spacing: 18, pinnedViews: .sectionHeaders) {
+                    ForEach(dayGroups, id: \.day) { group in
                         Section {
                             contentForSection(group.recordings)
                         } header: {
-                            HStack {
-                                Text(group.period.title)
-                                    .font(.cadenza(13 - 1, weight: .bold, scale: uiScale))
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                            }
-                            .padding(.vertical, 4)
-                            .padding(.horizontal, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(AppStyle.ColorToken.softFill)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(AppStyle.ColorToken.stroke, lineWidth: 0.6)
-                            )
+                            dayHeader(group)
                         }
                     }
                 }
                 .padding()
+                .onChange(of: recordings, initial: true) { _, updated in
+                    dayGroupCache = DayGroupCache(input: updated, groups: RecordingDayGrouper.group(updated))
+                }
             }
         }
         .animation(reduceMotion ? nil : .spring(duration: 0.3, bounce: 0.15), value: viewModeRaw)
     }
+
+    /// Date-first section header: the day carries the scan, with the
+    /// per-day count and total duration as secondary context.
+    private func dayHeader(_ group: RecordingDayGrouper.Group) -> some View {
+        HStack(spacing: 8) {
+            Text(group.day.formatted(Self.dayHeaderDateStyle))
+                .font(.cadenza(13 - 1, weight: .bold, scale: uiScale))
+                .foregroundStyle(.secondary)
+            Text(verbatim: dayHeaderDetail(group))
+                .font(.cadenza(13 - 3, scale: uiScale))
+                .foregroundStyle(.tertiary)
+            Spacer()
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(AppStyle.ColorToken.softFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(AppStyle.ColorToken.stroke, lineWidth: 0.6)
+        )
+    }
+
+    private func dayHeaderDetail(_ group: RecordingDayGrouper.Group) -> String {
+        let countString = String(localized: "\(group.recordings.count) recordings")
+        let durationString = Duration.seconds(group.totalDuration).formatted(
+            .units(allowed: [.hours, .minutes], width: .narrow, maximumUnitCount: 2)
+        )
+        guard group.totalDuration >= 60 else { return countString }
+        return "\(countString) · \(durationString)"
+    }
+
+    private static let dayHeaderDateStyle = Date.FormatStyle.dateTime
+        .month(.abbreviated).day().weekday(.wide)
+
 
     // MARK: - Card Click Handling
 
@@ -571,18 +609,26 @@ struct RecordingsContentView: View {
             ) {
                 ForEach(sectionRecordings) { recording in
                     recordingCard(recording) {
-                        RecordingCardView(recording: recording, viewMode: .waterfall)
+                        RecordingCardView(
+                            recording: recording,
+                            viewMode: .waterfall,
+                            processingPhase: appState.coordinator?.jobPhase(for: recording.id)
+                        )
                     }
                 }
             }
         case .grid:
             LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: RecordingsPerformance.cardMinimumWidth), spacing: RecordingsPerformance.cardSpacing)],
+                columns: [GridItem(.adaptive(minimum: RecordingsPerformance.gridCardMinimumWidth), spacing: RecordingsPerformance.cardSpacing)],
                 spacing: RecordingsPerformance.cardSpacing
             ) {
                 ForEach(sectionRecordings) { recording in
                     recordingCard(recording) {
-                        RecordingCardView(recording: recording, viewMode: .grid)
+                        RecordingCardView(
+                            recording: recording,
+                            viewMode: .grid,
+                            processingPhase: appState.coordinator?.jobPhase(for: recording.id)
+                        )
                     }
                 }
             }
@@ -644,11 +690,15 @@ struct RecordingsContentView: View {
             }
             .accessibilityIdentifier("recording-card-\(recording.id.uuidString)")
             .contextMenu {
-                // If right-clicked recording is part of selection, actions apply to all selected
+                // If right-clicked recording is part of selection, actions apply to all selected.
+                // The menu content is built while the card is, on every body pass of the
+                // library, so the selection is resolved lazily: an O(n) filter over the
+                // whole library per visible card was paid on every drag event.
                 let affectsMultiple = isSelected && selectedIDs.count > 1
-                let affectedRecordings = affectsMultiple
-                    ? recordings.filter { selectedIDs.contains($0.id) }
-                    : [recording]
+                let affectedCount = affectsMultiple ? selectedIDs.count : 1
+                let affected: () -> [RecordingDTO] = {
+                    affectsMultiple ? recordings.filter { selectedIDs.contains($0.id) } : [recording]
+                }
 
                 // Rename only makes sense for a single recording
                 if !affectsMultiple {
@@ -664,7 +714,7 @@ struct RecordingsContentView: View {
                 if !folders.isEmpty {
                     Menu {
                         Button {
-                            let targetIDs = Set(affectedRecordings.map(\.id))
+                            let targetIDs = Set(affected().map(\.id))
                             appState.moveRecordingsToFolder(
                                 recordingIDs: targetIDs,
                                 folderID: nil
@@ -678,7 +728,7 @@ struct RecordingsContentView: View {
                         Divider()
                         ForEach(folders) { folder in
                             Button {
-                                let targetIDs = Set(affectedRecordings.map(\.id))
+                                let targetIDs = Set(affected().map(\.id))
                                 appState.moveRecordingsToFolder(
                                     recordingIDs: targetIDs,
                                     folderID: folder.id
@@ -691,7 +741,7 @@ struct RecordingsContentView: View {
                             }
                         }
                     } label: {
-                        let count = affectedRecordings.count
+                        let count = affectedCount
                         Label(
                             count > 1 ? String(localized: "Move \(count) to Folder") : String(localized: "Move to Folder"),
                             systemImage: "folder"
@@ -700,47 +750,27 @@ struct RecordingsContentView: View {
                     .disabled(appState.isBatchMutationInProgress)
                 }
 
-                smartFolderContextActions(for: affectedRecordings)
+                smartFolderContextActions(count: affectedCount, affected: affected)
 
                 Divider()
 
-                Menu {
-                    Button {
-                        exportToNotion(affectedRecordings)
-                    } label: {
-                        Label("Notion", systemImage: "arrow.up.doc")
-                    }
-                    .disabled(!appState.notionConnected)
-
-                    Button {
-                        exportToCraft(affectedRecordings)
-                    } label: {
-                        Label("Craft", systemImage: "doc.richtext")
-                    }
-                    .disabled(!appState.craftIsAvailable)
-
-                    Divider()
-
-                    Button {
-                        exportToLocalFolder(affectedRecordings)
-                    } label: {
-                        Label("Local Folder…", systemImage: "folder")
-                    }
-                    .disabled(appState.exportService.batchFileExporter.isBusy)
-                } label: {
-                    Label("Export to...", systemImage: "square.and.arrow.up")
-                }
+                RecordingExportMenu(
+                    affected: affected,
+                    onNotion: exportToNotion,
+                    onCraft: exportToCraft,
+                    onLocalFolder: exportToLocalFolder
+                )
 
                 Divider()
 
                 Button(role: .destructive) {
-                    let targetIDs = Set(affectedRecordings.map(\.id))
+                    let targetIDs = Set(affected().map(\.id))
                     appState.deleteRecordings(recordingIDs: targetIDs) { result in
                         guard result.didCommit else { return }
                         selectedIDs.subtract(targetIDs)
                     }
                 } label: {
-                    let count = affectedRecordings.count
+                    let count = affectedCount
                     Label(
                         count > 1 ? String(localized: "Delete \(count) Recordings") : String(localized: "Delete"),
                         systemImage: "trash"
@@ -751,17 +781,17 @@ struct RecordingsContentView: View {
     }
 
     @ViewBuilder
-    private func smartFolderContextActions(for affectedRecordings: [RecordingDTO]) -> some View {
+    private func smartFolderContextActions(count affectedCount: Int, affected: @escaping () -> [RecordingDTO]) -> some View {
         if let smartFolder {
             Button {
-                let targetIDs = Set(affectedRecordings.map(\.id))
+                let targetIDs = Set(affected().map(\.id))
                 guard appState.excludeRecordingsFromSmartFolder(
                     recordingIDs: targetIDs,
                     smartFolderID: smartFolder.id
                 ) else { return }
                 selectedIDs.subtract(targetIDs)
             } label: {
-                let count = affectedRecordings.count
+                let count = affectedCount
                 Label(
                     count > 1
                     ? String(localized: "Exclude \(count) from Smart Folder")
@@ -774,7 +804,7 @@ struct RecordingsContentView: View {
             Menu {
                 ForEach(appState.smartFolderTargets) { target in
                     Button {
-                        let targetIDs = Set(affectedRecordings.map(\.id))
+                        let targetIDs = Set(affected().map(\.id))
                         guard appState.pinRecordingsToSmartFolder(
                             recordingIDs: targetIDs,
                             smartFolderID: target.id
@@ -785,7 +815,7 @@ struct RecordingsContentView: View {
                     }
                 }
             } label: {
-                let count = affectedRecordings.count
+                let count = affectedCount
                 Label(
                     count > 1
                     ? String(localized: "Pin \(count) to Smart Folder")
@@ -887,8 +917,21 @@ struct RecordingsContentView: View {
         }
     }
 
-    private var groupedRecordings: [(period: TimePeriod, recordings: [RecordingDTO])] {
-        TimePeriodGrouper.group(recordings)
+    /// Grouping is O(n log n) and used to run on every body pass, including
+    /// selection changes and every invalidation from AppState. The cache is
+    /// exact: keyed by the input array itself and refreshed by `onChange`, so
+    /// a stale group can never outlive the data it was built from.
+    private struct DayGroupCache {
+        let input: [RecordingDTO]
+        let groups: [RecordingDayGrouper.Group]
+    }
+    @State private var dayGroupCache: DayGroupCache?
+
+    private var dayGroups: [RecordingDayGrouper.Group] {
+        if let dayGroupCache, dayGroupCache.input == recordings {
+            return dayGroupCache.groups
+        }
+        return RecordingDayGrouper.group(recordings)
     }
 
 }
@@ -1132,6 +1175,11 @@ private final class RubberBandNSView: NSView {
                 newSelection.insert(id)
             }
         }
+        // Every drag event lands here (60 to 120 Hz). Writing an equal set
+        // into `@State` still invalidates the whole library body plus every
+        // visible card's context menu, so only a changed set may propagate.
+        guard newSelection != coordinator.currentSelectedIDs else { return }
+        coordinator.currentSelectedIDs = newSelection
         coordinator.onSelectionChanged?(newSelection)
     }
 
@@ -1140,5 +1188,262 @@ private final class RubberBandNSView: NSView {
             x: min(a.x, b.x), y: min(a.y, b.y),
             width: abs(b.x - a.x), height: abs(b.y - a.y)
         )
+    }
+}
+
+// MARK: - Today Strip
+
+/// The meeting strip above the library. Isolated on purpose: it is the only
+/// reader of `appState.upcomingMeetings`, which the calendar mirror rewrites
+/// every 5 s, and it owns the clock for time-derived state ("In progress",
+/// "in 12 min"), so the grid body never re-runs for either. The strip lives
+/// OUTSIDE the ScrollView: the marquee overlay consumes mouse-downs on the
+/// scroll document background, so an in-document button would never receive
+/// its click. As fixed chrome it also stays visible while scrolling.
+struct TodayMeetingStrip: View {
+    @Environment(\.uiScale) private var uiScale: CGFloat
+    @Environment(AppState.self) private var appState
+
+    let smartFolder: SmartFolderDTO?
+
+    @State private var prepEvent: MeetingEvent?
+    @AppStorage("autoRecordMeetings") private var autoRecordMeetings = false
+
+    var body: some View {
+        // Only the unfiltered library shows the strip: folder, tag, smart
+        // folder and search contexts stay purely about their result set.
+        if smartFolder == nil,
+           appState.activeDestination == .allRecordings,
+           appState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let meetings = appState.upcomingMeetings
+            TimelineView(MeetingBoundarySchedule(meetings: meetings)) { context in
+                if let meeting = Self.upcomingMeeting(in: meetings, now: context.date) {
+                    strip(meeting, now: context.date)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 2)
+                }
+            }
+        }
+    }
+
+    /// The meeting the strip points at: an in-progress one wins, else the
+    /// next not-yet-started one today; nil hides the strip entirely. The
+    /// original "not started yet" filter made the strip vanish the moment
+    /// the morning's first meeting began. Pure in `now` so the clock, not
+    /// the wall time at body evaluation, decides.
+    nonisolated static func upcomingMeeting(
+        in meetings: [MeetingEventDTO],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> MeetingEventDTO? {
+        let todays = meetings.filter {
+            !$0.isAllDay && calendar.isDate($0.startDate, inSameDayAs: now) && $0.endDate > now
+        }
+        return todays.first { $0.startDate <= now && now <= $0.endDate }
+            ?? todays.filter { $0.startDate > now }.min { $0.startDate < $1.startDate }
+    }
+
+    private func strip(_ meeting: MeetingEventDTO, now: Date) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Today")
+                    .font(.cadenza(13 - 1, weight: .bold, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                Text(now.formatted(.dateTime.month(.abbreviated).day().weekday(.abbreviated)))
+                    .font(.cadenza(13 - 3, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+            }
+
+            Button {
+                appState.navigate(to: .calendar)
+            } label: {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(meetingColor(meeting))
+                        .frame(width: 8, height: 8)
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(verbatim: "\(meeting.startDate.formatted(date: .omitted, time: .shortened)) · \(meeting.title)")
+                            .font(.cadenza(13 - 1, weight: .semibold, scale: uiScale))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text(verbatim: subtitle(meeting, now: now))
+                            .font(.cadenza(13 - 3, scale: uiScale))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.cadenzaPlain)
+            .accessibilityValue(Text(verbatim: "\(meeting.startDate.formatted(date: .omitted, time: .shortened)) \(meeting.title)"))
+
+            // Pre-meeting entry: the same event card the calendar shows,
+            // meeting-prep section included.
+            Button {
+                prepEvent = appState.calendarManager?.upcomingMeetings
+                    .first { $0.id == meeting.id }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "sparkles")
+                        .font(.cadenza(13 - 3, scale: uiScale))
+                    Text("Meeting Prep")
+                        .font(.cadenza(13 - 2, weight: .semibold, scale: uiScale))
+                }
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.accentColor.opacity(0.13)))
+                .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.3), lineWidth: 0.75))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.cadenzaPlain)
+            .popover(item: $prepEvent, arrowEdge: .bottom) { event in
+                EventDetailPopover(event: event) {
+                    prepEvent = nil
+                }
+            }
+
+            if autoRecordMeetings {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark")
+                        .font(.cadenza(13 - 4, weight: .bold, scale: uiScale))
+                        .foregroundStyle(.green)
+                    Text("Auto-record on")
+                        .font(.cadenza(13 - 3, scale: uiScale))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                appState.navigate(to: .calendar)
+            } label: {
+                HStack(spacing: 4) {
+                    Text("View Calendar")
+                    Image(systemName: "chevron.right")
+                        .font(.cadenza(13 - 4, weight: .semibold, scale: uiScale))
+                }
+                .font(.cadenza(13 - 2, weight: .semibold, scale: uiScale))
+                .foregroundStyle(Color.accentColor)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.cadenzaPlain)
+            .accessibilityLabel(Text("View Calendar"))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(AppStyle.ColorToken.softFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(AppStyle.ColorToken.stroke, lineWidth: 0.75)
+        )
+    }
+
+    private func subtitle(_ meeting: MeetingEventDTO, now: Date) -> String {
+        let app = meeting.meetingApp.flatMap { MeetingApp(rawValue: $0)?.displayName }
+        let timing = (meeting.startDate <= now && now <= meeting.endDate)
+            ? String(localized: "In progress")
+            : Self.relativeFormatter.localizedString(for: meeting.startDate, relativeTo: now)
+        return "\(app ?? meeting.calendarName) · \(timing)"
+    }
+
+    private func meetingColor(_ meeting: MeetingEventDTO) -> Color {
+        meeting.defaultColorHex.isEmpty ? .accentColor : Color(hex: meeting.defaultColorHex)
+    }
+
+    private static let relativeFormatter = RelativeDateTimeFormatter()
+}
+
+/// Wakes the strip exactly when its text can change: on every minute boundary
+/// (relative times) and at each meeting start and end (the "In progress"
+/// flip). Replaces the 5 s tick that used to re-run the whole library.
+struct MeetingBoundarySchedule: TimelineSchedule {
+    let boundaries: [Date]
+
+    init(meetings: [MeetingEventDTO]) {
+        boundaries = meetings.flatMap { [$0.startDate, $0.endDate] }.sorted()
+    }
+
+    func entries(from start: Date, mode: Mode) -> AnySequence<Date> {
+        Self.entries(boundaries: boundaries, from: start)
+    }
+
+    nonisolated static func entries(
+        boundaries: [Date],
+        from start: Date,
+        calendar: Calendar = .current
+    ) -> AnySequence<Date> {
+        let firstMinute = calendar.nextDate(
+            after: start, matching: DateComponents(second: 0), matchingPolicy: .nextTime
+        ) ?? start.addingTimeInterval(60)
+        let pending = boundaries.filter { $0 > start }.sorted()
+        var nextMinute = firstMinute
+        var index = 0
+        return AnySequence(AnyIterator {
+            let boundary = index < pending.count ? pending[index] : nil
+            let next: Date
+            if let boundary, boundary <= nextMinute {
+                next = boundary
+                index += 1
+                if boundary == nextMinute { nextMinute = nextMinute.addingTimeInterval(60) }
+            } else {
+                next = nextMinute
+                nextMinute = nextMinute.addingTimeInterval(60)
+            }
+            return next
+        })
+    }
+}
+
+// MARK: - Export Submenu
+
+/// The export submenu of a card's context menu. Its `disabled` states read
+/// service-level observables (Notion connection, Craft availability, the batch
+/// exporter's per-file progress). Inside the card builder those reads made
+/// every visible card, and with it the library body, a dependent of a
+/// per-exported-file progress write. Here they are dependencies of this small
+/// struct only.
+private struct RecordingExportMenu: View {
+    @Environment(AppState.self) private var appState
+
+    let affected: () -> [RecordingDTO]
+    let onNotion: ([RecordingDTO]) -> Void
+    let onCraft: ([RecordingDTO]) -> Void
+    let onLocalFolder: ([RecordingDTO]) -> Void
+
+    var body: some View {
+        Menu {
+            Button {
+                onNotion(affected())
+            } label: {
+                Label("Notion", systemImage: "arrow.up.doc")
+            }
+            .disabled(!appState.notionConnected)
+
+            Button {
+                onCraft(affected())
+            } label: {
+                Label("Craft", systemImage: "doc.richtext")
+            }
+            .disabled(!appState.craftIsAvailable)
+
+            Divider()
+
+            Button {
+                onLocalFolder(affected())
+            } label: {
+                Label("Local Folder…", systemImage: "folder")
+            }
+            .disabled(appState.exportService.batchFileExporter.isBusy)
+        } label: {
+            Label("Export to...", systemImage: "square.and.arrow.up")
+        }
     }
 }

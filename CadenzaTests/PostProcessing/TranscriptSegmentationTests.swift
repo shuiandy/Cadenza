@@ -87,6 +87,73 @@ struct TranscriptSegmentationTests {
     }
 }
 
+@Suite("Provider Segment Merge")
+struct ProviderSegmentMergeTests {
+    private func seg(
+        _ start: TimeInterval,
+        _ end: TimeInterval,
+        _ text: String,
+        _ speaker: String? = nil
+    ) -> TranscriptResultSegment {
+        TranscriptResultSegment(startTime: start, endTime: end, text: text, speaker: speaker)
+    }
+
+    @Test func unlabeledSegmentsNeverMerge() {
+        let merged = WhisperTranscriber.mergeSameSpeakerSegments([
+            seg(0, 10, "One."), seg(10, 20, "Two."), seg(20, 30, "Three.")
+        ])
+        #expect(merged.count == 3)
+    }
+
+    @Test func sameSpeakerRunsMerge() {
+        let merged = WhisperTranscriber.mergeSameSpeakerSegments([
+            seg(0, 10, "Hello", "A"), seg(10, 20, "again", "A"), seg(20, 30, "Bob here", "B")
+        ])
+        #expect(merged.count == 2)
+        #expect(merged[0].text == "Hello again")
+        #expect(merged[0].speaker == "A")
+        #expect(merged[0].startTime == 0)
+        #expect(merged[0].endTime == 20)
+    }
+
+    @Test func mergeCapsAtThirtySeconds() {
+        let merged = WhisperTranscriber.mergeSameSpeakerSegments([
+            seg(0, 15, "a", "A"), seg(15, 30, "b", "A"),
+            seg(30, 45, "c", "A"), seg(45, 60, "d", "A")
+        ])
+        #expect(merged.count == 2)
+        #expect(merged[0].endTime == 30)
+        #expect(merged[1].startTime == 30)
+    }
+
+    @Test func mergeCapsAtFiveHundredCharacters() {
+        let longText = String(repeating: "x", count: 501)
+        let merged = WhisperTranscriber.mergeSameSpeakerSegments([
+            seg(0, 5, longText, "A"), seg(5, 10, "tail", "A")
+        ])
+        #expect(merged.count == 2)
+    }
+
+    @Test func speakerChangeAlwaysBreaks() {
+        let merged = WhisperTranscriber.mergeSameSpeakerSegments([
+            seg(0, 5, "hi", "A"), seg(5, 10, "hey", "B"), seg(10, 15, "yo", "A")
+        ])
+        #expect(merged.count == 3)
+    }
+
+    @Test func uniformSpeakerResponseStaysChunked() {
+        // Regression guard: a diarized response whose speaker fields are
+        // uniform across a five-minute chunk used to collapse into a single
+        // monolith that no later diarization pass could re-label.
+        let segments = (0..<20).map { i in
+            seg(TimeInterval(i * 15), TimeInterval((i + 1) * 15), "sentence \(i).", "A")
+        }
+        let merged = WhisperTranscriber.mergeSameSpeakerSegments(segments)
+        #expect(merged.count >= 10)
+        #expect(merged.allSatisfy { $0.endTime - $0.startTime <= 30.001 })
+    }
+}
+
 @Suite("Speaker Assignment")
 @MainActor
 struct SpeakerAssignmentTests {

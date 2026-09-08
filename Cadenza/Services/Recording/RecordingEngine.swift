@@ -1431,6 +1431,8 @@ extension RecordingEngine {
     /// failure is replayed with the budget rewound to one below the cap. If the
     /// revived stream delivers a delta, onRealtimeStreamHealthy refills the
     /// budget in full; if it fails again, the give-up branch re-queues here.
+    /// `sustainedSilence` is the system-track duration: only audio the provider
+    /// actually receives counts as resumed speech worth redialing for.
     private func retryRealtimeOnSpeechIfNeeded(sustainedSilence: TimeInterval) {
         guard recordingState == .recording,
               let retry = queuedRealtimeSpeechRetry,
@@ -1516,14 +1518,19 @@ extension RecordingEngine {
                   self.isActiveRealtimeRecording(configuration.recordingID) else { return }
             // A delta proves this stream works end to end. Refill the budget so
             // scattered one-off faults across a long recording never accumulate
-            // into the reconnect cap.
+            // into the reconnect cap. The give-up branch leaves its stream open,
+            // so a session can recover this way with the interruption hint still
+            // showing — clear it, the banner is stale the moment text arrives.
             self.realtimeReconnectCount = 0
             self.queuedRealtimeSpeechRetry = nil
+            self.realtimeHint = nil
         }
 
         transcriptionManager.realtimeAudioIsSilent = { [weak self] in
             guard let self else { return true }
-            return self.audioMixer.sustainedSilenceDuration >= Self.realtimeWatchdogSilenceFloor
+            // System track only: it is the sole track fed to the provider, so
+            // local mic noise must not read as "speech went untranscribed".
+            return self.audioMixer.systemAudioSustainedSilenceDuration >= Self.realtimeWatchdogSilenceFloor
         }
 
         transcriptionManager.onRealtimeFailure = { [weak self] error, failedProvider, failedAttemptID in
@@ -1796,7 +1803,7 @@ private extension RecordingEngine {
                     self.audioLevel = level
                 }
                 self.retryRealtimeOnSpeechIfNeeded(
-                    sustainedSilence: self.audioMixer.sustainedSilenceDuration
+                    sustainedSilence: self.audioMixer.systemAudioSustainedSilenceDuration
                 )
             }
         }

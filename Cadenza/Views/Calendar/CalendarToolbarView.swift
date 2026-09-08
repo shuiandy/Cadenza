@@ -42,7 +42,7 @@ struct CalendarToolbarView: View {
     @Binding var selectedDate: Date
 
     var body: some View {
-        CalendarToolbarAdaptiveLayout {
+        CalendarToolbarAdaptiveLayout(spacing: 8) {
             navigationControls
         } today: {
             CalendarToolbarNativeButton(
@@ -63,12 +63,20 @@ struct CalendarToolbarView: View {
             }
         } dateTitle: {
             Text(dateTitle)
-                .font(.cadenza(.headline, scale: uiScale))
+                .font(.cadenza(12, scale: uiScale))
+                .foregroundStyle(.secondary)
                 .lineLimit(uiScale >= CadenzaTextScale.factor(.accessibility1) ? nil : 1)
                 .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .appToolbarRail(cornerRadius: 10)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(AppStyle.ColorToken.softFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 1)
+                )
         } modePicker: {
             CalendarToolbarModeSelector(
                 selection: $viewMode,
@@ -78,14 +86,21 @@ struct CalendarToolbarView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+        // The AppKit-bridged buttons report low content-hugging, so they accept
+        // any proposed height. Without pinning the toolbar to its ideal height
+        // it competes with the calendar grid for the container's vertical space
+        // and the VStack splits the window between them.
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var controlDimension: CGFloat {
         CalendarToolbarControlMetrics.controlDimension(scale: uiScale)
     }
 
+    /// Joined previous/next pair in one bordered capsule-corner box, per the
+    /// concept, instead of two loose buttons on a glass rail.
     private var navigationControls: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 0) {
             CalendarToolbarNativeButton(
                 systemName: "chevron.left",
                 accessibilityIdentifier: "calendar-toolbar-previous",
@@ -94,6 +109,10 @@ struct CalendarToolbarView: View {
             ) {
                 goBack()
             }
+
+            Rectangle()
+                .fill(AppStyle.ColorToken.mutedCapsuleStroke)
+                .frame(width: 1, height: controlDimension * 0.6)
 
             CalendarToolbarNativeButton(
                 systemName: "chevron.right",
@@ -104,9 +123,14 @@ struct CalendarToolbarView: View {
                 goForward()
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .appToolbarRail(cornerRadius: 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(AppStyle.ColorToken.softFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 1)
+        )
     }
 
     private var dateTitle: String {
@@ -192,17 +216,20 @@ enum CalendarToolbarControlMetrics {
         scale.isFinite && scale > 0 ? scale : 1
     }
 
+    /// Compact 24pt controls at scale 1 — the earlier 32pt base read as
+    /// oversized chrome next to the grid; accessibility scaling still grows
+    /// the frame through the symbol probe.
     static func controlDimension(scale: CGFloat) -> CGFloat {
         CadenzaControlMetrics.squareIconFrame(
-            base: 32,
-            symbolPointSize: 13,
+            base: 24,
+            symbolPointSize: 11,
             scale: safeScale(scale),
-            padding: 12
+            padding: 8
         )
     }
 
     static func fontPointSize(scale: CGFloat) -> CGFloat {
-        13 * safeScale(scale)
+        12 * safeScale(scale)
     }
 }
 
@@ -314,7 +341,7 @@ struct CalendarToolbarNativeButton: NSViewRepresentable {
             )
             button.contentTintColor = isProminent
                 ? .alternateSelectedControlTextColor
-                : (isSelected ? .controlAccentColor : .labelColor)
+                : (isSelected ? .labelColor : .secondaryLabelColor)
             button.setAccessibilityLabel(title)
         }
 
@@ -382,11 +409,17 @@ struct CalendarToolbarModeSelector: View {
                 }
                 .frame(maxWidth: .infinity)
                 .background {
+                    // Selected segment reads as a raised white chip, matching
+                    // the concept's segmented control.
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(
                             selection == mode
-                                ? Color.accentColor.opacity(0.16)
+                                ? Color(nsColor: .controlBackgroundColor)
                                 : .clear
+                        )
+                        .shadow(
+                            color: .black.opacity(selection == mode ? 0.12 : 0),
+                            radius: 2, y: 1
                         )
                 }
             }
@@ -421,17 +454,20 @@ struct CalendarToolbarModeSelector: View {
 /// picker can then split once more instead of clipping inside the 800pt
 /// minimum window.
 struct CalendarToolbarAdaptiveLayout<Navigation: View, Today: View, DateTitle: View, ModePicker: View>: View {
+    private let spacing: CGFloat
     private let navigation: Navigation
     private let today: Today
     private let dateTitle: DateTitle
     private let modePicker: ModePicker
 
     init(
+        spacing: CGFloat = 12,
         @ViewBuilder navigation: () -> Navigation,
         @ViewBuilder today: () -> Today,
         @ViewBuilder dateTitle: () -> DateTitle,
         @ViewBuilder modePicker: () -> ModePicker
     ) {
+        self.spacing = spacing
         self.navigation = navigation()
         self.today = today()
         self.dateTitle = dateTitle()
@@ -440,7 +476,7 @@ struct CalendarToolbarAdaptiveLayout<Navigation: View, Today: View, DateTitle: V
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(spacing: 12) {
+            HStack(spacing: spacing) {
                 navigation.fixedSize(horizontal: true, vertical: false)
                 today.fixedSize(horizontal: true, vertical: false)
                 dateTitle.fixedSize(horizontal: true, vertical: false)

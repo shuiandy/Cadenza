@@ -574,7 +574,10 @@ enum ProfileBootstrap {
         }
         do {
             try requireRegularFile(at: storeURL, fileOperations: dependencies.fileOperations)
-            _ = try SQLiteLogicalDigest.digest(of: storeURL)
+            // Availability probe, not a content digest: this gate runs on
+            // every boot (twice on the pipeline path) and the full logical
+            // digest was the app's dominant startup cost on real stores.
+            try SQLiteStoreProbe.verifyReadable(at: storeURL)
             return nil
         } catch {
             return "profile store unavailable: \(String(describing: error))"

@@ -993,6 +993,9 @@ struct MCPToolRegistry: MCPToolProviding {
             "date": .string(iso(detail.startDate)),
             "tags": .array(detail.tags.map { .string($0) }),
             "meetingType": detail.meetingType.map { .string($0) } ?? .null,
+            "summaryId": .string(summary.id.uuidString),
+            "reviewStage": summary.generationMetadata.map { .string($0.stage.rawValue) } ?? .null,
+            "sourceChanged": summary.generationMetadata.map { .bool($0.sourceChanged) } ?? .null,
             "overview": .string(summary.overview),
             "keyPoints": .array(summary.keyPoints.map { .string($0) }),
             "decisions": .array(summary.decisions.map { .string($0) }),
@@ -1650,8 +1653,7 @@ struct MCPToolRegistry: MCPToolProviding {
     /// Detail fetch that refuses trashed recordings (fetchRecordingDetail
     /// itself resolves by id regardless of trash status).
     private func fetchActiveDetail(_ id: UUID) async -> RecordingDetailDTO? {
-        let trashed = await store.fetchTrashedRecordings()
-        guard !trashed.contains(where: { $0.id == id }) else { return nil }
+        guard let trashed = await store.isRecordingTrashed(recordingID: id), !trashed else { return nil }
         return await store.fetchRecordingDetail(recordingID: id)
     }
 

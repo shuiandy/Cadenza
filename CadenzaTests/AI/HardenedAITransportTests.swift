@@ -198,7 +198,70 @@ struct HardenedAITransportTests {
         }
     }
 
-    @Test func allProviderBufferedSummariesUseInjectedHardenedTransport() async throws {
+    @Test(arguments: SummaryDetailLevel.allCases)
+    func claudeSummaryBudgetReachesActualCompletionTransport(level: SummaryDetailLevel) async throws {
+        AITransportTestURLProtocol.reset()
+        let service: any AIServiceProtocol = ClaudeService(apiKey: "fixture-key", transport: makeTransport())
+        for try await _ in service.streamSummaryCompletion(systemPrompt: "fixture", userMessage: "fictional meeting", model: "claude-sonnet-4-6", detailLevel: level) {}
+        let data = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "api.anthropic.com")?.body)
+        let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let expected: Int = level == .highlights ? 4096 : level == .detailed ? 8192 : 16384
+        #expect(body["max_tokens"] as? Int == expected)
+        for try await _ in service.streamChat(systemPrompt: "fixture", userMessage: "hello", model: "claude-sonnet-4-6") {}
+        let chat = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "api.anthropic.com")?.body)
+        #expect((try JSONSerialization.jsonObject(with: chat) as? [String: Any])?["max_tokens"] as? Int == 4096)
+    }
+
+    @Test(arguments: ["max_tokens", "model_context_window_exceeded", "refusal", "missing_reason", "missing_stop"])
+    func claudeRejectsIncompleteBufferedAndStreamingResponses(reason: String) async throws {
+        AITransportTestURLProtocol.reset(claudeTermination: reason)
+        let service = ClaudeService(apiKey: "fixture-key", transport: makeTransport())
+        await #expect(throws: AIServiceError.self) {
+            _ = try await service.summarize(transcript: "fictional", language: "en", model: "claude-sonnet-4-6", knownTags: [])
+        }
+        await #expect(throws: AIServiceError.self) {
+            for try await _ in service.streamSummaryCompletion(systemPrompt: "fixture", userMessage: "fictional", model: "claude-sonnet-4-6", detailLevel: .fullBreakdown) {}
+        }
+    }
+
+    @Test func claudeUsageDeltaPreservesTerminationAndChatAllowsTruncation() async throws {
+        AITransportTestURLProtocol.reset(claudeTermination: "usage_after_stop")
+        let service = ClaudeService(apiKey: "fixture-key", transport: makeTransport())
+        for try await _ in service.streamSummaryCompletion(systemPrompt: "fixture", userMessage: "fictional", model: nil, detailLevel: .detailed) {}
+        AITransportTestURLProtocol.reset(claudeTermination: "max_tokens")
+        var text = ""
+        for try await chunk in service.streamChat(systemPrompt: "fixture", userMessage: "fictional", model: nil) { text += chunk }
+        #expect(text == "claude")
+    }
+
+    @Test(arguments: ["length", "missing_reason"])
+    func otherProvidersRejectIncompleteSummaries(reason: String) async throws {
+        AITransportTestURLProtocol.reset(summaryTermination: reason)
+        let services: [any AIServiceProtocol] = [
+            OpenAIService(apiKey: "fixture-key", transport: makeTransport()),
+            GeminiService(apiKey: "fixture-key", transport: makeTransport())
+        ]
+        for service in services {
+            await #expect(throws: AIServiceError.self) {
+                _ = try await service.summarize(transcript: "fictional", language: "en", model: nil, knownTags: [])
+            }
+            await #expect(throws: AIServiceError.self) {
+                for try await _ in service.streamSummaryCompletion(systemPrompt: "fixture", userMessage: "fictional", model: nil, detailLevel: .detailed) {}
+            }
+            var chat = ""
+            for try await part in service.streamChat(systemPrompt: "fixture", userMessage: "fictional", model: nil) { chat += part }
+            #expect(!chat.isEmpty)
+        }
+    }
+
+    @Test func claudeUnknownModelRetainsConservativeBudget() {
+        #expect(ClaudeService.summaryOutputBudget(model: "unknown", detailLevel: .fullBreakdown) == 4096)
+        #expect(ClaudeService.summaryOutputBudget(model: "claude-haiku-4-5-20251001", detailLevel: .fullBreakdown) == 16384)
+    }
+
+    @Test(arguments: SummaryDetailLevel.allCases)
+    func allProviderBufferedSummariesUseSelectedDepth(level: SummaryDetailLevel) async throws {
+        AITransportTestURLProtocol.reset()
         let transport = makeTransport()
         let services: [AIServiceProtocol] = [
             OpenAIService(apiKey: "openai-key", transport: transport),
@@ -214,9 +277,13 @@ struct HardenedAITransportTests {
                 jobTitle: nil,
                 meetingType: nil,
                 meetingTitle: nil,
-                knownTags: []
+                knownTags: [], detailLevel: level
             )
             #expect(result.title == "Transport protected")
+            let host = service.provider == .openai ? "api.openai.com"
+                : service.provider == .claude ? "api.anthropic.com" : "generativelanguage.googleapis.com"
+            let body = try #require(AITransportTestURLProtocol.capturedRequest(forHost: host)?.body)
+            #expect(String(decoding: body, as: UTF8.self).contains(level.promptGuidance))
         }
     }
 
@@ -384,12 +451,15 @@ private final class AITransportTestURLProtocol: URLProtocol {
         let authorization: String?
         let apiKey: String?
         let anthropicVersion: String?
+        let body: Data?
     }
 
     private struct State: Sendable {
         var requestCountByHost: [String: Int] = [:]
         var secretObservedByTarget: String?
         var modelListMode: ModelListMode = .success
+        var claudeTermination = "end_turn"
+        var summaryTermination = "stop"
         var capturedRequestsByHost: [String: CapturedRequest] = [:]
     }
 
@@ -399,8 +469,8 @@ private final class AITransportTestURLProtocol: URLProtocol {
         state.withLock { $0.secretObservedByTarget }
     }
 
-    static func reset(modelListMode: ModelListMode = .success) {
-        state.withLock { $0 = State(modelListMode: modelListMode) }
+    static func reset(modelListMode: ModelListMode = .success, claudeTermination: String = "end_turn", summaryTermination: String = "stop") {
+        state.withLock { $0 = State(modelListMode: modelListMode, claudeTermination: claudeTermination, summaryTermination: summaryTermination) }
     }
 
     static func requestCount(forHost host: String) -> Int {
@@ -425,6 +495,10 @@ private final class AITransportTestURLProtocol: URLProtocol {
             return
         }
 
+        // URLSession hands URLProtocol buffered POST bodies as an input stream.
+        // Read it once for both request assertions and the fixture response.
+        let bodyData = capturedBody()
+
         Self.state.withLock { state in
             state.requestCountByHost[host, default: 0] += 1
             state.capturedRequestsByHost[host] = CapturedRequest(
@@ -432,7 +506,8 @@ private final class AITransportTestURLProtocol: URLProtocol {
                 authorization: request.value(forHTTPHeaderField: "Authorization"),
                 apiKey: request.value(forHTTPHeaderField: "x-api-key")
                     ?? request.value(forHTTPHeaderField: "x-goog-api-key"),
-                anthropicVersion: request.value(forHTTPHeaderField: "anthropic-version")
+                anthropicVersion: request.value(forHTTPHeaderField: "anthropic-version"),
+                body: bodyData
             )
             if host == "redirect-target.example" {
                 state.secretObservedByTarget = request.value(forHTTPHeaderField: "x-api-key")
@@ -476,23 +551,38 @@ private final class AITransportTestURLProtocol: URLProtocol {
         case "/sse-frame-oversize":
             send(status: 200, data: Data("data: one\n\ndata: two\n\ndata: three\n\n".utf8), url: url)
         case "/v1/chat/completions":
-            sendProviderResponse(provider: "openai", url: url)
+            sendProviderResponse(provider: "openai", url: url, bodyData: bodyData)
         case "/v1/messages":
-            sendProviderResponse(provider: "claude", url: url)
+            sendProviderResponse(provider: "claude", url: url, bodyData: bodyData)
         case "/v1/models":
             sendModelListResponse(url: url)
         case "/v1beta/models":
             sendModelListResponse(url: url)
         case let path where path.hasSuffix(":generateContent"):
-            sendProviderResponse(provider: "gemini", url: url)
+            sendProviderResponse(provider: "gemini", url: url, bodyData: bodyData)
         case let path where path.hasSuffix(":streamGenerateContent"):
-            sendProviderResponse(provider: "gemini", url: url, streaming: true)
+            sendProviderResponse(provider: "gemini", url: url, bodyData: bodyData, streaming: true)
         default:
             send(status: 200, data: Data("{}".utf8), url: url)
         }
     }
 
     override func stopLoading() {}
+
+    private func capturedBody() -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count >= 0 else { return nil }
+            if count == 0 { return data }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+    }
 
     private func sendRedirect(from url: URL) {
         let status = URLComponents(url: url, resolvingAgainstBaseURL: false)?
@@ -549,9 +639,10 @@ private final class AITransportTestURLProtocol: URLProtocol {
     private func sendProviderResponse(
         provider: String,
         url: URL,
+        bodyData: Data?,
         streaming explicitStreaming: Bool? = nil
     ) {
-        let bodyObject = request.httpBody.flatMap {
+        let bodyObject = bodyData.flatMap {
             try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
         }
         let streaming = explicitStreaming
@@ -561,24 +652,23 @@ private final class AITransportTestURLProtocol: URLProtocol {
             let payload: String
             switch provider {
             case "claude":
-                payload = """
-                data: {"type":"content_block_delta","delta":{"text":"claude"}}
-
-                data: {"type":"message_stop"}
-
-                """
+                let reason = Self.state.withLock { $0.claudeTermination }
+                var frames = ["data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"claude\"}}"]
+                if reason != "missing_reason" {
+                    let stop = ["missing_stop", "usage_after_stop"].contains(reason) ? "end_turn" : reason
+                    frames.append("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\(stop)\"}}")
+                }
+                if reason == "usage_after_stop" { frames.append(#"data: {"type":"message_delta","delta":{},"usage":{"output_tokens":3}}"#) }
+                if reason != "missing_stop" { frames.append("data: {\"type\":\"message_stop\"}") }
+                payload = frames.joined(separator: "\n\n") + "\n\n"
             case "gemini":
-                payload = """
-                data: {"candidates":[{"content":{"parts":[{"text":"gemini"}]}}]}
-
-                """
+                let reason = Self.state.withLock { $0.summaryTermination }
+                let terminal = reason == "missing_reason" ? "" : ",\"finishReason\":\"\(reason == "stop" ? "STOP" : "MAX_TOKENS")\""
+                payload = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini\"}]}\(terminal)}]}\n\n"
             default:
-                payload = """
-                data: {"choices":[{"delta":{"content":"openai"}}]}
-
-                data: [DONE]
-
-                """
+                let reason = Self.state.withLock { $0.summaryTermination }
+                let terminal = reason == "missing_reason" ? "" : ",\"finish_reason\":\"\(reason)\""
+                payload = "data: {\"choices\":[{\"delta\":{\"content\":\"openai\"}\(terminal)}]}\n\ndata: [DONE]\n\n"
             }
             send(status: 200, data: Data(payload.utf8), url: url)
             return
@@ -588,11 +678,12 @@ private final class AITransportTestURLProtocol: URLProtocol {
         let object: [String: Any]
         switch provider {
         case "claude":
-            object = ["content": [["type": "text", "text": summary]]]
+            object = ["content": [["type": "text", "text": summary]], "stop_reason": Self.state.withLock { $0.claudeTermination }]
         case "gemini":
-            object = ["candidates": [["content": ["parts": [["text": summary]]]]]]
+            let reason = Self.state.withLock { $0.summaryTermination }
+            object = ["candidates": [["content": ["parts": [["text": summary]]], "finishReason": reason == "stop" ? "STOP" : reason]]]
         default:
-            object = ["choices": [["message": ["content": summary]]]]
+            object = ["choices": [["message": ["content": summary], "finish_reason": Self.state.withLock { $0.summaryTermination }]]]
         }
         let data = try! JSONSerialization.data(withJSONObject: object)
         send(status: 200, data: data, url: url)

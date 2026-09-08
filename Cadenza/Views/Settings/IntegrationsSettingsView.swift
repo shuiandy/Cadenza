@@ -84,15 +84,38 @@ struct IntegrationsSettingsView: View {
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 8)
                 } else {
+                    let calendarIconSize = CadenzaControlMetrics.squareIconFrame(
+                        base: 34,
+                        symbolPointSize: 16,
+                        scale: uiScale,
+                        padding: 13
+                    )
                     Button {
                         showCalendarSheet = true
                     } label: {
-                        HStack {
-                            Text("Manage visible calendars")
-                            Spacer()
-                            Text("\(calendars.count - disabledIDs.count) of \(calendars.count) enabled")
-                                .font(.cadenza(.caption, scale: uiScale))
+                        HStack(spacing: 12) {
+                            Image(systemName: "calendar")
+                                .font(.cadenza(16, scale: uiScale))
                                 .foregroundStyle(.secondary)
+                                .frame(width: calendarIconSize, height: calendarIconSize)
+                                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Manage visible calendars")
+                                    .font(.cadenza(14, weight: .medium, scale: uiScale))
+                                Text("Visibility and color for each calendar")
+                                    .font(.cadenza(12, scale: uiScale))
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer(minLength: 8)
+
+                            Text("\(calendars.count - disabledIDs.count) of \(calendars.count) enabled")
+                                .font(.cadenza(10.5, scale: uiScale))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .frame(minHeight: 21)
+                                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                             Image(systemName: "chevron.right")
                                 .font(.cadenza(.caption, scale: uiScale))
                                 .foregroundStyle(.secondary)
@@ -161,49 +184,51 @@ struct IntegrationsSettingsView: View {
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Craft")
-                        .font(.cadenza(14, weight: .medium, scale: uiScale))
-                    Text(appState.craftIsAvailable ? String(localized: "Available") : String(localized: "Not installed"))
+                    HStack(spacing: 7) {
+                        Text("Craft")
+                            .font(.cadenza(14, weight: .medium, scale: uiScale))
+                        SettingsStatusCapsule(
+                            kind: appState.craftIsAvailable ? .connected : .attention,
+                            label: appState.craftIsAvailable ? "Available" : "Not installed"
+                        )
+                    }
+                    Text("Installed on this Mac; exports as Craft documents")
                         .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(appState.craftIsAvailable ? .green : .secondary)
+                        .foregroundStyle(.secondary)
                 }
 
                 Spacer(minLength: 8)
-
-                if !appState.craftIsAvailable {
-                    Label("Not installed", systemImage: "exclamationmark.triangle")
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(.orange)
-                }
             }
             .padding(.vertical, 10)
 
             if appState.craftIsAvailable {
-                Divider().padding(.leading, 40)
-
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Space ID")
-                            .font(.cadenza(14, scale: uiScale))
-                        Text("Leave empty to use your default space")
-                            .font(.cadenza(.subheadline, scale: uiScale))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 12)
-                    TextField("Optional", text: $craftSpaceID)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 200)
-                        .onChange(of: craftSpaceID) { _, value in
-                            UserDefaults.standard.set(value, forKey: ActiveProfileDefaults.key("craft.spaceID"))
+                SettingsDependentRow {
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Space ID")
+                                    .font(.cadenza(14, scale: uiScale))
+                                Text("Leave empty to use your default space")
+                                    .font(.cadenza(.subheadline, scale: uiScale))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 12)
+                            TextField("Optional", text: $craftSpaceID)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 200)
+                                .onChange(of: craftSpaceID) { _, value in
+                                    UserDefaults.standard.set(value, forKey: ActiveProfileDefaults.key("craft.spaceID"))
+                                }
                         }
+                        .padding(.vertical, 8)
+
+                        Divider().opacity(0.5)
+
+                        SettingsToggleRow("Auto-export after recording", isOn: $autoExportToCraft)
+
+                        BulkExportRow(destination: .craft)
+                    }
                 }
-                .padding(.vertical, 8)
-
-                Divider()
-
-                SettingsToggleRow("Auto-export after recording", isOn: $autoExportToCraft)
-
-                BulkExportRow(destination: .craft)
             }
         }
     }
@@ -277,8 +302,6 @@ private struct NotionDatabasePicker: View {    @Environment(\.uiScale) private v
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Divider().padding(.leading, 40)
-
             HStack(alignment: .top, spacing: 12) {
                 Text("Database")
                     .font(.cadenza(14, scale: uiScale))
@@ -446,15 +469,23 @@ private struct CadenzaAccountInline: View {
                     appState.webSync.retryNow()
                 }
                 let audioControl = entitlements?.audioControl ?? .deniedNoAuthority
-                Toggle("Upload audio for web playback", isOn: Binding(
-                    get: { appState.webSync.audioUploadEnabled(userID: user.id) },
-                    // A denial disables the control, so this setter is only
-                    // reachable while uploads are permitted and never writes a
-                    // value the user did not choose.
-                    set: { appState.webSync.setAudioUploadEnabled($0) }
-                ))
-                .font(.cadenza(14, scale: uiScale))
-                .disabled(!audioControl.isAvailable)
+                HStack(spacing: 12) {
+                    Text("Upload audio for web playback")
+                        .font(.cadenza(14, scale: uiScale))
+                    Spacer(minLength: 12)
+                    Toggle("Upload audio for web playback", isOn: Binding(
+                        get: { appState.webSync.audioUploadEnabled(userID: user.id) },
+                        // A denial disables the control, so this setter is only
+                        // reachable while uploads are permitted and never writes a
+                        // value the user did not choose.
+                        set: { appState.webSync.setAudioUploadEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .disabled(!audioControl.isAvailable)
+                    .accessibilityLabel(Text("Upload audio for web playback"))
+                }
                 if let denial = EntitlementsCopy.audioControlDenial(audioControl) {
                     Text(verbatim: denial)
                         .font(.cadenza(.caption, scale: uiScale))
@@ -681,30 +712,36 @@ private struct CalendarManageSheet: View {
             ScrollView {
                 VStack(spacing: 14) {
                     ForEach(groupedCalendars, id: \.account) { group in
+                        // Concept Q: one color swatch per row (the picker IS
+                        // the identity dot), an enabled count on the group
+                        // header, and disabled calendars dimmed.
+                        let enabledInGroup = group.items.filter { !disabledIDs.contains($0.id) }.count
                         VStack(alignment: .leading, spacing: 0) {
                             HStack(spacing: 8) {
                                 Image(systemName: "person.crop.circle")
                                     .foregroundStyle(.secondary)
                                 Text(group.account)
                                     .font(.cadenza(15, weight: .semibold, scale: uiScale))
+                                Spacer()
+                                Text("\(enabledInGroup) of \(group.items.count) enabled")
+                                    .font(.cadenza(10.5, scale: uiScale))
+                                    .foregroundStyle(.secondary)
                             }
-                            .padding(.bottom, 10)
+                            .padding(.bottom, 8)
 
                             Divider().opacity(0.32)
 
                             VStack(spacing: 0) {
                                 ForEach(Array(group.items.enumerated()), id: \.element.id) { index, calendar in
+                                    let isEnabled = !disabledIDs.contains(calendar.id)
                                     HStack(spacing: 10) {
-                                        Circle()
-                                            .fill(calendarColor(for: calendar))
-                                            .frame(width: 10, height: 10)
+                                        CalendarItemColorPicker(calendarID: calendar.id, defaultHex: calendar.defaultColorHex)
 
                                         Text(calendar.title)
                                             .font(.cadenza(14, scale: uiScale))
+                                            .foregroundStyle(isEnabled ? .primary : .secondary)
 
                                         Spacer(minLength: 8)
-
-                                        CalendarItemColorPicker(calendarID: calendar.id, defaultHex: calendar.defaultColorHex)
 
                                         Toggle("", isOn: Binding(
                                             get: { !disabledIDs.contains(calendar.id) },
@@ -718,15 +755,17 @@ private struct CalendarManageSheet: View {
                                             }
                                         ))
                                         .labelsHidden()
+                                        .toggleStyle(.switch)
+                                        .controlSize(.small)
                                     }
-                                    .padding(.vertical, 8)
+                                    .padding(.vertical, 6)
 
                                     if index < group.items.count - 1 {
                                         Divider().opacity(0.32)
                                     }
                                 }
                             }
-                            .padding(.top, 6)
+                            .padding(.top, 4)
                         }
                         .padding(14)
                         .appGlassPanel(cornerRadius: 14, accent: .accentColor)
@@ -746,6 +785,87 @@ private struct CalendarManageSheet: View {
             return option.color
         }
         return Color(hex: calendar.defaultColorHex)
+    }
+}
+
+// MARK: - Status Capsule
+
+/// Connection-state chip shared by the integration rows: a filled dot for
+/// connected, a hollow dot for disconnected, and a warning triangle for
+/// states that need the user (permission, reauth).
+struct SettingsStatusCapsule: View {
+    enum Kind {
+        case connected
+        case disconnected
+        case attention
+    }
+
+    @Environment(\.uiScale) private var uiScale: CGFloat
+
+    let kind: Kind
+    private let label: Text
+
+    init(kind: Kind, label: LocalizedStringKey) {
+        self.kind = kind
+        self.label = Text(label)
+    }
+
+    /// For labels already localized elsewhere (e.g. the Onboarding table).
+    init(kind: Kind, verbatimLabel: String) {
+        self.kind = kind
+        self.label = Text(verbatim: verbatimLabel)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            switch kind {
+            case .connected:
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 6, height: 6)
+            case .disconnected:
+                Circle()
+                    .strokeBorder(Color.secondary.opacity(0.7), lineWidth: 1.2)
+                    .frame(width: 7, height: 7)
+            case .attention:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.cadenza(8, scale: uiScale))
+                    .foregroundStyle(.orange)
+            }
+
+            label
+                .font(.cadenza(10.5, weight: .semibold, scale: uiScale))
+                .foregroundStyle(labelColor)
+        }
+        .padding(.horizontal, 10)
+        .frame(minHeight: 21)
+        .background(backgroundColor, in: Capsule())
+        .overlay(Capsule().strokeBorder(borderColor, lineWidth: 1))
+        .fixedSize()
+    }
+
+    private var labelColor: Color {
+        switch kind {
+        case .connected: .green
+        case .disconnected: .secondary
+        case .attention: .orange
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch kind {
+        case .connected: Color.green.opacity(0.12)
+        case .disconnected: Color.primary.opacity(0.05)
+        case .attention: Color.orange.opacity(0.12)
+        }
+    }
+
+    private var borderColor: Color {
+        switch kind {
+        case .connected: Color.green.opacity(0.35)
+        case .disconnected: Color.primary.opacity(0.14)
+        case .attention: Color.orange.opacity(0.4)
+        }
     }
 }
 
@@ -775,6 +895,7 @@ private struct ProviderRow: View {
 
     @Environment(AppState.self) private var appState
     @State private var showCopied = false
+    @State private var showFullKey = false
     @State private var isExpanded = false
     @State private var apiKey = ""
     @State private var showKey = false
@@ -801,72 +922,34 @@ private struct ProviderRow: View {
     }
 
     var body: some View {
-        let iconSize = CadenzaControlMetrics.squareIconFrame(
-            base: 34,
-            symbolPointSize: 16,
-            scale: uiScale,
-            padding: 13
-        )
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 12) {
-                Group {
-                    if NSImage(named: provider.iconName) != nil {
-                        Image(provider.iconName)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 22, height: 22)
-                    } else {
-                        Image(systemName: provider.iconFallbackSymbol)
-                            .font(.cadenza(16, scale: uiScale))
-                            .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            // Concept D row anatomy: logo tile · name + status capsule over the
+            // purpose line · masked key chip · one clear action. The key chip
+            // rides inline while it fits and drops below the row otherwise
+            // (accessibility scales, revealed keys).
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    rowHeader
+                    Spacer(minLength: 8)
+                    if isConnected, let existingKey = apiKeyPresentation.currentAPIKey {
+                        apiKeyPill(existingKey)
+                    }
+                    rowAction
+                }
+                .padding(.vertical, 10)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 12) {
+                        rowHeader
+                        Spacer(minLength: 8)
+                        rowAction
+                    }
+                    if isConnected, let existingKey = apiKeyPresentation.currentAPIKey {
+                        apiKeyPill(existingKey)
+                            .padding(.leading, 40)
                     }
                 }
-                .frame(width: iconSize, height: iconSize)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 6) {
-                        Text(provider.displayName)
-                            .font(.cadenza(14, weight: .medium, scale: uiScale))
-                        if isConnected {
-                            Text("Connected")
-                                .font(.cadenza(11, weight: .medium, scale: uiScale))
-                                .foregroundStyle(.green)
-                        }
-                    }
-                    if !isConnected {
-                        Text(provider.subtitle)
-                            .font(.cadenza(12, scale: uiScale))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Spacer(minLength: 8)
-
-                if isConnected {
-                    Button("Disconnect", role: .destructive) {
-                        disconnect()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                } else {
-                    Button("Connect") {
-                        guard appState.startupPolicy.externalAccessEnabled else { return }
-                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
-                            isExpanded = true
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(!appState.startupPolicy.externalAccessEnabled)
-                }
-            }
-            .padding(.vertical, 10)
-
-            if isConnected, let existingKey = apiKeyPresentation.currentAPIKey {
-                apiKeyPill(existingKey)
-                    .padding(.leading, 40)
-                    .padding(.bottom, 6)
+                .padding(.vertical, 10)
             }
 
             if let mutationError {
@@ -989,14 +1072,94 @@ private struct ProviderRow: View {
         }
     }
 
+    private var rowHeader: some View {
+        let iconSize = CadenzaControlMetrics.squareIconFrame(
+            base: 34,
+            symbolPointSize: 16,
+            scale: uiScale,
+            padding: 13
+        )
+        return HStack(spacing: 12) {
+            Group {
+                if NSImage(named: provider.iconName) != nil {
+                    Image(provider.iconName)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 22, height: 22)
+                } else {
+                    Image(systemName: provider.iconFallbackSymbol)
+                        .font(.cadenza(16, scale: uiScale))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: iconSize, height: iconSize)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(provider.displayName)
+                        .font(.cadenza(14, weight: .medium, scale: uiScale))
+                    SettingsStatusCapsule(
+                        kind: isConnected ? .connected : .disconnected,
+                        label: isConnected ? "Connected" : "Not Connected"
+                    )
+                }
+                Text(
+                    isDefaultProvider
+                        ? String(localized: "\(provider.subtitle) · Default")
+                        : provider.subtitle
+                )
+                .font(.cadenza(12, scale: uiScale))
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var rowAction: some View {
+        if isConnected {
+            Button("Disconnect", role: .destructive) {
+                disconnect()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        } else {
+            Button("Connect") {
+                guard appState.startupPolicy.externalAccessEnabled else { return }
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                    isExpanded = true
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(!appState.startupPolicy.externalAccessEnabled)
+        }
+    }
+
+    private var isDefaultProvider: Bool {
+        UserDefaults.standard.string(forKey: "defaultAIProvider") == provider.rawValue
+    }
+
     @ViewBuilder
     private func apiKeyPill(_ key: String) -> some View {
-        let masked = maskedKey(key)
         HStack(spacing: 6) {
-            Text(masked)
-                .font(.cadenza(12, design: .monospaced, scale: uiScale))
+            Text(showFullKey ? key : maskedKey(key))
+                .font(.cadenza(11, design: .monospaced, scale: uiScale))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: showFullKey ? 240 : nil)
+
+            Button {
+                showFullKey.toggle()
+            } label: {
+                Image(systemName: showFullKey ? "eye.slash" : "eye")
+                    .font(.cadenza(10, scale: uiScale))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.cadenzaPlain)
+            .accessibilityLabel(Text(showFullKey ? "Hide API key" : "Show API key"))
+            .help(showFullKey ? "Hide API key" : "Show API key")
 
             Button {
                 NSPasteboard.general.clearContents()
@@ -1014,9 +1177,9 @@ private struct ProviderRow: View {
             .help("Copy API key")
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: showCopied)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(.quaternary.opacity(0.5), in: Capsule())
+        .padding(.horizontal, 9)
+        .frame(minHeight: 22)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 
     private func disconnect() {
@@ -1045,10 +1208,8 @@ private struct ProviderRow: View {
     }
 
     private func maskedKey(_ key: String) -> String {
-        guard key.count > 12 else { return key }
-        let prefix = String(key.prefix(min(20, key.count - 5)))
-        let suffix = String(key.suffix(5))
-        return "\(prefix)...\(suffix)"
+        guard key.count > 5 else { return key }
+        return "\u{2022}\u{2022}\u{2022}\u{2022}" + key.suffix(5)
     }
 
 }

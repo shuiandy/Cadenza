@@ -335,10 +335,9 @@ private struct DayCell: View {
     }
 
     private var dayNumber: String {
-        LocalizedDateFormatting.string(
-            from: date,
-            style: .dateTime.day(),
-            locale: locale
-        )
+        // Bare digits only: the day() field style appends a day-unit suffix
+        // in zh/ja/ko locales that cannot fit the fixed 28pt badge.
+        Calendar.autoupdatingCurrent.component(.day, from: date)
+            .formatted(.number.grouping(.never).locale(locale))
     }
 }

@@ -99,6 +99,18 @@ final class FakeAuthHTTP: AuthHTTP {
     func enqueue(_ outcome: Outcome) { queue.append(outcome) }
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        if request.url?.path.hasSuffix("/me/mcp-prefs") == true {
+            if let override = mcpPrefsOutcome {
+                mcpPrefsOutcome = nil
+                requests.append(request)
+                switch override {
+                case .success(let data, let response): return (data, response)
+                case .failure(let error): throw error
+                }
+            }
+            let body = Data(#"{"search_index_enabled":false,"search_index_generation":0,"speaker_identity_enabled":false,"speaker_identity_generation":0,"updated_at":0}"#.utf8)
+            return (body, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
         requests.append(request)
         guard !queue.isEmpty else {
             throw URLError(.badServerResponse)
@@ -108,6 +120,9 @@ final class FakeAuthHTTP: AuthHTTP {
         case .failure(let error): throw error
         }
     }
+
+    /// Next `/me/mcp-prefs` uses this instead of the silent default-off body.
+    var mcpPrefsOutcome: Outcome?
 }
 
 /// `AuthorizationProvider` test fake.

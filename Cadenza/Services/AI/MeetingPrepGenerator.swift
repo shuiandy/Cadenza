@@ -33,7 +33,7 @@ final class MeetingPrepGenerator {
 
     /// 核心:给定已就绪的 service + context 文本,生成 markdown。经 gate 串行。
     func generate(contextText: String, service: AIServiceProtocol, model: String?) async throws -> String {
-        try await gate.run {
+        try await gate.run(provider: service.provider) {
             var full = ""
             let stream = service.streamChat(
                 systemPrompt: Self.systemPrompt, userMessage: contextText, model: model)

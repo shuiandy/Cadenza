@@ -259,6 +259,7 @@ struct RecordingDetailView: View {
     @Environment(\.uiScale) private var uiScale: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.locale) private var locale
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let recordingID: UUID
     @Environment(AppState.self) private var appState
@@ -270,9 +271,32 @@ struct RecordingDetailView: View {
     /// Resolved URL currently loaded in the player — reload compares against
     /// this, not the reference, so a root migration triggers a reload.
     @State private var loadedAudioURL: URL?
+    /// Resolved once per load. Checking the file in `body` ran a `stat` on the
+    /// main thread on every playback tick.
+    @State private var playableAudioURL: URL?
+    /// Playback-derived UI state. Written by the two observers below only when
+    /// the value changes, so the page body never depends on the 4 Hz clock.
+    @State private var activeTranscriptEntryID: UUID?
+    @State private var activeChapterIndex: Int?
     @State private var selectedTab = 0
     @State private var audioPlayer = AudioPlayerService()
     @State private var detailLoadTracker = DetailLoadTracker()
+    /// Speaker segments shown on the player scrubber. Cached per detail load
+    /// (see `rebuildPlayerTimeline`) so playback ticks never rebuild it.
+    @State private var playerTimeline: SpeakerTimelineData?
+    /// Transcript rows with consecutive same-speaker segments merged into
+    /// turns. Cached per detail load: merging concatenates the full
+    /// transcript text, which must never run on 10Hz playback re-renders.
+    @State private var transcriptTurns: [TranscriptDisplayEntry] = []
+
+    // Transcript search & speaker filter (Concept C)
+    @State private var transcriptQuery = ""
+    @State private var speakerFilterKey: String?
+    @AppStorage("transcriptFollowsPlayback") private var transcriptFollowsPlayback = true
+
+    // Tag editing (metadata rail)
+    @State private var isAddingTag = false
+    @State private var newTagText = ""
 
     // Rename / Delete
     @State private var isEditingTitle = false
@@ -702,6 +726,9 @@ struct RecordingDetailView: View {
                 // the relative reference but moves the file, so comparing
                 // references alone would leave the player on the old root.
                 let resolved = dto.audioFile.flatMap { Self.resolvedAudioURL($0) }
+                playableAudioURL = resolved.flatMap {
+                    FileManager.default.fileExists(atPath: $0.path) ? $0 : nil
+                }
                 if Self.playerNeedsReload(loaded: loadedAudioURL, resolved: resolved),
                    let resolved {
                     audioPlayer.load(url: resolved)
@@ -710,6 +737,8 @@ struct RecordingDetailView: View {
                 appState.recordingDetailTitle = dto.title
                 loadLinkedEvent()
                 loadSpeakerProfiles()
+                rebuildPlayerTimeline()
+                rebuildTranscriptTurns()
 
                 // Lazily generate chapters when user views a recording with summary but no chapters
                 if dto.summary != nil && (dto.summary?.chapters.isEmpty ?? true) {
@@ -717,6 +746,9 @@ struct RecordingDetailView: View {
                 }
             } else {
                 detail = nil
+                playableAudioURL = nil
+                playerTimeline = nil
+                transcriptTurns = []
             }
         }
     }
@@ -727,150 +759,188 @@ struct RecordingDetailView: View {
 
     // MARK: - Detail Content
 
-    @State private var isPlayerScrolledOut = false
-    private let playerBottomAnchor: CGFloat = 120
+    /// Measured width of the detail panel; drives which side rails fit.
+    @State private var detailContentWidth: CGFloat = 0
 
+    /// The chapter rail needs the summary tab, real chapters and room.
+    private func showsChapterRail(_ detail: RecordingDetailDTO) -> Bool {
+        selectedTab == 0
+            && !(detail.summary?.chapters.isEmpty ?? true)
+            && detailContentWidth >= 940
+            && !CadenzaTextScale.isAccessibilitySize(dynamicTypeSize)
+    }
+
+    /// Metadata rail (linked meeting, participants, action items, tags).
+    /// Below the threshold that metadata folds back into the header.
+    private var showsRightRail: Bool {
+        detailContentWidth >= 1120
+            && !CadenzaTextScale.isAccessibilitySize(dynamicTypeSize)
+    }
+
+    /// Fixed chrome (header, player, tab row) with a columned scroll area
+    /// under it: chapter rail | content | metadata rail. The player is always
+    /// visible, which is what lets it carry the speaker band and chapter
+    /// marks for every tab; the old scroll-out sticky mini player is gone
+    /// because nothing scrolls above the fold anymore.
     @ViewBuilder
     private func detailContent(_ detail: RecordingDetailDTO) -> some View {
-        ZStack(alignment: .top) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    headerSection(detail)
-                    Divider()
+        VStack(alignment: .leading, spacing: 0) {
+            headerSection(detail, compact: showsRightRail)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 10)
 
-                    if let audioFile = detail.audioFile {
-                        if let url = Self.resolvedAudioURL(audioFile),
-                           FileManager.default.fileExists(atPath: url.path) {
-                            audioPlayerSection
+            if let audioFile = detail.audioFile {
+                Group {
+                    if playableAudioURL != nil {
+                        VStack(alignment: .leading, spacing: 4) {
+                            audioPlayerSection(detail)
                             // A playable legacyAbsolute row is still an
                             // un-converged M1 residue; the repair stays
                             // available without an alarming warning.
                             if audioFile.isLegacy {
                                 legacyRelinkSection(audioFile, style: .residualLocation)
                             }
-                        } else {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "exclamationmark.triangle")
-                                        .foregroundStyle(.secondary)
-                                    Text("Audio file unavailable — it may have been removed to free storage.")
-                                        .font(.cadenza(.caption, scale: uiScale))
-                                        .foregroundStyle(.secondary)
-                                }
-                                if audioFile.isLegacy {
-                                    legacyRelinkSection(audioFile, style: .missingFile)
-                                }
-                            }
-                            .padding(.vertical, 8)
                         }
-                        Divider()
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .foregroundStyle(.secondary)
+                                Text("Audio file unavailable — it may have been removed to free storage.")
+                                    .font(.cadenza(.caption, scale: uiScale))
+                                    .foregroundStyle(.secondary)
+                            }
+                            if audioFile.isLegacy {
+                                legacyRelinkSection(audioFile, style: .missingFile)
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+            }
 
-                    // Tab bar
-                    tabBar
-                        .padding(.bottom, 4)
+            Divider()
 
-                    // Per-tab toolbar
-                    if selectedTab == 0 {
-                        summaryToolbar(detail)
-                    } else if selectedTab == 2 {
-                        transcriptToolbar(detail)
-                    }
+            tabRow(detail)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 4)
 
-                    if selectedTab != 1 {
-                        Divider()
-                    }
+            Divider()
 
-                    // Content
+            HStack(alignment: .top, spacing: 0) {
+                if showsChapterRail(detail) {
+                    chapterRail(detail)
+                        .frame(width: 200)
+                    Divider()
+                }
+
+                ScrollView {
                     Group {
                         switch selectedTab {
-                        case 0: summaryContent(detail)
-                        case 1: actionItemsContent(detail)
+                        case 0:
+                            // Cap the reading measure only when there is
+                            // something to read: at full panel width the
+                            // summary ran ~1000pt lines, but empty and
+                            // in-progress states should center in the column
+                            // instead of hugging a leading 720pt cage.
+                            if detail.summary != nil
+                                || appState.quickSummaryResult(for: recordingID) != nil {
+                                summaryContent(detail)
+                                    .frame(maxWidth: 720, alignment: .leading)
+                            } else {
+                                summaryContent(detail)
+                                    .frame(maxWidth: .infinity, minHeight: 420)
+                            }
+                        case 1:
+                            if detail.summary?.actionItems.isEmpty == false {
+                                actionItemsContent(detail)
+                                    .frame(maxWidth: 720, alignment: .leading)
+                            } else {
+                                actionItemsContent(detail)
+                                    .frame(maxWidth: .infinity, minHeight: 420)
+                            }
                         case 2: transcriptContent(detail)
                         default: EmptyView()
                         }
                     }
                     .transition(reduceMotion ? .identity : .opacity)
+                    .padding(20)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .padding(20)
-                .frame(maxWidth: .infinity, alignment: .top)
-            }
-            .onScrollGeometryChange(for: Bool.self) { geo in
-                geo.contentOffset.y > playerBottomAnchor + 20
-            } action: { _, scrolledOut in
-                isPlayerScrolledOut = scrolledOut
-            }
-            // Commit inline title editing when tapping empty space: on macOS clicking a
-            // non-interactive area does not resign first responder on its own, so the field
-            // would stay in edit mode. Child views still receive their own taps first.
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard isEditingTitle else { return }
-                commitRename()
-                NSApp.keyWindow?.makeFirstResponder(nil)
-            }
+                // Commit inline title editing when tapping empty space: on macOS clicking a
+                // non-interactive area does not resign first responder on its own, so the field
+                // would stay in edit mode. Child views still receive their own taps first.
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard isEditingTitle else { return }
+                    commitRename()
+                    NSApp.keyWindow?.makeFirstResponder(nil)
+                }
 
-            // Sticky compact player
-            if detail.audioFile != nil && isPlayerScrolledOut {
-                compactPlayerBar
-                    .transition(reduceMotion ? .identity : .move(edge: .top).combined(with: .opacity))
-                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: isPlayerScrolledOut)
+                if showsRightRail {
+                    Divider()
+                    rightRail(detail)
+                        .frame(width: 236)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { width in
+            detailContentWidth = width
+        }
     }
 
+    // MARK: - Tab Row
+
+    /// One row: the tab cluster leads, the active tab's actions trail. The
+    /// old layout spent a full row on tabs and another on the toolbar; the
+    /// toolbar-layout wrapper still reflows everything at narrow widths and
+    /// accessibility sizes.
     @ViewBuilder
-    private var compactPlayerBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                audioPlayer.toggle()
-            } label: {
-                Image(systemName: audioPlayer.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.cadenza(14, weight: .semibold, scale: uiScale))
+    private func tabRow(_ detail: RecordingDetailDTO) -> some View {
+        RecordingDetailToolbarLayout {
+            RecordingDetailTabBarLayout {
+                tabButton("Summary", icon: "sparkles", index: 0)
+                tabButton("Action Items", icon: "checklist", index: 1, badge: openActionItemCount(detail))
+                tabButton("Transcript", icon: "text.bubble", index: 2)
             }
-            .buttonStyle(.cadenzaPlain)
-
-            Text(formatTime(audioPlayer.currentTime))
-                .font(.cadenza(13, design: .monospaced, scale: uiScale))
-                .fixedSize()
-
-            Slider(
-                value: Binding(
-                    get: { audioPlayer.currentTime },
-                    set: { audioPlayer.seek(to: $0) }
-                ),
-                in: 0...max(audioPlayer.duration, 0.01)
-            )
-            .controlSize(.small)
-
-            Text(formatTime(audioPlayer.duration))
-                .font(.cadenza(13, design: .monospaced, scale: uiScale))
-                .fixedSize()
-                .foregroundStyle(.secondary)
-
-            PlaybackRateMenuView(player: audioPlayer, fontSize: 13)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .padding(.horizontal, 12)
-        .padding(.top, 4)
-    }
-
-    // MARK: - Tab Bar
-
-    @ViewBuilder
-    private var tabBar: some View {
-        RecordingDetailTabBarLayout {
-            tabButton("Summary", icon: "sparkles", index: 0)
-            tabButton("Action Items", icon: "checklist", index: 1)
-            tabButton("Transcript", icon: "text.bubble", index: 2)
+        } actions: {
+            if selectedTab == 0 {
+                if !showsChapterRail(detail), let chapters = detail.summary?.chapters, !chapters.isEmpty {
+                    Menu {
+                        ForEach(Array(chapters.enumerated()), id: \.offset) { _, chapter in
+                            Button {
+                                audioPlayer.seek(to: chapter.startSeconds)
+                                if !audioPlayer.isPlaying {
+                                    audioPlayer.play()
+                                }
+                            } label: {
+                                Text(verbatim: "\(formatTime(chapter.startSeconds))  \(chapter.title)")
+                            }
+                        }
+                    } label: {
+                        Label("Chapters", systemImage: "list.bullet")
+                    }
+                    .fixedSize()
+                }
+                summaryToolbarControls(detail)
+            } else if selectedTab == 2 {
+                transcriptToolbarControls(detail)
+            }
         }
     }
 
-    private func tabButton(_ title: LocalizedStringKey, icon: String, index: Int) -> some View {
+    private func openActionItemCount(_ detail: RecordingDetailDTO) -> Int {
+        (detail.summary?.actionItems ?? []).count { !$0.isCompleted }
+    }
+
+    private func tabButton(_ title: LocalizedStringKey, icon: String, index: Int, badge: Int = 0) -> some View {
         Button {
             withAnimation(reduceMotion ? nil : .spring(duration: 0.25, bounce: 0.15)) {
                 selectedTab = index
@@ -882,10 +952,18 @@ struct RecordingDetailView: View {
                         .font(.cadenza(13, scale: uiScale))
                     Text(title)
                         .font(.cadenza(13, weight: .medium, scale: uiScale))
+                    if badge > 0 {
+                        Text(verbatim: "\(badge)")
+                            .font(.cadenza(13 - 4, weight: .bold, scale: uiScale))
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                    }
                 }
                 .padding(.vertical, 7)
-                .frame(maxWidth: .infinity)
-                .foregroundStyle(selectedTab == index ? .primary : .secondary)
+                .padding(.horizontal, 10)
+                .foregroundStyle(selectedTab == index ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
                 .contentShape(Rectangle())
 
                 RoundedRectangle(cornerRadius: 1)
@@ -893,15 +971,272 @@ struct RecordingDetailView: View {
                     .frame(height: 2)
                     .opacity(selectedTab == index ? 1 : 0)
             }
+            .fixedSize()
         }
         .buttonStyle(.cadenzaPlain)
     }
 
-    // MARK: - Transcript Toolbar
+    // MARK: - Chapter Rail
+
+    /// Clickable chapter navigation that follows playback. Chapter descriptions
+    /// are available on hover without repeating them in the summary body.
+    private func chapterRail(_ detail: RecordingDetailDTO) -> some View {
+        let chapters = detail.summary?.chapters ?? []
+        let activeIndex = activeChapterIndex
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                PlaybackChapterObserver(
+                    player: audioPlayer, chapters: chapters, activeIndex: $activeChapterIndex
+                )
+                Text("Chapters")
+                    .font(.cadenza(10, weight: .bold, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+
+                ForEach(Array(chapters.enumerated()), id: \.offset) { index, chapter in
+                    let isActive = index == activeIndex
+                    Button {
+                        audioPlayer.seek(to: chapter.startSeconds)
+                        if !audioPlayer.isPlaying {
+                            audioPlayer.play()
+                        }
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(formatTime(chapter.startSeconds))
+                                .font(.cadenza(10, design: .monospaced, scale: uiScale))
+                                .foregroundStyle(isActive ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                                .fixedSize(horizontal: true, vertical: false)
+                            Text(chapter.title)
+                                .font(.cadenza(12, weight: isActive ? .semibold : .regular, scale: uiScale))
+                                .foregroundStyle(isActive ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+                                .multilineTextAlignment(.leading)
+                                .lineLimit(2)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(isActive ? Color.accentColor.opacity(0.12) : .clear)
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.cadenzaPlain)
+                    .help(chapter.summary.isEmpty ? chapter.title : chapter.summary)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    // MARK: - Metadata Rail
+
+    /// Right-hand metadata rail: linked meeting, participants, action-item
+    /// progress and tags. Everything here is a relocation, not an addition;
+    /// when the rail doesn't fit, the same controls fold back into the
+    /// header and tab contents.
+    private func rightRail(_ detail: RecordingDetailDTO) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                railCard("Linked Meeting") {
+                    calendarLinkRow(detail, stacked: true)
+                        .font(.cadenza(13 - 1, scale: uiScale))
+                }
+
+                if let speakers = playerTimeline?.speakers, !speakers.isEmpty {
+                    railCard("Participants") {
+                        ForEach(speakers.prefix(4)) { speaker in
+                            participantRow(speaker)
+                        }
+                    }
+                }
+
+                if let items = detail.summary?.actionItems, !items.isEmpty {
+                    railCard("Action Items") {
+                        actionItemsProgress(items)
+                    }
+                }
+
+                railCard("Tags") {
+                    tagsCardContent(detail)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    private func railCard<Content: View>(
+        _ title: LocalizedStringKey,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(.cadenza(10, weight: .bold, scale: uiScale))
+                .foregroundStyle(.tertiary)
+            content()
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .appCollectionCard(cornerRadius: 10)
+    }
+
+    /// Tapping a participant jumps to the transcript filtered to them.
+    private func participantRow(_ speaker: SpeakerTimelineData.SpeakerSummary) -> some View {
+        Button {
+            speakerFilterKey = speaker.speakerKey
+            withAnimation(reduceMotion ? nil : .spring(duration: 0.25, bounce: 0.15)) {
+                selectedTab = 2
+            }
+        } label: {
+            HStack(spacing: 7) {
+                speakerInitialAvatar(
+                    name: speaker.speakerName,
+                    color: speakerTimelineColor(for: speaker.colorIndex),
+                    diameter: 20
+                )
+                Text(speaker.speakerName)
+                    .font(.cadenza(13 - 1, scale: uiScale))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text(verbatim: "\(Int((speaker.fraction * 100).rounded()))%")
+                    .font(.cadenza(13 - 3, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.cadenzaPlain)
+        .help("Show only this speaker")
+    }
+
+    private func speakerInitialAvatar(name: String, color: Color, diameter: CGFloat) -> some View {
+        ZStack {
+            Circle()
+                .fill(color.opacity(0.2))
+            Text(verbatim: String(name.prefix(1)).uppercased())
+                .font(.cadenza(diameter * 0.42, weight: .bold, scale: 1))
+                .foregroundStyle(color)
+        }
+        .frame(width: diameter, height: diameter)
+        .accessibilityHidden(true)
+    }
 
     @ViewBuilder
-    private func transcriptToolbar(_ detail: RecordingDetailDTO) -> some View {
-        RecordingDetailToolbarLayout {
+    private func actionItemsProgress(_ items: [ActionItemDTO]) -> some View {
+        let doneCount = items.count(where: \.isCompleted)
+        HStack {
+            ProgressView(value: Double(doneCount), total: Double(max(items.count, 1)))
+                .controlSize(.small)
+            Text(verbatim: "\(doneCount) / \(items.count)")
+                .font(.cadenza(13 - 3, scale: uiScale))
+                .foregroundStyle(.tertiary)
+                .monospacedDigit()
+        }
+
+        ForEach(items.filter { !$0.isCompleted }.prefix(2)) { item in
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Button {
+                    appState.toggleActionItem(recordingID: recordingID, actionItemID: item.id)
+                    loadDetail()
+                } label: {
+                    Image(systemName: "circle")
+                        .font(.cadenza(13 - 2, scale: uiScale))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.cadenzaPlain)
+                Text(item.task)
+                    .font(.cadenza(13 - 2, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+
+        Button {
+            withAnimation(reduceMotion ? nil : .spring(duration: 0.25, bounce: 0.15)) {
+                selectedTab = 1
+            }
+        } label: {
+            Text("View All")
+                .font(.cadenza(13 - 2, weight: .semibold, scale: uiScale))
+                .foregroundStyle(Color.accentColor)
+        }
+        .buttonStyle(.cadenzaPlain)
+    }
+
+    @ViewBuilder
+    private func tagsCardContent(_ detail: RecordingDetailDTO) -> some View {
+        FlowLayout(spacing: 5) {
+            ForEach(detail.tags, id: \.self) { tag in
+                HStack(spacing: 3) {
+                    Circle()
+                        .fill(RecordingCardView.tagColor(for: tag))
+                        .frame(width: 5, height: 5)
+                        .padding(.trailing, 2)
+                        .accessibilityHidden(true)
+                    Text(tag)
+                    Button {
+                        appState.removeTag(recordingID: recordingID, tag: tag)
+                        self.detail?.tags.removeAll { $0 == tag }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.cadenza(7, weight: .bold, scale: uiScale))
+                    }
+                    .buttonStyle(.cadenzaPlain)
+                }
+                .font(.cadenza(13 - 2, scale: uiScale))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(.fill.tertiary, in: Capsule())
+            }
+
+            Button {
+                newTagText = ""
+                isAddingTag = true
+            } label: {
+                Image(systemName: "plus")
+                    .font(.cadenza(13 - 3, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(.fill.tertiary, in: Capsule())
+            }
+            .buttonStyle(.cadenzaPlain)
+            .help("Add Tag")
+            .popover(isPresented: $isAddingTag, arrowEdge: .bottom) {
+                HStack(spacing: 6) {
+                    TextField("Add Tag", text: $newTagText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                        .onSubmit { commitNewTag() }
+                    Button {
+                        commitNewTag()
+                    } label: {
+                        Image(systemName: "checkmark")
+                    }
+                    .disabled(newTagText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(10)
+            }
+        }
+    }
+
+    private func commitNewTag() {
+        let tag = newTagText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tag.isEmpty else { return }
+        appState.addTag(recordingID: recordingID, tag: tag)
+        newTagText = ""
+        isAddingTag = false
+    }
+
+    // MARK: - Transcript Toolbar
+
+    /// Transcript actions for the unified tab row: language, re-transcribe,
+    /// speaker identification, copy, export. Emitted as siblings so the
+    /// enclosing toolbar layout can reflow them.
+    @ViewBuilder
+    private func transcriptToolbarControls(_ detail: RecordingDetailDTO) -> some View {
             if detail.transcript != nil {
                 HStack(spacing: 4) {
                     Image(systemName: "globe")
@@ -931,7 +1266,7 @@ struct RecordingDetailView: View {
                     }
                 }
             }
-        } actions: {
+
             if detail.audioFile != nil {
                 Button {
                     appState.retryTranscription(recordingID: recordingID)
@@ -979,14 +1314,14 @@ struct RecordingDetailView: View {
             .help(copiedTab == 0 ? String(localized: "Copied") : String(localized: "Copy"))
 
             exportMenu
-        }
     }
 
     // MARK: - Summary Toolbar
 
+    /// Summary actions for the unified tab row: language, regenerate, copy,
+    /// export. Emitted as siblings so the toolbar layout can reflow them.
     @ViewBuilder
-    private func summaryToolbar(_ detail: RecordingDetailDTO) -> some View {
-        RecordingDetailToolbarLayout {
+    private func summaryToolbarControls(_ detail: RecordingDetailDTO) -> some View {
             if detail.transcript != nil {
                 HStack(spacing: 4) {
                     Image(systemName: "globe")
@@ -1008,7 +1343,7 @@ struct RecordingDetailView: View {
                     }
                 }
             }
-        } actions: {
+
             if detail.transcript != nil {
                 Button {
                     regenerateSummary(language: summaryLanguage)
@@ -1042,7 +1377,6 @@ struct RecordingDetailView: View {
             .help(copiedTab == 1 ? String(localized: "Copied") : String(localized: "Copy"))
 
             exportMenu
-        }
     }
 
     // MARK: - Export Menu
@@ -1102,9 +1436,12 @@ struct RecordingDetailView: View {
             .disabled(detail?.audioFile == nil)
         } label: {
             Label("Export", systemImage: "square.and.arrow.up")
-                .font(.cadenza(13, scale: uiScale))
         }
-        .menuStyle(.borderlessButton)
+        // Bordered like its Regenerate/Copy neighbours in the tab row —
+        // the borderless variant floated bare next to bordered buttons.
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         .fixedSize()
         .help(String(localized: "Export"))
     }
@@ -1230,7 +1567,9 @@ struct RecordingDetailView: View {
     // MARK: - Header
 
     @ViewBuilder
-    private func headerSection(_ detail: RecordingDetailDTO) -> some View {
+    /// `compact` hides tags and the calendar link: with the metadata rail
+    /// visible they live there instead, and the header stays two lines.
+    private func headerSection(_ detail: RecordingDetailDTO, compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 if isEditingTitle {
@@ -1278,10 +1617,15 @@ struct RecordingDetailView: View {
             }
 
             // Tags
-            if !detail.tags.isEmpty {
+            if !compact, !detail.tags.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(detail.tags, id: \.self) { tag in
                         HStack(spacing: 3) {
+                            Circle()
+                                .fill(RecordingCardView.tagColor(for: tag))
+                                .frame(width: 5, height: 5)
+                                .padding(.trailing, 2)
+                                .accessibilityHidden(true)
                             Text(tag)
                             Button {
                                 appState.removeTag(recordingID: recordingID, tag: tag)
@@ -1329,7 +1673,9 @@ struct RecordingDetailView: View {
                     }
                 }
 
-                calendarLinkRow(detail)
+                if !compact {
+                    calendarLinkRow(detail)
+                }
             }
             .font(.cadenza(13, scale: uiScale))
             .foregroundStyle(.secondary)
@@ -1343,30 +1689,63 @@ struct RecordingDetailView: View {
     /// or offset (its label reports `minX == 0` in global coordinates). Matching the date
     /// row's `Button` + `HStack` structure is what keeps the two calendar icons aligned.
     @ViewBuilder
-    private func calendarLinkRow(_ detail: RecordingDetailDTO) -> some View {
+    private func calendarLinkRow(_ detail: RecordingDetailDTO, stacked: Bool = false) -> some View {
         Button {
             isPickingCalendarEvent = true
         } label: {
-            HStack(spacing: 5) {
-                // Same glyph as the date row: `calendar.badge.checkmark` has a wider and
-                // taller bounding box, which no amount of padding can bring back into line.
-                // The linked state is carried by the tint colour instead.
-                Image(systemName: "calendar")
-                    .foregroundStyle(linkedEvent != nil ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                if let event = linkedEvent {
-                    Text(event.title)
-                        .lineLimit(1)
-                    Text(eventTimeString(event))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Link Meeting")
-                        .foregroundStyle(.secondary)
+            if stacked {
+                // Rail variant: the 236pt column cannot fit title and time side
+                // by side, so the title keeps up to two full lines and the time
+                // drops underneath (concept B's card anatomy).
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "calendar")
+                        .foregroundStyle(linkedEvent != nil ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                        .padding(.top, 1)
+                    if let event = linkedEvent {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(event.title)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(eventTimeString(event))
+                                .font(.cadenza(12, scale: uiScale))
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text("Link Meeting")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.down")
+                        .font(.cadenza(13 - 4, scale: uiScale))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 3)
                 }
-                Image(systemName: "chevron.down")
-                    .font(.cadenza(13 - 4, scale: uiScale))
-                    .foregroundStyle(.tertiary)
+                .font(.cadenza(13, scale: uiScale))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            } else {
+                HStack(spacing: 5) {
+                    // Same glyph as the date row: `calendar.badge.checkmark` has a wider and
+                    // taller bounding box, which no amount of padding can bring back into line.
+                    // The linked state is carried by the tint colour instead.
+                    Image(systemName: "calendar")
+                        .foregroundStyle(linkedEvent != nil ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    if let event = linkedEvent {
+                        Text(event.title)
+                            .lineLimit(1)
+                        Text(eventTimeString(event))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Link Meeting")
+                            .foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.down")
+                        .font(.cadenza(13 - 4, scale: uiScale))
+                        .foregroundStyle(.tertiary)
+                }
+                .font(.cadenza(13, scale: uiScale))
             }
-            .font(.cadenza(13, scale: uiScale))
         }
         .buttonStyle(.cadenzaPlain)
         .popover(isPresented: $isPickingCalendarEvent, arrowEdge: .bottom) {
@@ -1394,7 +1773,7 @@ struct RecordingDetailView: View {
                     ForEach(candidateEvents) { event in
                         let isLinked = detail?.linkedCalendarEventID == event.id
                         Button {
-                            appState.linkCalendarEvent(recordingID: recordingID, calendarEventID: event.id)
+                            appState.linkCalendarEvent(recordingID: recordingID, event: event)
                             detail?.linkedCalendarEventID = event.id
                             linkedEvent = event
                             isPickingCalendarEvent = false
@@ -1576,41 +1955,471 @@ struct RecordingDetailView: View {
     // MARK: - Audio Player
 
     @ViewBuilder
-    private var audioPlayerSection: some View {
-        HStack(spacing: 12) {
-            Button {
-                audioPlayer.toggle()
-            } label: {
-                Image(systemName: audioPlayer.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                    .font(.cadenza(.title, scale: uiScale))
-            }
-            .buttonStyle(.cadenzaPlain)
-
-            Text(formatTime(audioPlayer.currentTime))
-                .font(.cadenza(13, design: .monospaced, scale: uiScale))
-                .fixedSize()
-                .frame(minWidth: 40, alignment: .trailing)
-
-            Slider(
-                value: Binding(
-                    get: { audioPlayer.currentTime },
-                    set: { audioPlayer.seek(to: $0) }
-                ),
-                in: 0...max(audioPlayer.duration, 0.01)
-            )
-
-            Text(formatTime(audioPlayer.duration))
-                .font(.cadenza(13, design: .monospaced, scale: uiScale))
-                .fixedSize()
-                .frame(minWidth: 40, alignment: .leading)
-
-            playbackRateMenu
-        }
-        .padding(.vertical, 4)
+    /// Speaker-annotated scrubber (Concept B): the play bar carries who is
+    /// speaking, the chapter marks and the playhead, so the timeline reads
+    /// the same from every tab instead of living inside the transcript.
+    private func audioPlayerSection(_ detail: RecordingDetailDTO) -> some View {
+        // The only view on the page that reads the playback clock directly.
+        PlaybackControlsBar(
+            player: audioPlayer,
+            segments: playerTimeline?.segments ?? [],
+            chapters: detail.summary?.chapters ?? [],
+            formatTime: formatTime
+        )
     }
 
-    private var playbackRateMenu: some View {
-        PlaybackRateMenuView(player: audioPlayer, fontSize: 13)
+    /// Play/pause, the two time labels, the scrubber and the rate menu. Kept
+    /// in its own struct so the 4 Hz `currentTime` write re-evaluates this
+    /// small body instead of the whole detail page (which used to re-run the
+    /// transcript filter, the speaker map and a file `stat` on every tick).
+    private struct PlaybackControlsBar: View {
+        @Environment(\.uiScale) private var uiScale: CGFloat
+        let player: AudioPlayerService
+        let segments: [SpeakerTimelineData.Segment]
+        let chapters: [ChapterDTO]
+        let formatTime: (TimeInterval) -> String
+
+        var body: some View {
+            HStack(spacing: 12) {
+                Button {
+                    player.toggle()
+                } label: {
+                    Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.cadenza(.title, scale: uiScale))
+                }
+                .buttonStyle(.cadenzaPlain)
+
+                Text(formatTime(player.currentTime))
+                    .font(.cadenza(13, design: .monospaced, scale: uiScale))
+                    .fixedSize()
+                    .frame(minWidth: 40, alignment: .trailing)
+
+                SpeakerAnnotatedScrubber(
+                    duration: max(player.duration, 0.01),
+                    currentTime: player.currentTime,
+                    segments: segments,
+                    chapters: chapters,
+                    formatTime: formatTime,
+                    onSeek: { player.seek(to: $0) }
+                )
+
+                Text(formatTime(player.duration))
+                    .font(.cadenza(13, design: .monospaced, scale: uiScale))
+                    .fixedSize()
+                    .frame(minWidth: 40, alignment: .leading)
+
+                PlaybackRateMenuView(player: player, fontSize: 13)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    /// Zero-size view that turns the playback clock into "which transcript
+    /// row is active", writing the parent's state only on change. Rows compare
+    /// against that id instead of reading `currentTime` themselves.
+    private struct PlaybackEntryObserver: View {
+        let player: AudioPlayerService
+        let entries: [TranscriptDisplayEntry]
+        @Binding var activeID: UUID?
+
+        private var currentActiveID: UUID? {
+            guard player.isPlaying else { return nil }
+            let t = player.currentTime
+            return entries.first(where: { t >= $0.startTime && t < $0.endTime })?.id
+        }
+
+        var body: some View {
+            Color.clear
+                .frame(width: 0, height: 0)
+                .onChange(of: currentActiveID, initial: true) { _, newID in
+                    if activeID != newID { activeID = newID }
+                }
+        }
+    }
+
+    /// Same idea for the chapter rail: the chapter containing the playhead,
+    /// paused or not, published only when it changes.
+    private struct PlaybackChapterObserver: View {
+        let player: AudioPlayerService
+        let chapters: [ChapterDTO]
+        @Binding var activeIndex: Int?
+
+        private var currentActiveIndex: Int? {
+            guard !chapters.isEmpty else { return nil }
+            let t = player.currentTime
+            var active = 0
+            for (index, chapter) in chapters.enumerated() where chapter.startSeconds <= t {
+                active = index
+            }
+            return active
+        }
+
+        var body: some View {
+            Color.clear
+                .frame(width: 0, height: 0)
+                .onChange(of: currentActiveIndex, initial: true) { _, newIndex in
+                    if activeIndex != newIndex { activeIndex = newIndex }
+                }
+        }
+    }
+
+    /// Merges consecutive segments of the same speaker into one turn, so the
+    /// transcript scans as a conversation instead of a run of fragments.
+    /// Speakerless entries stay untouched: those come from the plain-text
+    /// chunker, whose splits exist purely for readability.
+    private func rebuildTranscriptTurns() {
+        guard let detail, let transcript = detail.transcript else {
+            transcriptTurns = []
+            return
+        }
+        let entries = displayTranscriptEntries(for: transcript, duration: detail.duration)
+        var turns: [TranscriptDisplayEntry] = []
+        turns.reserveCapacity(entries.count)
+        for entry in entries {
+            // The ~120s/~800-char cap keeps a long same-speaker stretch from
+            // rendering as one wall of text; the stored segments underneath
+            // are already capped at 30s/500 chars by the diarizer merge.
+            guard let speaker = entry.speaker?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !speaker.isEmpty,
+                  let last = turns.last,
+                  let lastSpeaker = last.speaker,
+                  transcriptTurnKey(lastSpeaker) == transcriptTurnKey(speaker),
+                  entry.endTime - last.startTime <= 120,
+                  last.text.count <= 800
+            else {
+                turns.append(entry)
+                continue
+            }
+            turns[turns.count - 1] = TranscriptDisplayEntry(
+                id: last.id,
+                startTime: last.startTime,
+                endTime: max(last.endTime, entry.endTime),
+                text: "\(last.text) \(entry.text)",
+                speaker: last.speaker,
+                mergedCount: last.mergedCount + 1
+            )
+        }
+        transcriptTurns = turns
+    }
+
+    private func transcriptTurnKey(_ rawLabel: String) -> String {
+        speakerTimelineIdentityKey(rawLabel: rawLabel) ?? rawLabel
+    }
+
+    /// Speaker filter and in-transcript search, applied to the cached turns.
+    private func visibleTranscriptTurns() -> [TranscriptDisplayEntry] {
+        var result = transcriptTurns
+        if let speakerFilterKey {
+            result = result.filter { entry in
+                guard let speaker = entry.speaker else { return false }
+                return transcriptTurnKey(speaker) == speakerFilterKey
+            }
+        }
+        let query = transcriptQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty {
+            result = result.filter { $0.text.localizedCaseInsensitiveContains(query) }
+        }
+        return result
+    }
+
+    /// Search, speaker filter chips and the follow-playback switch on one
+    /// row. The chips double as the speaking-share legend, replacing the old
+    /// distribution card (the band itself lives on the player now).
+    private func transcriptFilterBar(_ timeline: SpeakerTimelineData) -> some View {
+        HStack(spacing: 8) {
+            transcriptSearchField
+
+            Divider()
+                .frame(height: 18)
+
+            ForEach(timeline.speakers.prefix(4)) { speaker in
+                let isFilterable = speaker.speakerKey != SpeakerTimelineBuilder.unknownSpeakerKey
+                let chip = SpeakerShareChip(
+                    speaker: speaker,
+                    color: speakerTimelineColor(for: speaker.colorIndex),
+                    percentString: "\(Int((speaker.fraction * 100).rounded()))%",
+                    isSelected: speakerFilterKey == speaker.speakerKey,
+                    isDimmed: speakerFilterKey != nil && speakerFilterKey != speaker.speakerKey
+                )
+                .fixedSize()
+
+                if isFilterable {
+                    Button {
+                        if speakerFilterKey == speaker.speakerKey {
+                            speakerFilterKey = nil
+                        } else {
+                            speakerFilterKey = speaker.speakerKey
+                        }
+                    } label: {
+                        chip
+                    }
+                    .buttonStyle(.cadenzaPlain)
+                    .help("Show only this speaker")
+                    .accessibilityValue(
+                        speakerFilterKey == speaker.speakerKey
+                            ? Text("Selected") : Text("Not selected")
+                    )
+                } else {
+                    chip
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Toggle(isOn: $transcriptFollowsPlayback) {
+                Text("Follow playback")
+                    .font(.cadenza(13 - 2, scale: uiScale))
+                    .foregroundStyle(.secondary)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .fixedSize()
+        }
+    }
+
+    private var transcriptSearchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .font(.cadenza(12, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField("Search transcript", text: $transcriptQuery)
+                .textFieldStyle(.plain)
+                .font(.cadenza(12, scale: uiScale))
+                .accessibilityLabel("Search transcript")
+            if !transcriptQuery.isEmpty {
+                Button {
+                    transcriptQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.cadenza(11, scale: uiScale))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.cadenzaPlain)
+                .accessibilityLabel("Clear")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: 280)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(AppStyle.ColorToken.softFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(AppStyle.ColorToken.stroke, lineWidth: 0.75)
+        )
+    }
+
+    /// Rebuilt only when `detail` is (re)loaded: speaker mappings and
+    /// suggestions all live on the DTO, and every mutation funnels through
+    /// `loadDetail`. Playback ticks must never rebuild the segment model.
+    private func rebuildPlayerTimeline() {
+        guard let detail, let transcript = detail.transcript else {
+            playerTimeline = nil
+            return
+        }
+        playerTimeline = SpeakerTimelineBuilder.build(
+            entries: transcript.segments,
+            recordingDuration: detail.duration,
+            displayName: { rawLabel in
+                guard let rawLabel else { return String(localized: "Unknown") }
+                return resolvedSpeakerName(rawLabel: rawLabel)
+            },
+            identityKey: { rawLabel in
+                speakerTimelineIdentityKey(rawLabel: rawLabel)
+            }
+        )
+    }
+
+    // MARK: - Speaker-Annotated Scrubber
+
+    /// Replaces the plain `Slider`: a speaker-colored band with chapter tick
+    /// marks and a draggable playhead. Drawing goes through one `Canvas` pass
+    /// so playback ticks repaint cheaply even with hundreds of segments; the
+    /// chapter tooltips are thin invisible hover targets layered above it.
+    private struct ScrubberTrackCanvas: View, Equatable {
+        let duration: TimeInterval
+        let segments: [SpeakerTimelineData.Segment]
+        let chapters: [ChapterDTO]
+
+        static func chapterFraction(_ chapter: ChapterDTO, duration: TimeInterval) -> Double? {
+            guard duration > 0, chapter.startSeconds.isFinite else { return nil }
+            let fraction = chapter.startSeconds / duration
+            guard fraction >= 0, fraction <= 1 else { return nil }
+            return fraction
+        }
+
+        var body: some View {
+            Canvas { context, size in
+                // Chapter ticks above the band (drawn before the band
+                // clip narrows the context).
+                for chapter in chapters {
+                    guard let fraction = Self.chapterFraction(chapter, duration: duration) else { continue }
+                    let tick = CGRect(x: fraction * size.width - 1, y: 0, width: 2, height: 6)
+                    context.fill(
+                        Path(roundedRect: tick, cornerRadius: 1),
+                        with: .color(Color.primary.opacity(0.35))
+                    )
+                }
+
+                let bandRect = CGRect(x: 0, y: 8, width: size.width, height: 16)
+                let bandPath = Path(roundedRect: bandRect, cornerRadius: 6)
+                context.clip(to: bandPath)
+                context.fill(bandPath, with: .color(Color.primary.opacity(0.08)))
+                for segment in segments {
+                    let rect = CGRect(
+                        x: segment.startFraction * size.width,
+                        y: 8,
+                        width: max(segment.widthFraction * size.width, 0.8),
+                        height: 16
+                    )
+                    context.fill(
+                        Path(rect),
+                        with: .color(speakerTimelineColor(for: segment.colorIndex).opacity(0.94))
+                    )
+                }
+                // Thin vertical striping gives the band its waveform
+                // texture without the cost of drawing real audio.
+                var stripeX: CGFloat = 0
+                while stripeX < size.width {
+                    context.fill(
+                        Path(CGRect(x: stripeX, y: 8, width: 2, height: 16)),
+                        with: .color(Color.black.opacity(0.2))
+                    )
+                    stripeX += 5
+                }
+            }
+        }
+    }
+
+    private struct SpeakerAnnotatedScrubber: View {
+        let duration: TimeInterval
+        let currentTime: TimeInterval
+        let segments: [SpeakerTimelineData.Segment]
+        let chapters: [ChapterDTO]
+        let formatTime: (TimeInterval) -> String
+        let onSeek: (TimeInterval) -> Void
+
+        /// Non-nil while the user is dragging; the playhead follows the drag
+        /// instead of the (still advancing) playback clock.
+        @State private var dragFraction: Double?
+        /// Chapter tick under the pointer; drives the floating title bubble.
+        @State private var hoveredChapterIndex: Int?
+        /// Measured bubble width, used to keep it inside the track's bounds.
+        @State private var hoverBubbleWidth: CGFloat = 0
+
+        private var progressFraction: Double {
+            if let dragFraction { return dragFraction }
+            guard duration > 0 else { return 0 }
+            return min(max(currentTime / duration, 0), 1)
+        }
+
+        private func chapterFraction(_ chapter: ChapterDTO) -> Double? {
+            ScrubberTrackCanvas.chapterFraction(chapter, duration: duration)
+        }
+
+        var body: some View {
+            GeometryReader { geo in
+                let width = max(geo.size.width, 1)
+                ZStack(alignment: .topLeading) {
+                    // Nothing in the track depends on the playhead, so it is
+                    // Equatable: playback ticks reuse the rasterized layer
+                    // instead of repainting hundreds of fills 4 times a second.
+                    ScrubberTrackCanvas(duration: duration, segments: segments, chapters: chapters)
+                        .equatable()
+
+                    // Playhead: white with a top knob, defined by shadow so it
+                    // reads over any segment color in both appearances.
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: .black.opacity(0.45), radius: 1.5)
+                        .offset(x: progressFraction * width - 4, y: 0)
+                        .allowsHitTesting(false)
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(Color.white)
+                        .frame(width: 2, height: 22)
+                        .shadow(color: .black.opacity(0.45), radius: 1.5)
+                        .offset(x: progressFraction * width - 1, y: 4)
+                        .allowsHitTesting(false)
+
+                    ForEach(Array(chapters.enumerated()), id: \.offset) { index, chapter in
+                        if let fraction = chapterFraction(chapter) {
+                            Color.clear
+                                .frame(width: 14, height: 30)
+                                .contentShape(Rectangle())
+                                .offset(x: fraction * width - 7, y: 0)
+                                .onHover { hovering in
+                                    if hovering {
+                                        hoveredChapterIndex = index
+                                    } else if hoveredChapterIndex == index {
+                                        hoveredChapterIndex = nil
+                                    }
+                                }
+                        }
+                    }
+
+                    // Floating chapter bubble above the hovered tick — the
+                    // instant styled affordance the delayed system tooltip
+                    // never delivered. Deliberately overflows the track's
+                    // frame; nothing above clips it.
+                    if let index = hoveredChapterIndex,
+                       chapters.indices.contains(index),
+                       let fraction = chapterFraction(chapters[index]) {
+                        Text(verbatim: "\(formatTime(chapters[index].startSeconds))  \(chapters[index].title)")
+                            .font(.cadenza(10.5, weight: .medium, scale: 1))
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(0.15), lineWidth: 0.75)
+                            )
+                            .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
+                            .fixedSize()
+                            .onGeometryChange(for: CGFloat.self) { proxy in
+                                proxy.size.width
+                            } action: { measured in
+                                hoverBubbleWidth = measured
+                            }
+                            .position(
+                                x: min(
+                                    max(fraction * width, hoverBubbleWidth / 2),
+                                    max(width - hoverBubbleWidth / 2, hoverBubbleWidth / 2)
+                                ),
+                                y: -16
+                            )
+                            .allowsHitTesting(false)
+                    }
+                }
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            dragFraction = min(max(value.location.x / width, 0), 1)
+                        }
+                        .onEnded { value in
+                            let fraction = min(max(value.location.x / width, 0), 1)
+                            dragFraction = nil
+                            onSeek(fraction * duration)
+                        }
+                )
+            }
+            .frame(height: 30)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text("Playback position"))
+            .accessibilityValue(Text(verbatim: formatTime(currentTime)))
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: onSeek(min(currentTime + 15, duration))
+                case .decrement: onSeek(max(currentTime - 15, 0))
+                @unknown default: break
+                }
+            }
+        }
     }
 
     // MARK: - Transcript Content
@@ -1633,18 +2442,10 @@ struct RecordingDetailView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if let transcript = detail.transcript, !transcript.fullText.isEmpty {
-            let displayEntries = displayTranscriptEntries(for: transcript, duration: detail.duration)
-            let timeline = SpeakerTimelineBuilder.build(
-                entries: transcript.segments,
-                recordingDuration: detail.duration,
-                displayName: { rawLabel in
-                    guard let rawLabel else { return String(localized: "Unknown") }
-                    return resolvedSpeakerName(rawLabel: rawLabel)
-                },
-                identityKey: { rawLabel in
-                    speakerTimelineIdentityKey(rawLabel: rawLabel)
-                }
-            )
+            // Turns and timeline come from the per-load caches; recomputing
+            // either here would run on every 10Hz playback re-render.
+            let displayEntries = transcriptTurns
+            let timeline = playerTimeline
             let colorBySpeakerKey = Dictionary(
                 uniqueKeysWithValues: (timeline?.speakers ?? []).map { ($0.speakerKey, $0.colorIndex) }
             )
@@ -1655,48 +2456,75 @@ struct RecordingDetailView: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
+                    // The speaker band lives on the player now; here the
+                    // speakers appear as filter chips beside the search field.
                     if let timeline {
-                        SpeakerTimelineView(data: timeline, formatTime: formatTime)
-                            .padding(.bottom, 8)
+                        transcriptFilterBar(timeline)
+                            .padding(.bottom, 4)
+                    } else {
+                        transcriptSearchField
                     }
 
-                    ScrollViewReader { proxy in
-                        LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(displayEntries) { entry in
-                                let isActive = audioPlayer.isPlaying
-                                    && audioPlayer.currentTime >= entry.startTime
-                                    && audioPlayer.currentTime < entry.endTime
-                                TranscriptSegmentRow(
-                                    entry: entry,
-                                    isActive: isActive,
-                                    fontSize: 13,
-                                    formatTime: formatTime,
-                                    speakerLabel: { speaker in
-                                        speakerLabel(
-                                            rawLabel: speaker,
-                                            isActive: isActive,
-                                            colorBySpeakerKey: colorBySpeakerKey
-                                        )
-                                    },
-                                    onTap: {
-                                        audioPlayer.seek(to: entry.startTime)
-                                        if !audioPlayer.isPlaying {
-                                            audioPlayer.play()
-                                        }
-                                    }
+                    let visibleEntries = visibleTranscriptTurns()
+                    if visibleEntries.isEmpty {
+                        ContentUnavailableView.search(text: transcriptQuery)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                    } else {
+                        ScrollViewReader { proxy in
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                PlaybackEntryObserver(
+                                    player: audioPlayer,
+                                    entries: visibleEntries,
+                                    activeID: $activeTranscriptEntryID
                                 )
-                                .id(entry.id)
+                                ForEach(visibleEntries) { entry in
+                                    let isActive = entry.id == activeTranscriptEntryID
+                                    TranscriptSegmentRow(
+                                        entry: entry,
+                                        isActive: isActive,
+                                        fontSize: 13,
+                                        // Only recordings with identified speakers mark
+                                        // unattributed rows as Unknown; plain-text chunker
+                                        // output stays unadorned.
+                                        showsUnknownSpeaker: timeline != nil,
+                                        formatTime: formatTime,
+                                        speakerTint: { speaker in
+                                            speakerColor(for: speaker, colorBySpeakerKey: colorBySpeakerKey)
+                                        },
+                                        speakerDisplayName: { speaker in
+                                            resolvedSpeakerName(rawLabel: speaker)
+                                        },
+                                        speakerLabel: { speaker in
+                                            speakerLabel(
+                                                rawLabel: speaker,
+                                                isActive: isActive,
+                                                colorBySpeakerKey: colorBySpeakerKey
+                                            )
+                                        },
+                                        onTap: {
+                                            audioPlayer.seek(to: entry.startTime)
+                                            if !audioPlayer.isPlaying {
+                                                audioPlayer.play()
+                                            }
+                                        }
+                                    )
+                                    .id(entry.id)
 
-                                if entry.id != displayEntries.last?.id {
-                                    Divider()
-                                        .padding(.leading, 56)
+                                    if entry.id != visibleEntries.last?.id {
+                                        Divider()
+                                            .padding(.leading, 56)
+                                    }
                                 }
                             }
-                        }
-                        .onChange(of: activeTranscriptEntryID(entries: displayEntries)) { _, newID in
-                            if let newID, audioPlayer.isPlaying {
-                                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) {
-                                    proxy.scrollTo(newID, anchor: .center)
+                            // Keep the reading measure bounded even in a wide
+                            // window; the timeline card above stays full width.
+                            .frame(maxWidth: 820, alignment: .leading)
+                            .onChange(of: activeTranscriptEntryID) { _, newID in
+                                if let newID, transcriptFollowsPlayback {
+                                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) {
+                                        proxy.scrollTo(newID, anchor: .center)
+                                    }
                                 }
                             }
                         }
@@ -1711,7 +2539,7 @@ struct RecordingDetailView: View {
                     description: Text("Transcript will be generated after the recording is stopped.")
                 )
             }
-            .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)
+            .frame(maxWidth: .infinity, minHeight: 420, alignment: .center)
         } else if isTranscriptionBusy {
             VStack(spacing: 12) {
                 ProgressView()
@@ -1754,7 +2582,7 @@ struct RecordingDetailView: View {
                     )
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)
+            .frame(maxWidth: .infinity, minHeight: 420, alignment: .center)
         }
     }
 
@@ -1764,6 +2592,8 @@ struct RecordingDetailView: View {
         let endTime: TimeInterval
         let text: String
         let speaker: String?
+        /// How many raw segments this turn merged (1 = unmerged).
+        var mergedCount: Int = 1
     }
 
     private struct SpeakerTimelineView: View {
@@ -1771,6 +2601,10 @@ struct RecordingDetailView: View {
 
         let data: SpeakerTimelineData
         let formatTime: (TimeInterval) -> String
+        /// When set, the matching share chip renders selected and the others
+        /// dim: the legend doubles as the transcript's speaker filter.
+        var selectedSpeakerKey: String? = nil
+        var onSelectSpeaker: ((SpeakerTimelineData.SpeakerSummary) -> Void)? = nil
 
         var body: some View {
             VStack(alignment: .leading, spacing: 12) {
@@ -1819,11 +2653,31 @@ struct RecordingDetailView: View {
                     spacing: 8
                 ) {
                     ForEach(legendSpeakers) { speaker in
-                        SpeakerShareChip(
+                        let isFilterable = onSelectSpeaker != nil
+                            && speaker.speakerKey != "__others__"
+                            && speaker.speakerKey != SpeakerTimelineBuilder.unknownSpeakerKey
+                        let chip = SpeakerShareChip(
                             speaker: speaker,
                             color: speakerTimelineColor(for: speaker.colorIndex),
-                            percentString: percentString(speaker.fraction)
+                            percentString: percentString(speaker.fraction),
+                            isSelected: selectedSpeakerKey == speaker.speakerKey,
+                            isDimmed: selectedSpeakerKey != nil && selectedSpeakerKey != speaker.speakerKey
                         )
+                        if isFilterable {
+                            Button {
+                                onSelectSpeaker?(speaker)
+                            } label: {
+                                chip
+                            }
+                            .buttonStyle(.cadenzaPlain)
+                            .help("Show only this speaker")
+                            .accessibilityValue(
+                                selectedSpeakerKey == speaker.speakerKey
+                                    ? Text("Selected") : Text("Not selected")
+                            )
+                        } else {
+                            chip
+                        }
                     }
                 }
             }
@@ -1856,36 +2710,46 @@ struct RecordingDetailView: View {
         private func percentString(_ value: Double) -> String {
             "\(Int((value * 100).rounded()))%"
         }
+    }
 
-        private struct SpeakerShareChip: View {
-            @Environment(\.uiScale) private var uiScale: CGFloat
+    /// Speaker share chip shared by the (superseded) distribution card and
+    /// the transcript filter bar. Capsule with a hue dot, per the concept;
+    /// selection styling backs the filter role.
+    private struct SpeakerShareChip: View {
+        @Environment(\.uiScale) private var uiScale: CGFloat
 
-            let speaker: SpeakerTimelineData.SpeakerSummary
-            let color: Color
-            let percentString: String
+        let speaker: SpeakerTimelineData.SpeakerSummary
+        let color: Color
+        let percentString: String
+        var isSelected: Bool = false
+        var isDimmed: Bool = false
 
-            var body: some View {
-                HStack(spacing: 7) {
-                    RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(color)
-                        .frame(width: 4, height: 18)
-                    Text(speaker.speakerName)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 6)
-                    Text(percentString)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(color)
-                }
-                .font(.cadenza(13 - 1, scale: uiScale))
-                .padding(.horizontal, 9)
-                .padding(.vertical, 6)
-                .background(color.opacity(0.13), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(color.opacity(0.26), lineWidth: 1)
-                )
+        var body: some View {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
+                Text(speaker.speakerName)
+                    .fontWeight(isSelected ? .semibold : .regular)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(percentString)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(color)
             }
+            .font(.cadenza(13 - 2, scale: uiScale))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                color.opacity(isSelected ? 0.22 : 0.13),
+                in: Capsule(style: .continuous)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(color.opacity(isSelected ? 0.7 : 0.32), lineWidth: isSelected ? 1.5 : 1)
+            )
+            .opacity(isDimmed ? 0.55 : 1)
         }
     }
 
@@ -1981,20 +2845,52 @@ struct RecordingDetailView: View {
         }
     }
 
+    /// A conversation turn: gutter timestamp, speaker avatar, then a name
+    /// line (identity menu, time range, merge count, playing badge) above
+    /// the merged body text.
     private struct TranscriptSegmentRow<SpeakerView: View>: View {
         @Environment(\.uiScale) private var uiScale: CGFloat
 
         let entry: TranscriptDisplayEntry
         let isActive: Bool
         let fontSize: Double
+        /// When the recording has identified speakers, rows the diarizer could
+        /// not attribute show an explicit Unknown chip instead of nothing.
+        let showsUnknownSpeaker: Bool
         let formatTime: (TimeInterval) -> String
+        let speakerTint: (String) -> Color
+        let speakerDisplayName: (String) -> String
         @ViewBuilder let speakerLabel: (String) -> SpeakerView
         let onTap: () -> Void
 
         @State private var isHovered = false
 
+        private var unknownSpeakerColor: Color {
+            speakerTimelineColor(for: SpeakerTimelineBuilder.unknownSpeakerColorIndex)
+        }
+
+        /// Same capsule shape as the identity chip, minus the mapping menu:
+        /// there is no identity to assign to an unattributed row.
+        private var unknownSpeakerChip: some View {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(unknownSpeakerColor)
+                    .frame(width: 7, height: 7)
+                Text("Unknown")
+                    .font(.cadenza(13 - 1, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(unknownSpeakerColor)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule()
+                    .fill(unknownSpeakerColor.opacity(0.12))
+            )
+            .fixedSize()
+        }
+
         var body: some View {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
                 // Copy button — visible on hover, placed next to timestamp
                 CopySegmentButton(text: entry.text, isRowHovered: isHovered)
 
@@ -2004,11 +2900,57 @@ struct RecordingDetailView: View {
                     .foregroundStyle(isActive ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
                     .fixedSize(horizontal: true, vertical: false)
                     .frame(minWidth: 38, alignment: .trailing)
+                    .padding(.top, 3)
+
+                if let speaker = entry.speaker {
+                    ZStack {
+                        Circle()
+                            .fill(speakerTint(speaker).opacity(0.2))
+                        Text(verbatim: String(speakerDisplayName(speaker).prefix(1)).uppercased())
+                            .font(.cadenza(11, weight: .bold, scale: uiScale))
+                            .foregroundStyle(speakerTint(speaker))
+                    }
+                    .frame(width: 26, height: 26)
+                    .accessibilityHidden(true)
+                } else if showsUnknownSpeaker {
+                    ZStack {
+                        Circle()
+                            .fill(unknownSpeakerColor.opacity(0.2))
+                        Text(verbatim: "?")
+                            .font(.cadenza(11, weight: .bold, scale: uiScale))
+                            .foregroundStyle(unknownSpeakerColor)
+                    }
+                    .frame(width: 26, height: 26)
+                    .accessibilityHidden(true)
+                }
 
                 // Speaker + text
                 VStack(alignment: .leading, spacing: 3) {
-                    if let speaker = entry.speaker {
-                        speakerLabel(speaker)
+                    if entry.speaker != nil || showsUnknownSpeaker {
+                        HStack(spacing: 8) {
+                            if let speaker = entry.speaker {
+                                speakerLabel(speaker)
+                            } else {
+                                unknownSpeakerChip
+                            }
+                            Text(verbatim: "\(formatTime(entry.startTime)) - \(formatTime(entry.endTime))")
+                                .font(.cadenza(fontSize - 3, scale: uiScale))
+                                .foregroundStyle(.tertiary)
+                                .monospacedDigit()
+                            if entry.mergedCount > 1 {
+                                Text("Merged from \(entry.mergedCount) segments")
+                                    .font(.cadenza(fontSize - 3, scale: uiScale))
+                                    .foregroundStyle(.quaternary)
+                            }
+                            if isActive {
+                                Text("Playing")
+                                    .font(.cadenza(fontSize - 4, weight: .semibold, scale: uiScale))
+                                    .foregroundStyle(Color.accentColor)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1)
+                                    .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                            }
+                        }
                     }
                     Text(entry.text)
                         .font(.cadenzaBody(13, scale: uiScale))
@@ -2027,12 +2969,6 @@ struct RecordingDetailView: View {
             .onHover { isHovered = $0 }
             .onTapGesture { onTap() }
         }
-    }
-
-    private func activeTranscriptEntryID(entries: [TranscriptDisplayEntry]) -> UUID? {
-        guard audioPlayer.isPlaying else { return nil }
-        let t = audioPlayer.currentTime
-        return entries.first(where: { t >= $0.startTime && t < $0.endTime })?.id
     }
 
     private func displayTranscriptEntries(for transcript: TranscriptDTO, duration: TimeInterval) -> [TranscriptDisplayEntry] {
@@ -2197,6 +3133,8 @@ struct RecordingDetailView: View {
 
     @ViewBuilder
     private func summaryContent(_ detail: RecordingDetailDTO) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+        SummaryContextView(detail: detail, event: linkedEvent).id(detail.id)
         if let quickResult = appState.quickSummaryResult(for: recordingID), isSummaryBusy {
             // Two-stage: quick result available, show it with enrich spinner
             VStack(alignment: .leading, spacing: 16) {
@@ -2217,26 +3155,6 @@ struct RecordingDetailView: View {
                     }
                 }
 
-                if !quickResult.actionItems.isEmpty {
-                    SummarySection(title: "Action Items", fontSize: 13) {
-                        ForEach(quickResult.actionItems, id: \.task) { item in
-                            HStack {
-                                Image(systemName: "checkmark.circle")
-                                    .foregroundStyle(.blue)
-                                VStack(alignment: .leading) {
-                                    Text(item.task)
-                                        .font(.cadenzaBody(13, scale: uiScale))
-                                    if let assignee = item.assignee {
-                                        Text(assignee)
-                                            .font(.cadenza(13, scale: uiScale))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 yourTasksSection(quickResult.yourTasks)
 
                 // Enrich spinner
@@ -2244,7 +3162,7 @@ struct RecordingDetailView: View {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Enriching decisions & follow-ups...")
+                        Text("Reviewing summary...")
                             .font(.cadenza(13 - 1, scale: uiScale))
                             .foregroundStyle(.secondary)
                     }
@@ -2266,34 +3184,9 @@ struct RecordingDetailView: View {
             .padding(.vertical, 20)
         } else if let summary = detail.summary {
             VStack(alignment: .leading, spacing: 16) {
-                if !summary.chapters.isEmpty {
-                    SummarySection(title: "Chapters", fontSize: 13) {
-                        ForEach(summary.chapters, id: \.title) { chapter in
-                            HStack(alignment: .top, spacing: 8) {
-                                Text(formatTime(chapter.startSeconds))
-                                    .font(.cadenza(13 - 2, design: .monospaced, scale: uiScale))
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: true, vertical: false)
-                                    .frame(minWidth: 50, alignment: .trailing)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(chapter.title)
-                                        .font(.cadenza(13, weight: .medium, scale: uiScale))
-                                    if !chapter.summary.isEmpty {
-                                        Text(chapter.summary)
-                                            .font(.cadenzaBody(13 - 1, scale: uiScale))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                audioPlayer.seek(to: chapter.startSeconds)
-                                if !audioPlayer.isPlaying {
-                                    audioPlayer.play()
-                                }
-                            }
-                        }
-                    }
+                if let metadata = summary.generationMetadata {
+                    Text(metadata.statusText)
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 if !summary.overview.isEmpty {
@@ -2309,26 +3202,6 @@ struct RecordingDetailView: View {
                             Label(point, systemImage: "circle.fill")
                                 .font(.cadenzaBody(13, scale: uiScale))
                                 .labelStyle(BulletLabelStyle())
-                        }
-                    }
-                }
-
-                if !summary.actionItems.isEmpty {
-                    SummarySection(title: "Action Items", fontSize: 13) {
-                        ForEach(summary.actionItems) { item in
-                            HStack {
-                                Image(systemName: "checkmark.circle")
-                                    .foregroundStyle(.blue)
-                                VStack(alignment: .leading) {
-                                    Text(item.task)
-                                        .font(.cadenzaBody(13, scale: uiScale))
-                                    if let assignee = item.assignee {
-                                        Text(assignee)
-                                            .font(.cadenza(13, scale: uiScale))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -2371,6 +3244,7 @@ struct RecordingDetailView: View {
                     : String(localized: "This recording doesn't have a summary."))
             )
             .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)
+        }
         }
     }
 
@@ -2545,6 +3419,7 @@ struct RecordingDetailView: View {
 
     private func formatSummaryForCopy(_ summary: SummaryDTO) -> String {
         var parts: [String] = []
+        if let metadata = summary.generationMetadata { parts.append(metadata.exportStatusText) }
 
         if !summary.overview.isEmpty {
             parts.append("## Overview\n\(summary.overview)")

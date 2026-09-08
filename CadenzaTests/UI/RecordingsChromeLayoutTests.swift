@@ -317,7 +317,6 @@ struct RecordingsChromeLayoutTests {
 
         #expect(detail.components(separatedBy: ".frame(minHeight: 32)").count - 1 >= 2)
         #expect(detail.contains(".frame(minWidth: 38, alignment: .trailing)"))
-        #expect(detail.contains(".frame(minWidth: 50, alignment: .trailing)"))
         #expect(!detail.contains(".frame(width: 38, alignment: .trailing)"))
         #expect(detail.contains("RecordingDetailTabBarLayout {"))
 
@@ -941,6 +940,63 @@ struct RecordingsChromeLayoutTests {
         )
         #expect(detail.contains("let controlSize = CadenzaControlMetrics.squareIconFrame("))
         #expect(!detail.contains(".frame(width: 22, height: 22)"))
+    }
+
+    @Test func libraryRootDoesNotObserveTheCalendarMirror() throws {
+        // `appState.upcomingMeetings` is rewritten by a 5 s timer. Only the
+        // isolated strip may read it; a read from the library root re-runs
+        // the whole grid on every tick.
+        let source = try recordingsSource("RecordingsContentView.swift")
+        let stripStart = try #require(source.range(of: "// MARK: - Today Strip"))
+        let rootPortion = source[..<stripStart.lowerBound]
+        #expect(
+            !rootPortion.contains("upcomingMeetings"),
+            "RecordingsContentView must not read the calendar mirror outside TodayMeetingStrip."
+        )
+        #expect(source.contains("TimelineView(MeetingBoundarySchedule("))
+    }
+
+    @Test func cardContextMenuResolvesSelectionLazilyAndIsolatesServiceReads() throws {
+        let source = try recordingsSource("RecordingsContentView.swift")
+        let menuStart = try #require(source.range(of: "// MARK: - Export Submenu"))
+        let root = source[..<menuStart.lowerBound]
+        // The multi-selection filter is O(recordings) and used to run for every
+        // visible card on every library body pass.
+        #expect(!root.contains("let affectedRecordings = affectsMultiple"))
+        #expect(root.contains("let affected: () -> [RecordingDTO] = {"))
+        // Per-file export progress must not be a dependency of the card builder.
+        #expect(!root.contains("batchFileExporter.isBusy"))
+        #expect(!root.contains("appState.notionConnected"))
+        #expect(root.contains("RecordingExportMenu("))
+    }
+
+    @Test func detailPageBodyDoesNotReadThePlaybackClock() throws {
+        // AudioPlayerService writes currentTime 4 times a second. Only the
+        // controls bar and the two zero-size observers may read it; a read in
+        // the page body re-runs the transcript filter, the speaker map and a
+        // file stat on every tick.
+        let detail = try recordingsSource("RecordingDetailView.swift")
+        #expect(!detail.contains("audioPlayer.currentTime"))
+        #expect(detail.contains("private struct PlaybackControlsBar: View"))
+        #expect(detail.contains("PlaybackEntryObserver("))
+        #expect(detail.contains("PlaybackChapterObserver("))
+        #expect(detail.contains("ScrubberTrackCanvas(duration: duration, segments: segments, chapters: chapters)\n                        .equatable()"))
+        #expect(!detail.contains("FileManager.default.fileExists(atPath: url.path) {"))
+    }
+
+    @Test func libraryDerivationsAreMemoizedOutsideViewBodies() throws {
+        let tab = try source("Cadenza/Views/TabBar/TabContentView.swift")
+        // Histograms and the library sort used to be rebuilt in body on every
+        // keystroke; they now come from AppState's token-keyed memo.
+        #expect(!tab.contains("for recording in appState.recordings"))
+        #expect(tab.contains("appState.sortedLibraryRecordings(sortKey: recordingsSort)"))
+        #expect(tab.contains("appState.libraryTopSpeakers(limit: 3)"))
+        #expect(tab.contains("appState.libraryTagsByFrequency"))
+        #expect(!tab.contains("localizedCaseInsensitiveCompare"), "Sorting lives in RecordingSorting, not in the view.")
+
+        let library = try recordingsSource("RecordingsContentView.swift")
+        #expect(library.contains("dayGroupCache.input == recordings"))
+        #expect(library.contains(".onChange(of: recordings, initial: true)"))
     }
 
     @Test func recordingsCollectionAvoidsEagerWaterfallLayoutAtEveryCount() throws {

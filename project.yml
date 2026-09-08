@@ -21,6 +21,14 @@ configs:
   Test Debug: debug
   Release: release
 
+# Signing identity comes from an untracked local file so no personal team ID
+# is committed. See Signing.xcconfig for why an unsigned Debug build breaks
+# TCC grants and keychain ACLs.
+configFiles:
+  Debug: Signing.xcconfig
+  Test Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+
 packages:
   KeychainAccess:
     url: https://github.com/kishikawakatsumi/KeychainAccess.git
@@ -46,6 +54,11 @@ targets:
       - package: WhisperKit
       - package: WhisperKit
         product: SpeakerKit
+      - target: CadenzaMCP
+        embed: true
+        codeSign: true
+        copy:
+          destination: executables
     settings:
       base:
         PRODUCT_NAME: Cadenza
@@ -53,8 +66,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.shuiandy.Cadenza
         APP_BUNDLE_NAME: Cadenza
         APP_BUNDLE_DISPLAY_NAME: Cadenza
-        MARKETING_VERSION: "1.1.0"
-        CURRENT_PROJECT_VERSION: 2
+        MARKETING_VERSION: "1.2.0"
+        CURRENT_PROJECT_VERSION: 3
         SWIFT_VERSION: "6.0"
         SWIFT_EMIT_LOC_STRINGS: YES
         SWIFT_OBJC_BRIDGING_HEADER: Cadenza/BridgingHeader.h
@@ -75,8 +88,8 @@ targets:
       properties:
         CFBundleName: $(APP_BUNDLE_NAME)
         CFBundleDisplayName: $(APP_BUNDLE_DISPLAY_NAME)
-        CFBundleShortVersionString: "1.1.0"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.2.0"
+        CFBundleVersion: "3"
         LSMinimumSystemVersion: "26.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSAudioCaptureUsageDescription: "Cadenza captures system audio from meeting apps to create recordings, transcripts, and summaries."
@@ -95,6 +108,24 @@ targets:
         com.apple.security.app-sandbox: false
         com.apple.security.device.audio-input: true
         com.apple.security.personal-information.calendars: true
+
+  CadenzaMCP:
+    type: tool
+    platform: macOS
+    sources:
+      - path: CadenzaMCP
+      - path: Cadenza/Services/MCP/MCPModels.swift
+      - path: Cadenza/Services/MCP/MCPBridgeRuntime.swift
+      - path: Cadenza/Services/MCP/MCPBridgeCLI.swift
+    settings:
+      base:
+        PRODUCT_NAME: cadenza-mcp
+        PRODUCT_MODULE_NAME: CadenzaMCP
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        ENABLE_HARDENED_RUNTIME: true
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: true
 
   CadenzaTests:
     type: bundle.unit-test

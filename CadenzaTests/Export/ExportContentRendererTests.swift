@@ -9,6 +9,13 @@ struct ExportContentRendererTests {
     private let fixedDate = Date(timeIntervalSince1970: 1_785_628_800)
     private let fixedID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
 
+    @Test func summaryStatusIsLabeledAsMetadata() {
+        var metadata = SummaryGenerationMetadata(detailLevel: "detailed", stage: .reviewed)
+        metadata.speakerMappingsChanged = true
+        #expect(metadata.exportStatusText.contains(metadata.statusText))
+        #expect(metadata.exportStatusText != metadata.statusText)
+    }
+
     // MARK: - Fixtures
 
     private func makeEntry(

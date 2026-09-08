@@ -46,9 +46,15 @@ struct EnumTests {
     }
 
     @Test func geminiDefaultsUseCurrentStableModel() {
-        #expect(AIProvider.gemini.defaultModel == "gemini-3.5-flash")
-        #expect(AIProvider.gemini.defaultChatModel == "gemini-3.5-flash")
-        #expect(AIProvider.gemini.defaultTranscriptionModel == "gemini-3.5-flash")
+        #expect(AIProvider.gemini.defaultModel == "gemini-3.7-flash")
+        #expect(AIProvider.gemini.defaultChatModel == "gemini-3.7-flash")
+        // Transcription no longer borrows the flash model: it runs on the
+        // dedicated ASR, which also decides that the batch path speaks the
+        // Interactions API rather than generateContent.
+        #expect(AIProvider.gemini.defaultTranscriptionModel == "gemini-3.5-transcribe")
+        #expect(GeminiTranscribeInteraction.isTranscribeModel(AIProvider.gemini.defaultTranscriptionModel))
+        #expect(GeminiTranscribeInteraction.isTranscribeModel(AIProvider.gemini.defaultRealtimeModel))
+        #expect(GeminiTranscribeInteraction.isTranscribeModel(AIProvider.gemini.defaultModel) == false)
     }
 
     @Test func aiProviderIconName() {
@@ -172,9 +178,23 @@ struct EnumTests {
     // MARK: - SummaryDetailLevel
 
     @Test func summaryDetailLevelDisplayName() {
-        #expect(SummaryDetailLevel.highlights.displayName == "Highlights Only")
-        #expect(SummaryDetailLevel.detailed.displayName == "Detailed")
-        #expect(SummaryDetailLevel.fullBreakdown.displayName == "Full Breakdown")
+        #expect(SummaryDetailLevel.highlights.displayName == "Brief")
+        #expect(SummaryDetailLevel.detailed.displayName == "Standard")
+        #expect(SummaryDetailLevel.fullBreakdown.displayName == "Detailed")
+    }
+
+    @Test func summaryDetailLevelPreservesSavedValuesAndStandardFallback() throws {
+        let suite = "SummaryDetailLevelTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        #expect(SummaryDetailLevel.load(defaults: defaults) == .detailed)
+        for (raw, expected) in [("highlights", SummaryDetailLevel.highlights),
+                                ("detailed", .detailed), ("fullBreakdown", .fullBreakdown)] {
+            defaults.set(raw, forKey: SummaryDetailLevel.defaultsKey)
+            #expect(SummaryDetailLevel.load(defaults: defaults) == expected)
+        }
+        defaults.set("unknown-future-level", forKey: SummaryDetailLevel.defaultsKey)
+        #expect(SummaryDetailLevel.load(defaults: defaults) == .detailed)
     }
 
     // MARK: - AppTheme

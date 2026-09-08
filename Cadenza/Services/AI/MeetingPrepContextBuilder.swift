@@ -106,6 +106,14 @@ enum MeetingPrepContextBuilder {
         Set(s.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
     }
 
+    /// Personal summaries require explicit selection rather than title/speaker inference.
+    /// Both context products keep their scoping at this shared boundary; the stricter
+    /// selection never broadens the existing MCP meeting-context permission.
+    static func confirmedHistory(store: RecordingsStore, ids: [UUID], currentID: UUID, before: Date) async -> [RecordingDetailDTO] {
+        guard case .history(let rows) = await retrieve(.confirmed(ids: ids, currentID: currentID, before: before), store: store) else { return [] }
+        return rows
+    }
+
     // MARK: - Assembly (shared by scheduler + MCP)
 
     /// 装配一场会的完整 prep context(事件头 + scoped 历史)。内置 scheduler 与 MCP
@@ -121,21 +129,35 @@ enum MeetingPrepContextBuilder {
     ///   往届同名会议若还没做说话人识别(逐字稿仍是 `Speaker 1`)、或刚被重新转录清空
     ///   映射,就会整场丢失 —— 标题候选必须走一条不带 speaker 过滤的独立查询。
     static func assemble(event: MeetingEvent, store: RecordingsStore) async -> String {
-        let names = event.attendees.filter { !$0.isCurrentUser }
-            .map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        // 标题候选:不带 speaker 过滤,且 maxTranscriptEntries: 0 —— 只要 metadata,
-        // 不取任何 excerpt,所以这一路不会把无关逐字稿带进 prompt。
-        let titleCandidates = await store.fetchAIContext(maxTranscriptEntries: 0)
-        guard !names.isEmpty else {
-            return build(event: event,
-                         aiContext: scoped(titleCandidates, eventTitle: event.title),
-                         folderContext: nil)
+        guard case .prep(let context) = await retrieve(.event(event), store: store) else {
+            return build(event: event, aiContext: nil, folderContext: nil)
         }
-        let speakerHits = await store.fetchAIContext(speakerQueries: names, speakerMatchMode: .any)
-        let ai = scoped(merge(speakerHits, titleCandidates), eventTitle: event.title)
-        return build(event: event, aiContext: ai, folderContext: nil)
+        return build(event: event, aiContext: context, folderContext: nil)
+    }
+
+    private enum Selection {
+        case event(MeetingEvent)
+        case confirmed(ids: [UUID], currentID: UUID, before: Date)
+    }
+    private enum RetrievedContext {
+        case prep(AIContextData)
+        case history([RecordingDetailDTO])
+    }
+    /// A shared structured retrieval boundary with explicit, non-interchangeable scope policies.
+    private static func retrieve(_ selection: Selection, store: RecordingsStore) async -> RetrievedContext {
+        switch selection {
+        case .confirmed(let ids, let currentID, let before):
+            return .history(await store.fetchConfirmedSummaryHistory(ids: ids, currentID: currentID, before: before))
+        case .event(let event):
+            let names = event.attendees.filter { !$0.isCurrentUser }
+                .map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            // Metadata-only title fallback and attendee-based excerpt lookup preserve
+            // the existing prep/MCP scope; confirmed history never uses this inference.
+            let titleCandidates = await store.fetchAIContext(maxTranscriptEntries: 0)
+            guard !names.isEmpty else { return .prep(scoped(titleCandidates, eventTitle: event.title)) }
+            let speakerHits = await store.fetchAIContext(speakerQueries: names, speakerMatchMode: .any)
+            return .prep(scoped(merge(speakerHits, titleCandidates), eventTitle: event.title))
+        }
     }
 
     /// 合并两路候选(按 recordingID 去重,`primary` 优先)。excerpts/coverage/speakers 只取

@@ -28,10 +28,10 @@ struct ConnectionsSection: View {
                 connectAction: {
                     guard appState.startupPolicy.externalAccessEnabled else { return }
                     Task {
-                        _ = await Permissions.requestOrRecoverCalendarAccess(
+                        let granted = await Permissions.requestOrRecoverCalendarAccess(
                             currentStatus: appState.calendarPermissionStatus
                         )
-                        await appState.checkPermissionsAndRefreshCalendarIfNeeded()
+                        await appState.applyCalendarAccessRequestOutcome(granted: granted)
                     }
                 },
                 disconnectAction: nil

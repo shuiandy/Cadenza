@@ -238,10 +238,32 @@ struct SettingsToggleRow: View {
 
             Toggle(title, isOn: $isOn)
                 .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
                 .accessibilityLabel(Text(title))
                 .accessibilityHint(subtitle.map { Text($0) } ?? Text(""))
         }
         .padding(.vertical, 8)
+    }
+}
+
+/// Indents a row under its controlling toggle with an accent rail, making a
+/// parent-child dependency visible instead of rendering both rows as peers.
+struct SettingsDependentRow<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Color.accentColor.opacity(0.25))
+                .frame(width: 2)
+            content
+        }
+        .padding(.leading, 14)
     }
 }
 
@@ -459,21 +481,59 @@ private struct RecordingStorageSection: View {
             // Storage stats + limit
             VStack(alignment: .leading, spacing: 8) {
                 if let quotaStatus {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Cadenza recordings")
-                            .font(.cadenza(12, weight: .medium, scale: uiScale))
-                        Text("Used: \(formattedSize(quotaStatus.usage.ownedBytes)) \u{00B7} \(quotaStatus.usage.ownedFileCount) files")
-                            .font(.cadenza(12, scale: uiScale))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if quotaStatus.usage.externalBytes > 0 {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Other files in this folder")
+                    // Concept J: the two prose blocks become one proportional
+                    // bar plus a one-row legend, with the grand total on the
+                    // header line — the ratio reads at a glance instead of
+                    // being mental arithmetic.
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("Usage")
                                 .font(.cadenza(12, weight: .medium, scale: uiScale))
-                            Text("Used: \(formattedSize(quotaStatus.usage.externalBytes)) \u{00B7} \(quotaStatus.usage.externalFileCount) files")
-                                .font(.cadenza(12, scale: uiScale))
+                            Spacer()
+                            Text("Total: \(formattedSize(quotaStatus.usage.ownedBytes + quotaStatus.usage.externalBytes)) \u{00B7} \(quotaStatus.usage.ownedFileCount + quotaStatus.usage.externalFileCount) files")
+                                .font(.cadenza(10.5, scale: uiScale))
                                 .foregroundStyle(.secondary)
+                        }
+
+                        StorageUsageBar(
+                            ownedBytes: quotaStatus.usage.ownedBytes,
+                            externalBytes: quotaStatus.usage.externalBytes
+                        )
+
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 16) {
+                                usageLegendItem(
+                                    "Cadenza recordings",
+                                    dot: Color.accentColor,
+                                    bytes: quotaStatus.usage.ownedBytes,
+                                    count: quotaStatus.usage.ownedFileCount
+                                )
+                                if quotaStatus.usage.externalBytes > 0 {
+                                    usageLegendItem(
+                                        "Other files in this folder",
+                                        dot: Color.primary.opacity(0.28),
+                                        bytes: quotaStatus.usage.externalBytes,
+                                        count: quotaStatus.usage.externalFileCount
+                                    )
+                                }
+                            }
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                usageLegendItem(
+                                    "Cadenza recordings",
+                                    dot: Color.accentColor,
+                                    bytes: quotaStatus.usage.ownedBytes,
+                                    count: quotaStatus.usage.ownedFileCount
+                                )
+                                if quotaStatus.usage.externalBytes > 0 {
+                                    usageLegendItem(
+                                        "Other files in this folder",
+                                        dot: Color.primary.opacity(0.28),
+                                        bytes: quotaStatus.usage.externalBytes,
+                                        count: quotaStatus.usage.externalFileCount
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -493,8 +553,8 @@ private struct RecordingStorageSection: View {
                             "Other files are shown for context but do not count toward the Cadenza storage limit.",
                             systemImage: "info.circle"
                         )
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(.secondary)
+                        .font(.cadenza(10.5, scale: uiScale))
+                        .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityElement(children: .combine)
                     }
@@ -556,6 +616,27 @@ private struct RecordingStorageSection: View {
     private var usesAccessibleLayout: Bool {
         dynamicTypeSize.isAccessibilitySize
             || uiScale >= CadenzaTextScale.factor(.accessibility1)
+    }
+
+    @ViewBuilder
+    private func usageLegendItem(
+        _ name: LocalizedStringKey,
+        dot: Color,
+        bytes: Int64,
+        count: Int
+    ) -> some View {
+        HStack(spacing: 5) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(dot)
+                .frame(width: 7, height: 7)
+            Text(name)
+                .font(.cadenza(10.5, weight: .medium, scale: uiScale))
+                .foregroundStyle(.secondary)
+            Text("\(formattedSize(bytes)) \u{00B7} \(count) files")
+                .font(.cadenza(10.5, scale: uiScale))
+                .foregroundStyle(.tertiary)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private func chooseDirectory() {
@@ -827,6 +908,42 @@ private struct RecordingStorageSection: View {
     }
 }
 
+/// Two-segment proportional bar for the storage stats: Cadenza-owned bytes
+/// in accent, other files in a muted tone. Tiny nonzero segments are floored
+/// at 2% so they stay visible; the legend carries the exact numbers.
+private struct StorageUsageBar: View {
+    let ownedBytes: Int64
+    let externalBytes: Int64
+
+    var body: some View {
+        let total = max(1, ownedBytes + externalBytes)
+        let ownedFraction = clampedFraction(Double(ownedBytes) / Double(total), nonZero: ownedBytes > 0)
+        let externalFraction = clampedFraction(Double(externalBytes) / Double(total), nonZero: externalBytes > 0)
+        GeometryReader { proxy in
+            HStack(spacing: ownedBytes > 0 && externalBytes > 0 ? 1 : 0) {
+                if ownedBytes > 0 {
+                    Rectangle()
+                        .fill(Color.accentColor)
+                        .frame(width: proxy.size.width * ownedFraction / max(0.0001, ownedFraction + externalFraction))
+                }
+                if externalBytes > 0 {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.28))
+                }
+            }
+        }
+        .frame(height: 8)
+        .background(Color.primary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .accessibilityHidden(true)
+    }
+
+    private func clampedFraction(_ fraction: Double, nonZero: Bool) -> Double {
+        guard nonZero else { return 0 }
+        return min(max(fraction, 0.02), 0.98)
+    }
+}
+
 /// Reflows the storage identity above its controls once scaled, localized
 /// actions can no longer leave a useful width for the path.
 struct RecordingStorageHeaderLayout<Identity: View, Actions: View>: View {
@@ -893,7 +1010,7 @@ private struct GeneralSettingsSection: View {
 
             ExportBackupSection()
 
-            SettingsSectionCard(title: "Interface") {
+            SettingsSectionCard(title: "Interface & Startup") {
                 SettingsToggleRow(
                     "Show menu bar icon",
                     subtitle: "Keep quick controls available in the menu bar",
@@ -931,9 +1048,9 @@ private struct GeneralSettingsSection: View {
                         showMenuBarIcon = true
                     }
                 }
-            }
 
-            SettingsSectionCard(title: "Startup") {
+                Divider()
+
                 SettingsToggleRow(
                     "Launch at login",
                     subtitle: "Start Cadenza automatically after sign in",
@@ -953,13 +1070,17 @@ private struct GeneralSettingsSection: View {
                     }
                 }
 
-                Divider()
-
-                SettingsToggleRow(
-                    "Open main window after login",
-                    subtitle: "When Launch at login is enabled, show the main window after sign in",
-                    isOn: $openMainWindowOnLaunch
-                )
+                // Dependent child of "Launch at login": the rail plus indent
+                // makes the dependency visible, and the toggle only operates
+                // while its parent is on (concept J).
+                SettingsDependentRow {
+                    SettingsToggleRow(
+                        "Open main window after login",
+                        subtitle: "When Launch at login is enabled, show the main window after sign in",
+                        isOn: $openMainWindowOnLaunch
+                    )
+                    .disabled(!launchAtLogin)
+                }
             }
 
             if appState.startupPolicy.externalAccessEnabled {
@@ -993,6 +1114,10 @@ private struct DiagnosticsSection: View {
     @State private var speakerMemoryRunner = SpeakerMemoryDiagnosticRunner.shared
     @State private var showSpeakerMemoryPicker = false
     @State private var activeReport: String?
+#if DEBUG
+    @State private var confirmSummaryEvaluation = false
+    @State private var evaluationMode = 0
+#endif
 
     private var isRunning: Bool { funcRunner.isRunning || qualityRunner.isRunning || systemRunner.isRunning || speakerMemoryRunner.isRunning }
     private var currentStatus: String {
@@ -1013,6 +1138,9 @@ private struct DiagnosticsSection: View {
                         .lineLimit(1)
                 }
                 .padding(.vertical, 4)
+                if qualityRunner.isEvaluatingSummary {
+                    Button("Cancel") { qualityRunner.cancelSummaryEvaluation() }
+                }
             } else {
                 HStack(spacing: 12) {
                     Button("System Check") {
@@ -1071,6 +1199,26 @@ private struct DiagnosticsSection: View {
                     }
                 }
                 .padding(.vertical, 4)
+
+#if DEBUG
+                Menu("Summary Evaluation") {
+                    Button("Summary") { evaluationMode = 0; confirmSummaryEvaluation = true }
+                    Button("Meeting context") { evaluationMode = 1; confirmSummaryEvaluation = true }
+                    Button("Review follow-up") { evaluationMode = 2; confirmSummaryEvaluation = true }
+                }
+                .alert("Run a paid summary evaluation?", isPresented: $confirmSummaryEvaluation) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Run Evaluation") {
+                        activeReport = nil
+                        qualityRunner.startSummaryEvaluation(personalOnly: evaluationMode == 1, focused: evaluationMode == 2)
+                    }
+                } message: {
+                    Text("This developer evaluation can send hundreds of requests and take over 20 minutes. Your AI provider may charge for them. Only fictional meetings are used.")
+                }
+                Text("Uses fictional meetings with your selected AI provider and a smaller model when available. API usage charges may apply.")
+                    .font(.cadenza(.caption, scale: uiScale))
+                    .foregroundStyle(.secondary)
+#endif
 
                 Text("System Check: audio, database, storage, meeting detection, exports. Smoke Test: AI providers. Quality Compare: side-by-side output. Speaker Memory: embedding extraction and cosine scoring.")
                     .font(.cadenza(.caption, scale: uiScale))
@@ -1159,38 +1307,40 @@ private struct RecordingSettingsSection: View {
                     appState.setMeetingDetectionEnabled(newValue)
                 }
 
-                Divider()
+                // Both automatic behaviors depend on meeting detection; the
+                // rail-indented rows make that chain visible (concept K).
+                SettingsDependentRow {
+                    VStack(alignment: .leading, spacing: 0) {
+                        SettingsToggleRow(
+                            "Auto-record meetings",
+                            subtitle: "Automatically start recording when a meeting app and microphone are detected",
+                            isOn: autoRecordBinding
+                        )
+                        .disabled(
+                            !enableMeetingDetection
+                                || !appState.hasPreparedSystemAudioCapture
+                                || isRequestingMicrophone
+                        )
 
-                SettingsToggleRow(
-                    "Auto-record meetings",
-                    subtitle: "Automatically start recording when a meeting app and microphone are detected",
-                    isOn: autoRecordBinding
-                )
-                .disabled(
-                    !enableMeetingDetection
-                        || !appState.hasPreparedSystemAudioCapture
-                        || isRequestingMicrophone
-                )
+                        if showMicrophonePermissionMessage {
+                            Text("Microphone access is required for automatic meeting recording. Auto-record stays on and will resume once access is granted.")
+                                .font(.cadenza(.caption, scale: uiScale))
+                                .foregroundStyle(.red)
+                                .accessibilityIdentifier("recording.autoRecord.microphoneRequired")
+                        }
 
-                if showMicrophonePermissionMessage {
-                    Text("Microphone access is required for automatic meeting recording. Auto-record stays on and will resume once access is granted.")
-                        .font(.cadenza(.caption, scale: uiScale))
-                        .foregroundStyle(.red)
-                        .accessibilityIdentifier("recording.autoRecord.microphoneRequired")
+                        Text("Make sure everyone knows the meeting is being recorded. Follow applicable laws and workplace policies.")
+                            .font(.cadenza(.caption, scale: uiScale))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        SettingsToggleRow(
+                            "Auto-stop when mic closes",
+                            subtitle: "Stop recording after a 5-second countdown when microphone is released",
+                            isOn: $autoStopOnMicClose
+                        )
+                    }
                 }
-
-                Text("Make sure everyone knows the meeting is being recorded. Follow applicable laws and workplace policies.")
-                    .font(.cadenza(.caption, scale: uiScale))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Divider()
-
-                SettingsToggleRow(
-                    "Auto-stop when mic closes",
-                    subtitle: "Stop recording after a 5-second countdown when microphone is released",
-                    isOn: $autoStopOnMicClose
-                )
 
                 Divider()
 
@@ -1334,16 +1484,9 @@ private struct MicrophonePermissionRow: View {
             }
             .accessibilityElement(children: .combine)
         } controls: {
-            Image(systemName: status == .granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .font(.cadenza(13, weight: .semibold, scale: uiScale))
-                .foregroundStyle(status == .granted ? .green : .orange)
-                .accessibilityHidden(true)
-
             switch status {
             case .granted:
-                Text("Granted")
-                    .font(.cadenza(12, weight: .medium, scale: uiScale))
-                    .foregroundStyle(.secondary)
+                SettingsStatusCapsule(kind: .connected, label: "Granted")
                     .accessibilityLabel("Microphone")
                     .accessibilityValue("Granted")
             case .notDetermined:
@@ -1355,7 +1498,7 @@ private struct MicrophonePermissionRow: View {
                         Label("Grant Access", systemImage: "mic")
                     }
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
                 .controlSize(usesAccessibleLayout ? .regular : .small)
                 .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .disabled(isRequesting)
@@ -1409,18 +1552,15 @@ private struct ScreenRecordingPermissionRow: View {
             }
             .accessibilityElement(children: .combine)
         } controls: {
-            Image(systemName: appState.hasScreenRecordingPermission ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .font(.cadenza(13, weight: .semibold, scale: uiScale))
-                .foregroundStyle(appState.hasScreenRecordingPermission ? .green : .orange)
-                .accessibilityHidden(true)
-
             if appState.hasScreenRecordingPermission {
-                Text(text("Granted"))
-                    .font(.cadenza(12, weight: .medium, scale: uiScale))
-                    .foregroundStyle(.secondary)
+                SettingsStatusCapsule(kind: .connected, verbatimLabel: text("Granted"))
                     .accessibilityLabel(text("Screen Recording"))
                     .accessibilityValue(text("Granted"))
             } else {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
                 Button {
                     guard appState.startupPolicy.allowsHardwareCapture else { return }
                     _ = Permissions.requestScreenRecording()
@@ -1468,22 +1608,15 @@ private struct AccessibilityPermissionRow: View {
             }
             .accessibilityElement(children: .combine)
         } controls: {
-            Image(
-                systemName: appState.hasAccessibilityPermission
-                    ? "checkmark.circle.fill"
-                    : "keyboard.badge.ellipsis"
-            )
-            .font(.cadenza(13, weight: .semibold, scale: uiScale))
-            .foregroundStyle(appState.hasAccessibilityPermission ? .green : .orange)
-            .accessibilityHidden(true)
-
             if appState.hasAccessibilityPermission {
-                Text(text("Granted"))
-                    .font(.cadenza(12, weight: .medium, scale: uiScale))
-                    .foregroundStyle(.secondary)
+                SettingsStatusCapsule(kind: .connected, verbatimLabel: text("Granted"))
                     .accessibilityLabel(text("Accessibility"))
                     .accessibilityValue(text("Granted"))
             } else {
+                Image(systemName: "keyboard.badge.ellipsis")
+                    .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
                 Button {
                     guard appState.startupPolicy.checksPermissions else { return }
                     if requestAttempted {
@@ -1541,16 +1674,10 @@ private struct SystemAudioCapturePreparationRow: View {
             }
             .accessibilityElement(children: .combine)
         } controls: {
-            Image(
-                systemName: appState.hasPreparedSystemAudioCapture
-                    ? "checkmark.circle.fill"
-                    : "waveform.badge.exclamationmark"
-            )
-            .font(.cadenza(13, weight: .semibold, scale: uiScale))
-            .foregroundStyle(appState.hasPreparedSystemAudioCapture ? .green : .orange)
-            .accessibilityHidden(true)
-
             if appState.hasPreparedSystemAudioCapture {
+                SettingsStatusCapsule(kind: .connected, label: "Ready")
+                    .accessibilityLabel(Text("System Audio Recording"))
+                    .accessibilityValue(Text("Ready"))
                 Button {
                     guard appState.startupPolicy.allowsHardwareCapture else { return }
                     Permissions.openSystemAudioRecordingSettings()
@@ -1562,6 +1689,10 @@ private struct SystemAudioCapturePreparationRow: View {
                 .frame(minHeight: usesAccessibleLayout ? 44 : nil)
                 .disabled(!appState.startupPolicy.allowsHardwareCapture)
             } else {
+                Image(systemName: "waveform.badge.exclamationmark")
+                    .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
                 Button {
                     guard appState.startupPolicy.allowsHardwareCapture else { return }
                     Task { await appState.prepareSystemAudioCapture() }
@@ -1640,7 +1771,9 @@ private struct AppearanceSettingsSection: View {
     @AppStorage("uiScale") private var uiScalePreset: UIScalePreset = .default
 
     private let columns = [GridItem(.adaptive(minimum: 120, maximum: 160), spacing: 10)]
-    private let iconColumns = [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 10)]
+    // Concept L: compact swatch tiles — every colorway visible in one screen.
+    private let iconColumns = [GridItem(.adaptive(minimum: 76, maximum: 104), spacing: 6)]
+    private let themeColumns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
 
     var body: some View {
         SettingsPageLayout(title: SettingsCategory.appearance.title, subtitle: SettingsCategory.appearance.subtitle) {
@@ -1660,12 +1793,22 @@ private struct AppearanceSettingsSection: View {
                 .padding(.vertical, 6)
             }
 
-            SettingsSectionCard(title: "Theme") {
-                SettingsPickerRow("Theme", subtitle: "Use system appearance or force one theme", selection: $appTheme) {
+            SettingsSectionCard(title: "Theme", subtitle: "Use system appearance or force one theme") {
+                // Concept L: the dropdown becomes three mini-window previews
+                // so light/dark/system are visible before choosing.
+                LazyVGrid(columns: themeColumns, spacing: 10) {
                     ForEach(AppTheme.allCases, id: \.self) { theme in
-                        Text(theme.displayName).tag(theme)
+                        ThemePreviewTile(
+                            theme: theme,
+                            isSelected: appTheme == theme
+                        ) {
+                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                                appTheme = theme
+                            }
+                        }
                     }
                 }
+                .padding(.vertical, 6)
             }
 
             SettingsSectionCard(title: "Language") {
@@ -1761,6 +1904,9 @@ private struct BackgroundThemeCard: View {
     }
 }
 
+/// Compact colorway swatch (concept L): icon plus name only — the flavor
+/// subtitles were decorative — with a ring and check badge marking the
+/// selection so the current icon is findable at a glance.
 private struct AppIconVariantCard: View {
     @Environment(\.uiScale) private var uiScale: CGFloat
 
@@ -1770,39 +1916,142 @@ private struct AppIconVariantCard: View {
 
     var body: some View {
         Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(spacing: 6) {
                 AppIconArtwork(variant: variant)
-                .frame(width: 72, height: 72)
-                .shadow(color: .black.opacity(0.10), radius: 8, y: 4)
-                .frame(maxWidth: .infinity)
+                    .frame(width: 46, height: 46)
+                    .shadow(color: .black.opacity(0.10), radius: 5, y: 2)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(variant.displayName)
-                        .font(.cadenza(12, weight: .semibold, scale: uiScale))
-                        .foregroundStyle(.primary)
-
-                    Text(variant.description)
-                        .font(.cadenza(11, scale: uiScale))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text(variant.displayName)
+                    .font(.cadenza(11, weight: isSelected ? .semibold : .regular, scale: uiScale))
+                    .foregroundStyle(isSelected ? .primary : .secondary)
+                    .lineLimit(1)
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 9)
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
             .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.primary.opacity(0.035))
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.06) : Color.clear)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(
-                        isSelected ? Color.accentColor : Color.primary.opacity(0.08),
-                        lineWidth: isSelected ? 2 : 1
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        isSelected ? Color.accentColor : Color.clear,
+                        lineWidth: 1.5
                     )
             )
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.cadenza(7, weight: .bold, scale: uiScale))
+                        .foregroundStyle(.white)
+                        .frame(width: 14, height: 14)
+                        .background(Circle().fill(Color.accentColor))
+                        .padding(4)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.cadenzaPlain)
+        .accessibilityLabel(Text(variant.displayName))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+/// Mini-window theme preview (concept L): a light card, a dark card, and a
+/// diagonally split card for "system", each a literal picture of the choice.
+private struct ThemePreviewTile: View {
+    @Environment(\.uiScale) private var uiScale: CGFloat
+
+    let theme: AppTheme
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    private static let lightBackground = Color(red: 0.965, green: 0.93, blue: 0.885)
+    private static let darkBackground = Color(red: 0.13, green: 0.10, blue: 0.078)
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(spacing: 6) {
+                preview
+                    .frame(height: 52)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.14), lineWidth: 1)
+                    )
+
+                Text(theme.displayName)
+                    .font(.cadenza(11, weight: isSelected ? .semibold : .regular, scale: uiScale))
+                    .foregroundStyle(isSelected ? .primary : .secondary)
+            }
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.05) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        isSelected ? Color.accentColor : Color.primary.opacity(0.12),
+                        lineWidth: isSelected ? 1.5 : 1
+                    )
+            )
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.cadenza(7, weight: .bold, scale: uiScale))
+                        .foregroundStyle(.white)
+                        .frame(width: 14, height: 14)
+                        .background(Circle().fill(Color.accentColor))
+                        .padding(5)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.cadenzaPlain)
+        .accessibilityLabel(Text(theme.displayName))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var preview: some View {
+        switch theme {
+        case .light:
+            miniWindow(background: Self.lightBackground, line: Color.black.opacity(0.22))
+        case .dark:
+            miniWindow(background: Self.darkBackground, line: Color.white.opacity(0.3))
+        case .system:
+            ZStack {
+                LinearGradient(
+                    stops: [
+                        .init(color: Self.lightBackground, location: 0.5),
+                        .init(color: Self.darkBackground, location: 0.5),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                miniWindowLines(line: Color.primary.opacity(0.3))
+            }
+        }
+    }
+
+    private func miniWindow(background: Color, line: Color) -> some View {
+        ZStack {
+            background
+            miniWindowLines(line: line)
+        }
+    }
+
+    private func miniWindowLines(line: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Capsule().fill(line).frame(width: 42, height: 5)
+            Capsule().fill(line.opacity(0.5)).frame(width: 62, height: 4)
+            Capsule().fill(line.opacity(0.5)).frame(width: 54, height: 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 10)
     }
 }
 
@@ -1834,8 +2083,13 @@ private struct ModelOverrideRow: View {
         _fieldState = State(initialValue: ModelOverrideFieldState(key: key))
     }
 
+    private var usesRecommendedModel: Bool {
+        !fieldState.hasOverride
+            || fieldState.text.trimmingCharacters(in: .whitespacesAndNewlines) == placeholder
+    }
+
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.cadenza(13, scale: uiScale))
@@ -1846,41 +2100,111 @@ private struct ModelOverrideRow: View {
 
             Spacer(minLength: 12)
 
-            VStack(alignment: .trailing, spacing: 3) {
-                TextField(
-                    placeholder,
-                    text: Binding(
-                        get: { fieldState.text },
-                        set: { fieldState.updateText($0) }
-                    )
-                )
-                    .textFieldStyle(.roundedBorder)
-                    .font(.cadenza(12, design: .monospaced, scale: uiScale))
-                    .frame(width: 260)
-                    .autocorrectionDisabled()
-                    .accessibilityLabel(Text(title))
-                    .accessibilityHint(Text(subtitle))
-                    .accessibilityIdentifier("settings.modelOverride.\(key)")
-
-                HStack(spacing: 8) {
-                    Text("Recommended: \(placeholder)")
-                        .font(.cadenza(.caption2, scale: uiScale))
-                        .foregroundStyle(.tertiary)
-
-                    if fieldState.hasOverride {
-                        Button("Use recommended") {
-                            fieldState.useRecommended()
-                        }
-                        .buttonStyle(.borderless)
-                        .font(.cadenza(.caption2, weight: .medium, scale: uiScale))
-                    }
+            // Concept M: recommendation state lives inline beside the field —
+            // a green tag while the effective model IS the recommended one
+            // (empty field or an override typed to the same value), a single
+            // restore action once it differs. No second line under the field.
+            if usesRecommendedModel {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark")
+                        .font(.cadenza(8, weight: .bold, scale: uiScale))
+                    Text("Recommended")
+                        .font(.cadenza(10.5, weight: .semibold, scale: uiScale))
                 }
+                .foregroundStyle(.green)
+                .padding(.horizontal, 9)
+                .frame(minHeight: 20)
+                .background(Color.green.opacity(0.12), in: Capsule())
+                .overlay(Capsule().strokeBorder(Color.green.opacity(0.3), lineWidth: 1))
+                .accessibilityElement(children: .combine)
+            } else {
+                Button("Use recommended") {
+                    fieldState.useRecommended()
+                }
+                .buttonStyle(.borderless)
+                .font(.cadenza(.caption2, weight: .medium, scale: uiScale))
+                .help(Text("Recommended: \(placeholder)"))
             }
+
+            TextField(
+                placeholder,
+                text: Binding(
+                    get: { fieldState.text },
+                    set: { fieldState.updateText($0) }
+                )
+            )
+                .textFieldStyle(.roundedBorder)
+                .font(.cadenza(12, design: .monospaced, scale: uiScale))
+                .frame(width: 260)
+                .autocorrectionDisabled()
+                .accessibilityLabel(Text(title))
+                .accessibilityHint(Text(subtitle))
+                .accessibilityIdentifier("settings.modelOverride.\(key)")
         }
         .padding(.vertical, 4)
         .onChange(of: key) { _, newKey in
             fieldState.activate(key: newKey)
         }
+    }
+}
+
+/// Small provider logo tile leading an engine/provider picker row, matching
+/// the row anatomy of the Integrations page (concept M).
+private struct ProviderLogoTile: View {
+    @Environment(\.uiScale) private var uiScale: CGFloat
+
+    let provider: AIProvider
+
+    var body: some View {
+        Group {
+            if NSImage(named: provider.iconName) != nil {
+                Image(provider.iconName)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 16, height: 16)
+            } else {
+                Image(systemName: provider.iconFallbackSymbol)
+                    .font(.cadenza(12, scale: uiScale))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 26, height: 26)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .accessibilityHidden(true)
+    }
+}
+
+/// Tinted disclosure line for data-egress notes (concept M): what leaves the
+/// machine deserves an info row, not a caption buried under a toggle.
+private struct SettingsInfoNote: View {
+    @Environment(\.uiScale) private var uiScale: CGFloat
+
+    private let text: Text
+
+    init(_ key: LocalizedStringKey) {
+        self.text = Text(key)
+    }
+
+    init(verbatim value: String) {
+        self.text = Text(verbatim: value)
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "info.circle")
+                .font(.cadenza(10, weight: .semibold, scale: uiScale))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            text
+                .font(.cadenza(11, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -1891,7 +2215,7 @@ private struct TranscriptionSettingsSection: View {
 
     @AppStorage("transcriptionLanguage") private var transcriptionLanguage: TranscriptionLanguage = .auto
     @AppStorage("summaryLanguage") private var summaryLanguage: TranscriptionLanguage = .auto
-    @AppStorage("summaryDetailLevel") private var detailLevel: SummaryDetailLevel = .detailed
+    @AppStorage(SummaryDetailLevel.defaultsKey) private var detailLevel: SummaryDetailLevel = .detailed
     @AppStorage("transcriptionProvider") private var transcriptionProvider: AIProvider = .apple
     @AppStorage("defaultAIProvider") private var defaultProvider: AIProvider = .apple
     @AppStorage("enableRealtimeTranscription") private var enableRealtimeTranscription = false
@@ -1901,11 +2225,29 @@ private struct TranscriptionSettingsSection: View {
     @AppStorage(AutomaticRecapGeneration.defaultsKey) private var automaticRecapsEnabled = false
     @AppStorage(ActiveProfileDefaults.key("userName")) private var userName = ""
     @AppStorage(ActiveProfileDefaults.key("userJobTitle")) private var userJobTitle = ""
+    @AppStorage(ActiveProfileDefaults.key("summaryFocus")) private var summaryFocus = ""
     @AppStorage(ActiveProfileDefaults.key("meetingPrepEnabled")) private var meetingPrepEnabled = false
     @AppStorage(ActiveProfileDefaults.key("meetingPrepLeadMinutes")) private var meetingPrepLeadMinutes = 30
     @State private var showDeleteSpeakerMemoryAlert = false
     @State private var isDeletingSpeakerMemory = false
     @State private var speakerMemoryDeletionError: String?
+
+    private var summaryProviderPicker: some View {
+        SettingsPickerRow("AI Provider", subtitle: "Used for summaries, AI chat, and other AI tasks", selection: $defaultProvider) {
+            // Always include Apple plus every provider with a stored key.
+            // Additionally include the currently-stored provider even if its
+            // key is missing, so the menu never silently drops the value the
+            // app will actually use. The missing-key case is labeled so the
+            // user can see why summaries will fail until a key is added.
+            ForEach(aiProviderOptions) { provider in
+                if provider.requiresAPIKey && !KeychainManager.shared.hasAPIKey(for: provider) {
+                    Text("\(provider.displayName) (API key missing)").tag(provider)
+                } else {
+                    Text(provider.displayName).tag(provider)
+                }
+            }
+        }
+    }
 
     /// Options for the "AI Provider" picker. Always offers Apple and every
     /// provider that has a stored API key. Crucially, it also includes the
@@ -1927,11 +2269,15 @@ private struct TranscriptionSettingsSection: View {
     var body: some View {
         SettingsPageLayout(title: SettingsCategory.transcription.title, subtitle: SettingsCategory.transcription.subtitle) {
             SettingsSectionCard(title: "Transcription") {
-                SettingsPickerRow("Engine", subtitle: "Speech-to-text provider for post-recording transcription", selection: $transcriptionProvider) {
-                    Text("Apple (Local)").tag(AIProvider.apple)
-                    Text("Whisper (Local)").tag(AIProvider.whisperLocal)
-                    Text("OpenAI").tag(AIProvider.openai)
-                    Text("Gemini").tag(AIProvider.gemini)
+                HStack(alignment: .top, spacing: 10) {
+                    ProviderLogoTile(provider: transcriptionProvider)
+                        .padding(.top, 6)
+                    SettingsPickerRow("Engine", subtitle: "Speech-to-text provider for post-recording transcription", selection: $transcriptionProvider) {
+                        Text("Apple (Local)").tag(AIProvider.apple)
+                        Text("Whisper (Local)").tag(AIProvider.whisperLocal)
+                        Text("OpenAI").tag(AIProvider.openai)
+                        Text("Gemini").tag(AIProvider.gemini)
+                    }
                 }
 
                 if transcriptionProvider == .apple {
@@ -2006,20 +2352,25 @@ private struct TranscriptionSettingsSection: View {
 
                 Divider()
 
-                SettingsToggleRow(
-                    "Remember voices across recordings",
-                    subtitle: "Store reusable voice embeddings on this Mac to suggest or apply speaker names in future recordings. This is separate from per-recording speaker identification.",
-                    isOn: $speakerMemoryEnabled
-                )
-                .disabled(
-                    SpeakerMemoryConsent.isSettingsToggleDisabled(
-                        diarizationEnabled: diarizer.isEnabled,
-                        memoryEnabled: speakerMemoryEnabled,
-                        isDeleting: isDeletingSpeakerMemory
-                    )
-                )
+                // Concept M: the destructive action lives on the row it acts
+                // on instead of floating below the card as an orphan button.
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Remember voices across recordings")
+                            .font(.cadenza(14, scale: uiScale))
+                        Text("Store reusable voice embeddings on this Mac to suggest or apply speaker names in future recordings. This is separate from per-recording speaker identification.")
+                            .font(.cadenza(.subheadline, scale: uiScale))
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityHidden(true)
 
-                HStack {
+                    Spacer(minLength: 12)
+
+                    if isDeletingSpeakerMemory {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
                     Button("Delete Voice Memory", role: .destructive) {
                         showDeleteSpeakerMemoryAlert = true
                     }
@@ -2027,12 +2378,20 @@ private struct TranscriptionSettingsSection: View {
                     .controlSize(.small)
                     .disabled(isDeletingSpeakerMemory)
 
-                    if isDeletingSpeakerMemory {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
+                    Toggle("Remember voices across recordings", isOn: $speakerMemoryEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .accessibilityLabel(Text("Remember voices across recordings"))
+                        .disabled(
+                            SpeakerMemoryConsent.isSettingsToggleDisabled(
+                                diarizationEnabled: diarizer.isEnabled,
+                                memoryEnabled: speakerMemoryEnabled,
+                                isDeleting: isDeletingSpeakerMemory
+                            )
+                        )
                 }
-                .padding(.vertical, 4)
+                .padding(.vertical, 8)
 
                 if let speakerMemoryDeletionError {
                     Text(speakerMemoryDeletionError)
@@ -2051,29 +2410,29 @@ private struct TranscriptionSettingsSection: View {
                 if enableRealtimeTranscription {
                     Divider()
 
-                    SettingsPickerRow("Engine", subtitle: "Provider for real-time transcription", selection: $realtimeProvider) {
-                        Text("OpenAI").tag(AIProvider.openai)
-                        Text("Gemini").tag(AIProvider.gemini)
-                        Text("Apple (Local)").tag(AIProvider.apple)
+                    HStack(alignment: .top, spacing: 10) {
+                        ProviderLogoTile(provider: realtimeProvider)
+                            .padding(.top, 6)
+                        SettingsPickerRow("Engine", subtitle: "Provider for real-time transcription", selection: $realtimeProvider) {
+                            Text("OpenAI").tag(AIProvider.openai)
+                            Text("Gemini").tag(AIProvider.gemini)
+                            Text("Apple (Local)").tag(AIProvider.apple)
+                        }
                     }
 
                     if realtimeProvider == .apple {
-                        Text("Apple live transcription is processed on this Mac. No API key is required.")
-                            .font(.cadenza(.caption, scale: uiScale))
-                            .foregroundStyle(.secondary)
+                        SettingsInfoNote("Apple live transcription is processed on this Mac. No API key is required.")
                         Text("Live transcription uses the meeting/system audio track only. Microphone audio is not sent to realtime providers.")
                             .font(.cadenza(.caption, scale: uiScale))
                             .foregroundStyle(.secondary)
                             .padding(.bottom, 4)
                     } else {
-                        Text(
-                            String(
+                        SettingsInfoNote(
+                            verbatim: String(
                                 format: String(localized: "Meeting/system audio is sent to %@ for live transcription. Microphone audio is not sent."),
                                 realtimeProvider.displayName
                             )
                         )
-                            .font(.cadenza(.caption, scale: uiScale))
-                            .foregroundStyle(.secondary)
                             .padding(.bottom, realtimeProvider == .gemini ? 0 : 4)
 
                         if realtimeProvider == .gemini {
@@ -2096,19 +2455,10 @@ private struct TranscriptionSettingsSection: View {
             }
 
             SettingsSectionCard(title: "Summary & AI") {
-                SettingsPickerRow("AI Provider", subtitle: "Used for summaries, AI chat, and other AI tasks", selection: $defaultProvider) {
-                    // Always include Apple plus every provider with a stored key.
-                    // Additionally include the currently-stored provider even if its
-                    // key is missing, so the menu never silently drops the value the
-                    // app will actually use. The missing-key case is labeled so the
-                    // user can see why summaries will fail until a key is added.
-                    ForEach(aiProviderOptions) { provider in
-                        if provider.requiresAPIKey && !KeychainManager.shared.hasAPIKey(for: provider) {
-                            Text("\(provider.displayName) (API key missing)").tag(provider)
-                        } else {
-                            Text(provider.displayName).tag(provider)
-                        }
-                    }
+                HStack(alignment: .top, spacing: 10) {
+                    ProviderLogoTile(provider: defaultProvider)
+                        .padding(.top, 6)
+                    summaryProviderPicker
                 }
 
                 if defaultProvider.requiresAPIKey {
@@ -2156,6 +2506,16 @@ private struct TranscriptionSettingsSection: View {
                     Text(detailLevel.description)
                         .font(.cadenza(.caption, scale: uiScale))
                         .foregroundStyle(.secondary)
+
+                    Text("Applies to new and regenerated summaries. Existing summaries stay unchanged.")
+                        .font(.cadenza(.caption, scale: uiScale))
+                        .foregroundStyle(.secondary)
+
+                    if detailLevel == .fullBreakdown {
+                        Text("Detailed summaries may take longer. Coverage depends on the transcript and model.")
+                            .font(.cadenza(.caption, scale: uiScale))
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .padding(.vertical, 2)
 
@@ -2175,11 +2535,21 @@ private struct TranscriptionSettingsSection: View {
                     Text("Your Job Title")
                     TextField("Engineering Manager", text: $userJobTitle)
                         .textFieldStyle(.roundedBorder)
-                    Text("Helps AI tailor summaries to your role.")
+                    Text("Used for optional personal notes. The meeting record stays complete.")
                         .font(.cadenza(.caption, scale: uiScale))
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 8)
+            }
+
+            SettingsSectionCard(title: "Personal summary context") {
+                TextField("Usual focus", text: $summaryFocus, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.roundedBorder)
+                Text("Personal context is stored by the app locally and excluded from sync, standard exports and MCP summaries.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Used when you update personal notes in a meeting. Your selected AI provider receives your name, role and chosen context. Calendar details and related history are optional.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             SettingsSectionCard(title: "Meeting Prep") {
@@ -2444,20 +2814,21 @@ struct ConnectionsInline: View {
             connectionRow(
                 icon: "calendar",
                 name: String(localized: "Apple Calendar"),
-                subtitle: appState.hasCalendarPermission ? String(localized: "Connected") : String(localized: "Calendar access required"),
-                isConnected: appState.hasCalendarPermission
+                subtitle: String(localized: "On-device calendar events"),
+                status: appState.hasCalendarPermission ? .connected : .attention,
+                statusLabel: appState.hasCalendarPermission ? "Connected" : "Calendar access required"
             ) {
                 if !appState.hasCalendarPermission {
                     Button(calendarPermissionActionLabel) {
                         guard appState.startupPolicy.externalAccessEnabled else { return }
                         Task {
-                            _ = await Permissions.requestOrRecoverCalendarAccess(
+                            let granted = await Permissions.requestOrRecoverCalendarAccess(
                                 currentStatus: appState.calendarPermissionStatus
                             )
-                            await appState.checkPermissionsAndRefreshCalendarIfNeeded()
+                            await appState.applyCalendarAccessRequestOutcome(granted: granted)
                         }
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(!appState.startupPolicy.externalAccessEnabled)
                 }
@@ -2484,7 +2855,8 @@ struct ConnectionsInline: View {
         icon: String,
         name: String,
         subtitle: String,
-        isConnected: Bool,
+        status: SettingsStatusCapsule.Kind,
+        statusLabel: LocalizedStringKey,
         @ViewBuilder actions: () -> Actions
     ) -> some View {
         let iconSize = CadenzaControlMetrics.squareIconFrame(
@@ -2499,12 +2871,15 @@ struct ConnectionsInline: View {
                 .frame(width: iconSize, height: iconSize)
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name)
-                    .font(.cadenza(14, weight: .medium, scale: uiScale))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(name)
+                        .font(.cadenza(14, weight: .medium, scale: uiScale))
+                    SettingsStatusCapsule(kind: status, label: statusLabel)
+                }
                 Text(subtitle)
                     .font(.cadenza(12, scale: uiScale))
-                    .foregroundStyle(isConnected ? .green : .secondary)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer(minLength: 8)
@@ -2548,20 +2923,25 @@ private struct GoogleCalendarInlineRow: View {
                     .frame(width: iconSize, height: iconSize)
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Google Calendar")
-                        .font(.cadenza(14, weight: .medium, scale: uiScale))
-                    Text(
-                        presentation.phase == .disconnected
-                            ? String(localized: "Sync Google Calendar events")
-                            : presentation.statusText
-                    )
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(
-                            presentation.phase == .error
-                                ? Color.red
-                                : (presentation.phase == .connected ? Color.green : Color.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Google Calendar")
+                            .font(.cadenza(14, weight: .medium, scale: uiScale))
+                        SettingsStatusCapsule(
+                            kind: presentation.phase == .connected
+                                ? .connected
+                                : (presentation.phase == .error ? .attention : .disconnected),
+                            label: presentation.phase == .connected ? "Connected" : "Not Connected"
                         )
+                    }
+                    Text("Sync Google Calendar events")
+                        .font(.cadenza(12, scale: uiScale))
+                        .foregroundStyle(.secondary)
+                    if presentation.phase == .error {
+                        Text(presentation.statusText)
+                            .font(.cadenza(11, scale: uiScale))
+                            .foregroundStyle(.red)
+                    }
                 }
 
                 Spacer(minLength: 8)
@@ -2583,7 +2963,7 @@ private struct GoogleCalendarInlineRow: View {
                             appState.connectGoogleCalendar()
                         }
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                 }
             }
@@ -2667,20 +3047,20 @@ private struct ZoomInlineRow: View {
                     .frame(width: iconSize, height: iconSize)
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Zoom")
-                        .font(.cadenza(14, weight: .medium, scale: uiScale))
-                    Text(
-                        presentation.phase == .disconnected
-                            ? String(localized: "Import Zoom cloud recordings")
-                            : presentation.statusText
-                    )
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(
-                            presentation.phase == .error
-                                ? Color.red
-                                : (presentation.phase == .connected ? Color.green : Color.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Zoom")
+                            .font(.cadenza(14, weight: .medium, scale: uiScale))
+                        SettingsStatusCapsule(
+                            kind: presentation.phase == .connected
+                                ? .connected
+                                : (presentation.phase == .error ? .attention : .disconnected),
+                            label: presentation.phase == .connected ? "Connected" : "Not Connected"
                         )
+                    }
+                    Text("Import Zoom cloud recordings")
+                        .font(.cadenza(12, scale: uiScale))
+                        .foregroundStyle(.secondary)
                 }
 
                 Spacer(minLength: 8)
@@ -2701,7 +3081,7 @@ private struct ZoomInlineRow: View {
                         .controlSize(.small)
                 } else {
                     Button("Connect") { appState.connectZoom() }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                 }
             }
@@ -2790,8 +3170,10 @@ struct CalendarItemColorPicker: View {
                     Circle()
                         .stroke(Color.primary.opacity(0.25), lineWidth: 0.5)
                 }
+                .frame(width: 26, height: 26)
+                .contentShape(Circle())
         }
-        .buttonStyle(.cadenzaPlain)
+        .buttonStyle(.cadenzaPlain(in: Circle()))
         .accessibilityLabel(Text("Calendar Color"))
         .accessibilityValue(Text(selectedOption?.localizedName ?? String(localized: "Default")))
         .popover(isPresented: $showPicker) {

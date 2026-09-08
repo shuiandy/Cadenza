@@ -12,13 +12,13 @@ final class ClaudeService: AIServiceProtocol {
         self.transport = transport
     }
 
-    func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String]) async throws -> SummaryResult {
+    func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) async throws -> SummaryResult {
         let modelID = model ?? provider.summaryModel
-        let systemPrompt = SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags)
+        let systemPrompt = SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel)
 
         let body: [String: Any] = [
             "model": modelID,
-            "max_tokens": 4096,
+            "max_tokens": Self.summaryOutputBudget(model: modelID, detailLevel: detailLevel),
             "system": Self.cacheableSystem(systemPrompt),
             "messages": [
                 ["role": "user", "content": SummaryPrompt.user(transcript: transcript)]
@@ -33,153 +33,97 @@ final class ClaudeService: AIServiceProtocol {
             throw AIServiceError.invalidResponse
         }
 
+        try Self.validateStopReason(json["stop_reason"] as? String)
         return SummaryPrompt.parseResponse(text)
     }
 
-    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String]) -> AsyncThrowingStream<String, Error> {
+    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) -> AsyncThrowingStream<String, Error> {
+        streamSummaryCompletion(
+            systemPrompt: SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel),
+            userMessage: SummaryPrompt.user(transcript: transcript), model: model, detailLevel: detailLevel
+        )
+    }
+
+    func streamSummaryCompletion(systemPrompt: String, userMessage: String, model: String?, detailLevel: SummaryDetailLevel) -> AsyncThrowingStream<String, Error> {
         let modelID = model ?? provider.summaryModel
-        let systemPrompt = SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags)
-
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let body: [String: Any] = [
-                        "model": modelID,
-                        "max_tokens": 4096,
-                        "system": Self.cacheableSystem(systemPrompt),
-                        "messages": [
-                            ["role": "user", "content": SummaryPrompt.user(transcript: transcript)]
-                        ],
-                        "stream": true
-                    ]
-
-                    let events = try self.postStreamJSON(body)
-
-                    for try await payload in events {
-                        try Task.checkCancellation()
-                        guard let lineData = payload.data(using: .utf8),
-                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                              let type = json["type"] as? String else { continue }
-
-                        if type == "content_block_delta",
-                           let delta = json["delta"] as? [String: Any],
-                           let text = delta["text"] as? String {
-                            continuation.yield(text)
-                        }
-
-                        if type == "message_stop" {
-                            break
-                        }
-                    }
-                    continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
-        }
+        return streamMessages(systemPrompt: systemPrompt, messages: [["role": "user", "content": userMessage]], model: modelID,
+                              maxTokens: Self.summaryOutputBudget(model: modelID, detailLevel: detailLevel), requireCompleteSummary: true)
     }
 
     func streamChat(systemPrompt: String, userMessage: String, model: String?) -> AsyncThrowingStream<String, Error> {
-        let modelID = model ?? provider.summaryModel
+        streamMessages(systemPrompt: systemPrompt, messages: [["role": "user", "content": userMessage]],
+                       model: model ?? provider.summaryModel, maxTokens: 4096)
+    }
 
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let body: [String: Any] = [
-                        "model": modelID,
-                        "max_tokens": 4096,
-                        "system": Self.cacheableSystem(systemPrompt),
-                        "messages": [
-                            ["role": "user", "content": userMessage]
-                        ],
-                        "stream": true
-                    ]
+    func streamChat(systemPrompt: String, history: [ChatMessage], model: String?) -> AsyncThrowingStream<String, Error> {
+        guard !history.isEmpty else { return AsyncThrowingStream { $0.finish() } }
+        return streamMessages(systemPrompt: systemPrompt, messages: Self.encodeMessages(history),
+                              model: model ?? provider.summaryModel, maxTokens: 4096)
+    }
 
-                    let events = try self.postStreamJSON(body)
-
-                    for try await payload in events {
-                        try Task.checkCancellation()
-                        guard let lineData = payload.data(using: .utf8),
-                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                              let type = json["type"] as? String else { continue }
-
-                        if type == "content_block_delta",
-                           let delta = json["delta"] as? [String: Any],
-                           let text = delta["text"] as? String {
-                            continuation.yield(text)
-                        }
-
-                        if type == "message_stop" {
-                            break
-                        }
-                    }
-                    continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
+    /// Explicitly verified model families; unknown/older models keep the conservative limit.
+    /// https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+    /// https://platform.claude.com/docs/en/models/haiku-4-5/overview
+    static func summaryOutputBudget(model: String, detailLevel: SummaryDetailLevel) -> Int {
+        let supported = ["claude-sonnet-4-6", "claude-haiku-4-5"]
+            .contains { model == $0 || model.hasPrefix($0 + "-") }
+        guard supported else { return 4096 }
+        switch detailLevel {
+        case .highlights: return 4096
+        case .detailed: return 8192
+        case .fullBreakdown: return 16384
         }
     }
 
-    /// Multi-turn variant: takes a full history and lets Anthropic cache turn 1..N-1.
-    /// The cache_control on the LAST user message creates a breakpoint covering all prior turns,
-    /// so a follow-up question only re-processes the new user turn (and the new assistant output).
-    func streamChat(systemPrompt: String, history: [ChatMessage], model: String?) -> AsyncThrowingStream<String, Error> {
-        let modelID = model ?? provider.summaryModel
-        guard !history.isEmpty else {
-            return AsyncThrowingStream { $0.finish() }
+    static func validateStopReason(_ reason: String?) throws {
+        // Missing termination, refusals and length-limited JSON must not become successful summaries.
+        guard reason == "end_turn" || reason == "stop_sequence" else {
+            throw AIServiceError.incompleteResponse
         }
+    }
 
+    private func streamMessages(systemPrompt: String, messages: [[String: Any]], model: String, maxTokens: Int, requireCompleteSummary: Bool = false) -> AsyncThrowingStream<String, Error> {
+        // Serialize before crossing into the task: [String: Any] is not Sendable.
+        let events: AsyncThrowingStream<String, Error>
+        do {
+            events = try postStreamJSON([
+                "model": model, "max_tokens": maxTokens,
+                "system": Self.cacheableSystem(systemPrompt), "messages": messages, "stream": true
+            ])
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let messagesArray = Self.encodeMessages(history)
-                    let body: [String: Any] = [
-                        "model": modelID,
-                        "max_tokens": 4096,
-                        "system": Self.cacheableSystem(systemPrompt),
-                        "messages": messagesArray,
-                        "stream": true
-                    ]
-
-                    let events = try self.postStreamJSON(body)
-
+                    var stopped = false
+                    var reason: String?
                     for try await payload in events {
                         try Task.checkCancellation()
-                        guard let lineData = payload.data(using: .utf8),
-                              let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                        guard let data = payload.data(using: .utf8),
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                               let type = json["type"] as? String else { continue }
-
+                        if type == "error" { throw AIServiceError.invalidResponse }
                         if type == "content_block_delta",
                            let delta = json["delta"] as? [String: Any],
-                           let text = delta["text"] as? String {
-                            continuation.yield(text)
+                           let text = delta["text"] as? String { continuation.yield(text) }
+                        if type == "message_delta", let delta = json["delta"] as? [String: Any],
+                           let terminalReason = delta["stop_reason"] as? String {
+                            reason = terminalReason
                         }
-
-                        if type == "message_stop" {
-                            break
-                        }
+                        if type == "message_stop" { stopped = true; break }
                     }
-                    continuation.finish()
-                } catch is CancellationError {
+                    try Task.checkCancellation()
+                    if requireCompleteSummary {
+                        guard stopped else { throw AIServiceError.incompleteResponse }
+                        try Self.validateStopReason(reason)
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
         }
     }
 

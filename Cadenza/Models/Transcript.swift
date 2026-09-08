@@ -8,6 +8,8 @@ final class Transcript {
     var segments: [TranscriptEntry]
     var detectedLanguage: String?
     var createdAt: Date
+    /// Compact provenance computed when immutable transcript content is saved.
+    var summarySourceVersionJSON: String? = nil
 
     @Relationship(inverse: \Recording.transcript)
     var recording: Recording?
@@ -18,6 +20,15 @@ final class Transcript {
         self.segments = segments
         self.createdAt = Date()
     }
+    func captureSummarySource() {
+        let dto = TranscriptDTO(id: id, fullText: fullText,
+            segments: segments.map { TranscriptEntryDTO(id: $0.id, startTime: $0.startTime,
+                endTime: $0.endTime, text: $0.text, speaker: $0.speaker) },
+            detectedLanguage: detectedLanguage, createdAt: createdAt)
+        summarySourceVersionJSON = (try? JSONEncoder().encode(SummarySourceVersion.capture(dto, mappings: [])))
+            .map { String(decoding: $0, as: UTF8.self) }
+    }
+
 }
 
 struct TranscriptEntry: Codable, Identifiable, Sendable {

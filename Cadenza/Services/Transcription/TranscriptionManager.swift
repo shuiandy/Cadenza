@@ -762,7 +762,9 @@ final class TranscriptionManager {
 
         let elapsed = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
         var changed = false
-        let replaceHypothesis = provider == .apple
+        // Apple's recognizer always resends the full utterance; cloud
+        // providers vary by model, so the transcriber flags it per delta.
+        let replaceHypothesis = provider == .apple || delta.replacesHypothesis
 
         if delta.isFinal {
             let incomingFinal = trimmedIncoming

@@ -26,6 +26,7 @@ struct LiveTransferStoreInspector: TransferStoreInspecting {
         ("Recording", "ZRECORDING"),
         ("Transcript", "ZTRANSCRIPT"),
         ("MeetingSummary", "ZMEETINGSUMMARY"),
+        ("SummaryContextRecord", "ZSUMMARYCONTEXTRECORD"),
         ("ExternalRecordingImport", "ZEXTERNALRECORDINGIMPORT"),
         ("Folder", "ZFOLDER"),
         ("SpeakerProfile", "ZSPEAKERPROFILE"),
@@ -59,6 +60,35 @@ struct LiveTransferStoreInspector: TransferStoreInspecting {
 
         var counts: [String: Int] = [:]
         for (entity, table) in Self.entityTables {
+            // The additive private-context entity is absent in pre-context stores.
+            // Inspect the catalog explicitly; all other missing tables remain errors.
+            if entity == "SummaryContextRecord" {
+                var probe: OpaquePointer?
+                guard sqlite3_prepare_v2(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ZSUMMARYCONTEXTRECORD'", -1, &probe, nil) == SQLITE_OK else {
+                    throw TransferStoreInspectionError.queryFailed(String(cString: sqlite3_errmsg(database)))
+                }
+                let step = sqlite3_step(probe)
+                let exists = step == SQLITE_ROW && sqlite3_column_int(probe, 0) > 0
+                sqlite3_finalize(probe)
+                guard step == SQLITE_ROW else { throw TransferStoreInspectionError.queryFailed("Context table inspection failed") }
+                if !exists {
+                    var metadata: OpaquePointer?
+                    guard sqlite3_prepare_v2(database, "SELECT Z_PLIST FROM Z_METADATA LIMIT 1", -1, &metadata, nil) == SQLITE_OK else {
+                        throw TransferStoreInspectionError.queryFailed("Missing store metadata")
+                    }
+                    defer { sqlite3_finalize(metadata) }
+                    guard sqlite3_step(metadata) == SQLITE_ROW, let bytes = sqlite3_column_blob(metadata, 0) else {
+                        throw TransferStoreInspectionError.queryFailed("Unreadable store metadata")
+                    }
+                    let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(metadata, 0)))
+                    guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                          let hashes = plist["NSStoreModelVersionHashes"] as? [String: Any], !hashes.isEmpty,
+                          hashes["SummaryContextRecord"] == nil else {
+                        throw TransferStoreInspectionError.queryFailed("Declared context table is missing")
+                    }
+                    counts[entity] = 0; continue
+                }
+            }
             var statement: OpaquePointer?
             let sql = "SELECT COUNT(*) FROM \"\(table)\""
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -128,7 +158,7 @@ enum ProfileTransfer {
     /// The entity types the emptiness proof counts. Must stay identical
     /// to `RecordingsStore.schema`; the inventory test enforces it.
     static let inspectedEntityNames: [String] = [
-        "Recording", "Transcript", "MeetingSummary", "ExternalRecordingImport",
+        "Recording", "Transcript", "MeetingSummary", "SummaryContextRecord", "ExternalRecordingImport",
         "Folder", "SpeakerProfile", "SpeakerVoiceSample", "Recap",
         "AgentArtifact", "WebSyncRecord",
     ]

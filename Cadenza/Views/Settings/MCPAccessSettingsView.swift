@@ -16,6 +16,7 @@ struct MCPAccessInline: View {
     @AppStorage(MCPServer.Constants.portDefaultsKey) private var port = Int(MCPServer.Constants.defaultPort)
 
     @State private var token = ""
+    @State private var showFullToken = false
     @State private var showRegenerateAlert = false
     @State private var copyFeedback: String?
     @State private var connectFailure: ConnectFailure?
@@ -28,6 +29,7 @@ struct MCPAccessInline: View {
 
     private let connector = MCPClientConnector()
     private let accessStore = MCPClientAccessStore.shared
+    private let bridgeRuntime = MCPBridgeRuntime.standard()
     @State private var clientStatuses: [MCPClientConnector.Client: MCPClientConnector.ConnectionState] = [:]
     @State private var accessRecords: [String: MCPClientAccessRecord] = [:]
     /// Clients whose access was revoked but whose Keychain item survived the delete.
@@ -39,19 +41,29 @@ struct MCPAccessInline: View {
         VStack(alignment: .leading, spacing: 0) {
             serverToggleRow
             if serverEnabled {
-                Divider()
-                writesToggleRow
-                Divider()
-                externalImportToggleRow
-                if externalImportEnabled {
-                    externalImportRecipeRow
+                // Concept O: everything the server switch controls rides a
+                // dependency rail — address/port, the permission switches —
+                // so turning the server off visibly disables the chain.
+                SettingsDependentRow {
+                    VStack(alignment: .leading, spacing: 0) {
+                        addressRow
+                        Divider().opacity(0.5)
+                        writesToggleRow
+                        Divider().opacity(0.5)
+                        externalImportToggleRow
+                        if externalImportEnabled {
+                            externalImportRecipeRow
+                        }
+                        Divider().opacity(0.5)
+                        meetingContextToggleRow
+                    }
                 }
+
                 Divider()
-                meetingContextToggleRow
-                Divider()
-                portRow
                 tokenRow
                 Divider()
+
+                clientsHeaderRow
                 ForEach(Array(MCPClientConnector.Client.allCases.enumerated()), id: \.element) { index, client in
                     clientRow(client)
                     if index < MCPClientConnector.Client.allCases.count - 1 {
@@ -88,9 +100,10 @@ struct MCPAccessInline: View {
     /// align regardless of subtitle height), subtitle running full width.
     private var serverToggleRow: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .center) {
+            HStack(alignment: .center, spacing: 7) {
                 Text("Enable MCP server")
                     .font(.cadenza(14, weight: .medium, scale: uiScale))
+                serverStatusCapsule
                 Spacer()
                 Toggle("", isOn: $serverEnabled)
                     .labelsHidden()
@@ -107,10 +120,26 @@ struct MCPAccessInline: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            statusRow
-                .padding(.top, 2)
+            if case .failed(let message) = appState.mcpServerStatus {
+                Text("Failed: \(message). Is the port in use?")
+                    .font(.cadenza(12, scale: uiScale))
+                    .foregroundStyle(.red)
+                    .padding(.top, 2)
+            }
         }
         .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private var serverStatusCapsule: some View {
+        switch appState.mcpServerStatus {
+        case .running:
+            SettingsStatusCapsule(kind: .connected, label: "Running")
+        case .failed:
+            SettingsStatusCapsule(kind: .attention, label: "Failed")
+        case .stopped:
+            SettingsStatusCapsule(kind: .disconnected, label: "Stopped")
+        }
     }
 
     private var writesToggleRow: some View {
@@ -197,74 +226,127 @@ struct MCPAccessInline: View {
         .padding(.bottom, 10)
     }
 
-    private var statusRow: some View {
-        HStack(spacing: 6) {
-            switch appState.mcpServerStatus {
-            case .running(let activePort):
-                let runningURL = "http://127.0.0.1:\(activePort)/mcp"
-                Circle().fill(.green).frame(width: 8, height: 8)
-                Text("Running at \(runningURL)")
-                    .font(.cadenza(12, scale: uiScale))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            case .failed(let message):
-                Circle().fill(.red).frame(width: 8, height: 8)
-                Text("Failed: \(message) — is the port in use?")
-                    .font(.cadenza(12, scale: uiScale))
-                    .foregroundStyle(.red)
-            case .stopped:
-                Circle().fill(.gray).frame(width: 8, height: 8)
-                Text("Stopped")
-                    .font(.cadenza(12, scale: uiScale))
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
+    // MARK: - Address & token
 
-    // MARK: - Port & token
+    private var addressRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Address")
+                    .font(.cadenza(13, weight: .medium, scale: uiScale))
 
-    private var portRow: some View {
-        HStack(spacing: 10) {
-            Text("Port")
-                .font(.cadenza(14, weight: .medium, scale: uiScale))
-            TextField(
-                value: $port,
-                format: .number.grouping(.never),
-                prompt: Text(verbatim: "8585")
-            ) {
-                Text("Port")
+                Spacer(minLength: 8)
+
+                HStack(spacing: 6) {
+                    Text(verbatim: appState.mcpServerURL)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Button {
+                        copy(appState.mcpServerURL, label: "url")
+                    } label: {
+                        Image(systemName: copyFeedback == "url" ? "checkmark" : "doc.on.doc")
+                            .font(.cadenza(10, scale: uiScale))
+                            .foregroundStyle(copyFeedback == "url" ? .green : .secondary)
+                    }
+                    .buttonStyle(.cadenzaPlain)
+                    .accessibilityLabel(Text("Copy"))
+                    .help("Copy")
+                }
+                .padding(.horizontal, 9)
+                .frame(minHeight: 22)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                TextField(
+                    value: $port,
+                    format: .number.grouping(.never),
+                    prompt: Text(verbatim: "8585")
+                ) {
+                    Text("Port")
+                }
+                    .labelsHidden()
+                    .accessibilityLabel(Text("Port"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 70)
+                    .onSubmit(applyPortChange)
             }
-                .labelsHidden()
-                .accessibilityLabel(Text("Port"))
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 80)
-                .onSubmit(applyPortChange)
-            Text("Changing the port breaks existing client configs — update them too.")
-                .font(.cadenza(12, scale: uiScale))
-                .foregroundStyle(.secondary)
-            Spacer()
+            Text("Changing the port breaks existing client configs. Update them too.")
+                .font(.cadenza(11, scale: uiScale))
+                .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 8)
     }
 
     private var tokenRow: some View {
         HStack(spacing: 10) {
-            Text("Legacy token")
-                .font(.cadenza(14, weight: .medium, scale: uiScale))
-            Text(maskedToken)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.secondary)
-            Button {
-                copy(token, label: "token")
-            } label: {
-                Label(copyFeedback == "token" ? "Copied" : "Copy", systemImage: "doc.on.doc")
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Legacy token")
+                    .font(.cadenza(13, weight: .medium, scale: uiScale))
+                Text("Only for clients not yet migrated to per-client access.")
+                    .font(.cadenza(10.5, scale: uiScale))
+                    .foregroundStyle(.tertiary)
             }
-            .controlSize(.small)
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 6) {
+                Text(showFullToken ? token : maskedToken)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: showFullToken ? 200 : nil)
+                Button {
+                    showFullToken.toggle()
+                } label: {
+                    Image(systemName: showFullToken ? "eye.slash" : "eye")
+                        .font(.cadenza(10, scale: uiScale))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.cadenzaPlain)
+                .accessibilityLabel(Text(showFullToken ? "Hide API key" : "Show API key"))
+                Button {
+                    copy(token, label: "token")
+                } label: {
+                    Image(systemName: copyFeedback == "token" ? "checkmark" : "doc.on.doc")
+                        .font(.cadenza(10, scale: uiScale))
+                        .foregroundStyle(copyFeedback == "token" ? .green : .secondary)
+                }
+                .buttonStyle(.cadenzaPlain)
+                .accessibilityLabel(Text("Copy"))
+                .help("Copy")
+            }
+            .padding(.horizontal, 9)
+            .frame(minHeight: 22)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
             Button("Reset…") { showRegenerateAlert = true }
+                .buttonStyle(.bordered)
                 .controlSize(.small)
-            Spacer()
         }
         .padding(.vertical, 8)
+    }
+
+    // MARK: - Clients header
+
+    private var clientsHeaderRow: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("Connected clients")
+                .font(.cadenza(12, weight: .bold, scale: uiScale))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text("\(connectedClientCount) of \(MCPClientConnector.Client.allCases.count) connected")
+                .font(.cadenza(10.5, scale: uiScale))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    private var connectedClientCount: Int {
+        clientStatuses.values.filter {
+            if case .connected = $0 { return true }
+            return false
+        }.count
     }
 
     // MARK: - Client rows (mirrors ConnectionsInline.connectionRow)
@@ -275,6 +357,7 @@ struct MCPAccessInline: View {
         case .geminiCLI: "terminal"
         case .claudeDesktop: "macwindow"
         case .codexCLI: "curlybraces"
+        case .grokCLI: "sparkles"
         case .hermes: "cross.case"
         }
     }
@@ -295,45 +378,37 @@ struct MCPAccessInline: View {
                 .frame(width: iconSize, height: iconSize)
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(client.rawValue)
-                    .font(.cadenza(14, weight: .medium, scale: uiScale))
-                switch state {
-                case .connected:
-                    Text(
-                        scopesOutOfDate
-                            ? String(localized: "Scopes out of date")
-                            : String(localized: "Connected")
-                    )
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(scopesOutOfDate ? .orange : .green)
-                case .stale:
-                    Text("Token out of date")
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(.orange)
-                case .disconnected:
-                    Text("Not connected")
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(.secondary)
-                case .notInstalled(let hint):
-                    Text(hint)
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 7) {
+                    Text(client.rawValue)
+                        .font(.cadenza(14, weight: .medium, scale: uiScale))
+                    clientStateCapsule(state, scopesOutOfDate: scopesOutOfDate)
                 }
+
                 if let record = accessRecord {
-                    Text(String.localizedStringWithFormat(
-                        String(localized: "Scopes: %@"),
-                        record.scopes.map(\.rawValue).sorted().joined(separator: ", ")
-                    ))
-                        .font(.cadenza(11, scale: uiScale))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Text(record.lastUsedAt.map {
-                        String.localizedStringWithFormat(
-                            String(localized: "Last used: %@"),
-                            $0.formatted(date: .abbreviated, time: .shortened)
-                        )
-                    } ?? String(localized: "Not used yet"))
+                    // Concept O: raw scope IDs become readable mini chips and
+                    // the last-used stamp rides the same line.
+                    HStack(spacing: 5) {
+                        ForEach(record.scopes.map(\.rawValue).sorted(), id: \.self) { raw in
+                            Text(Self.scopeChipLabel(raw))
+                                .font(.cadenza(9, weight: .semibold, scale: uiScale))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 6)
+                                .frame(minHeight: 16)
+                                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        }
+                        Text(record.lastUsedAt.map {
+                            String.localizedStringWithFormat(
+                                String(localized: "Last used: %@"),
+                                $0.formatted(date: .abbreviated, time: .shortened)
+                            )
+                        } ?? String(localized: "Not used yet"))
+                            .font(.cadenza(10.5, scale: uiScale))
+                            .foregroundStyle(.tertiary)
+                            .padding(.leading, 2)
+                    }
+                } else if case .notInstalled(let hint) = state {
+                    Text(hint)
                         .font(.cadenza(11, scale: uiScale))
                         .foregroundStyle(.secondary)
                 }
@@ -341,6 +416,11 @@ struct MCPAccessInline: View {
                     Text("Access revoked, but its Keychain item could not be removed.")
                         .font(.cadenza(11, scale: uiScale))
                         .foregroundStyle(.orange)
+                }
+                if client == .grokCLI {
+                    Text("Connect applies to Grok CLI on this Mac; a remote bot connects from Cadenza Web settings.")
+                        .font(.cadenza(10.5, scale: uiScale))
+                        .foregroundStyle(.tertiary)
                 }
             }
 
@@ -352,15 +432,17 @@ struct MCPAccessInline: View {
                 switch state {
                 case .stale:
                     Button("Update") { connect(client) }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
                         .controlSize(.small)
                 case .disconnected:
                     Button("Connect") { connect(client) }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                 case .connected where scopesOutOfDate:
                     Button("Update") { connect(client) }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
                         .controlSize(.small)
                 case .connected, .notInstalled:
                     if accessRecord != nil {
@@ -371,7 +453,38 @@ struct MCPAccessInline: View {
                 }
             }
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 9)
+    }
+
+    @ViewBuilder
+    private func clientStateCapsule(
+        _ state: MCPClientConnector.ConnectionState,
+        scopesOutOfDate: Bool
+    ) -> some View {
+        switch state {
+        case .connected where scopesOutOfDate:
+            SettingsStatusCapsule(kind: .attention, label: "Scopes out of date")
+        case .connected:
+            SettingsStatusCapsule(kind: .connected, label: "Connected")
+        case .stale:
+            SettingsStatusCapsule(kind: .attention, label: "Token out of date")
+        case .disconnected, .notInstalled:
+            SettingsStatusCapsule(kind: .disconnected, label: "Not connected")
+        }
+    }
+
+    /// Readable label for a stored permission-scope ID. Unknown scopes from a
+    /// newer build fall back to their raw ID rather than disappearing.
+    private static func scopeChipLabel(_ raw: String) -> String {
+        switch MCPPermissionScope(rawValue: raw) {
+        case .recordingRead: String(localized: "Read")
+        case .recordingWrite: String(localized: "Write")
+        case .exportWrite: String(localized: "Export")
+        case .calendarContextRead: String(localized: "Calendar")
+        case .prepWrite: String(localized: "Prep brief")
+        case .externalImportWrite: String(localized: "Import")
+        case nil: raw
+        }
     }
 
     // MARK: - Connect failure fallback (the only place manual config appears)
@@ -405,44 +518,50 @@ struct MCPAccessInline: View {
     }
 
     private func manualSnippet(for client: MCPClientConnector.Client, token: String) -> String {
+        let bridge = appState.mcpBridgePath
         switch client {
         case .claudeCode:
-            "claude mcp add --transport http cadenza \(appState.mcpServerURL) --header \"Authorization: Bearer \(token)\""
+            return "claude mcp add cadenza -s user -- \(MCPClientConnector.shellQuoted(bridge)) --client \(client.accessID)"
         case .geminiCLI:
-            """
+            return """
             // ~/.gemini/settings.json
             {
               "mcpServers": {
                 "cadenza": {
-                  "httpUrl": "\(appState.mcpServerURL)",
-                  "headers": { "Authorization": "Bearer \(token)" }
+                  "command": "\(bridge)",
+                  "args": ["--client", "\(client.accessID)"]
                 }
               }
             }
             """
         case .claudeDesktop:
-            """
-            // claude_desktop_config.json (requires Node)
+            return """
+            // claude_desktop_config.json
             {
               "mcpServers": {
                 "cadenza": {
-                  "command": "npx",
-                  "args": ["-y", "mcp-remote", "\(appState.mcpServerURL)",
-                           "--header", "Authorization:${AUTH_HEADER}"],
-                  "env": { "AUTH_HEADER": "Bearer \(token)" }
+                  "command": "\(bridge)",
+                  "args": ["--client", "\(client.accessID)"]
                 }
               }
             }
             """
         case .codexCLI:
-            """
+            return """
             # ~/.codex/config.toml
             [mcp_servers.cadenza]
-            url = "\(appState.mcpServerURL)"
-            http_headers = { Authorization = "Bearer \(token)" }
+            command = "\(bridge)"
+            args = ["--client", "\(client.accessID)"]
+            """
+        case .grokCLI:
+            return """
+            # ~/.grok/config.toml
+            [mcp_servers.cadenza]
+            command = "\(bridge)"
+            args = ["--client", "\(client.accessID)"]
             """
         case .hermes:
-            """
+            return """
             # ~/.hermes/config.yaml
             mcp_servers:
               cadenza:
@@ -459,6 +578,7 @@ struct MCPAccessInline: View {
         connectingClients.insert(client)
         connectFailure = nil
         let url = appState.mcpServerURL
+        let bridgePath = appState.mcpBridgePath
         let scopes = scopesForNewConnection
         Task {
             do {
@@ -467,7 +587,13 @@ struct MCPAccessInline: View {
                     name: client.rawValue,
                     scopes: scopes
                 )
-                try await connector.connect(client, url: url, token: clientToken)
+                // The credential file must exist before any client launches
+                // the bridge — including a user applying the manual snippet
+                // after an automatic-setup failure.
+                if client.usesBridge {
+                    try bridgeRuntime.writeCredential(clientToken, for: client.accessID)
+                }
+                try await connector.connect(client, bridgePath: bridgePath, url: url, token: clientToken)
             } catch {
                 NSLog(
                     "[MCPAccess] %@ automatic setup failed: %@",
@@ -493,24 +619,24 @@ struct MCPAccessInline: View {
             return
         }
         let url = appState.mcpServerURL
+        let bridgePath = appState.mcpBridgePath
         for client in MCPClientConnector.Client.allCases {
             let expected = accessStore.existingToken(for: client.accessID) ?? token
-            clientStatuses[client] = connector.detect(client, url: url, token: expected)
+            clientStatuses[client] = connector.detect(
+                client,
+                bridgePath: bridgePath,
+                url: url,
+                token: expected,
+                storedCredential: bridgeRuntime.credential(for: client.accessID)
+            )
         }
     }
 
+    // The toggles above are @AppStorage-backed, so standard defaults always
+    // hold their current values — one shared helper keeps this in lockstep
+    // with the auto-provisioned CLI credential.
     private var scopesForNewConnection: Set<MCPPermissionScope> {
-        var scopes: Set<MCPPermissionScope> = [.recordingRead]
-        if writesEnabled {
-            scopes.insert(.recordingWrite)
-            scopes.insert(.exportWrite)
-        }
-        if meetingContextEnabled {
-            scopes.insert(.calendarContextRead)
-            if writesEnabled { scopes.insert(.prepWrite) }
-        }
-        if externalImportEnabled { scopes.insert(.externalImportWrite) }
-        return scopes
+        MCPServer.scopesForNewConnection()
     }
 
     private func refreshAccessRecords() {
@@ -525,13 +651,16 @@ struct MCPAccessInline: View {
         } else {
             incompleteRevocations.insert(client.accessID)
         }
+        // The bridge credential file is dead either way — the server no
+        // longer accepts its token.
+        try? bridgeRuntime.removeCredential(for: client.accessID)
         refreshAccessRecords()
         refreshClientStatuses()
     }
 
     private var maskedToken: String {
-        guard token.count > 8 else { return "••••••••" }
-        return "\(token.prefix(4))…\(token.suffix(4))"
+        guard token.count > 4 else { return "••••••••" }
+        return "\u{2022}\u{2022}\u{2022}\u{2022}\(token.suffix(4))"
     }
 
     private func refreshToken() {

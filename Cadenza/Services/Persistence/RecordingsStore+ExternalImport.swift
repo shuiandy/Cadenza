@@ -632,6 +632,7 @@ extension RecordingsStore {
             recording.transcript = nil
             modelContext.delete(oldTranscript)
         }
+        recording.transcriptPreview = input.transcript.map { RecordingsStore.listPreview(of: $0.fullText) } ?? ""
         if let transcriptInput = input.transcript {
             let transcript = Transcript(
                 fullText: transcriptInput.fullText,
@@ -641,6 +642,7 @@ extension RecordingsStore {
                 }
             )
             transcript.detectedLanguage = transcriptInput.detectedLanguage
+            transcript.captureSummarySource()
             recording.transcript = transcript
         }
 
@@ -648,6 +650,7 @@ extension RecordingsStore {
             recording.summary = nil
             modelContext.delete(oldSummary)
         }
+        recording.summaryPreview = input.summary.map { RecordingsStore.listPreview(of: $0.overview) } ?? ""
         if let summaryInput = input.summary {
             let summary = MeetingSummary(
                 overview: summaryInput.overview,

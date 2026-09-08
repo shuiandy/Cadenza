@@ -442,6 +442,7 @@ struct M1StorageMigrationTests {
             "craft.exportedRecordingIDs",
             "userName",
             "userJobTitle",
+            "summaryFocus",
             "smartFolders.overrides.v2",
             "smartFolders.pinned.v1",
             "smartFolders.excluded.v1",

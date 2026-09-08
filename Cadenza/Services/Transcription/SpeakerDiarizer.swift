@@ -298,7 +298,7 @@ final class SpeakerDiarizer {
 
             let audioArray: [Float]
             do {
-                audioArray = try await Task.detached {
+                audioArray = try await Task.detached(priority: ProcessingWorkPriority.shared.current) {
                     try AudioProcessor.loadAudioAsFloatArray(fromPath: audioURL.path)
                 }.value
             } catch {
@@ -316,7 +316,9 @@ final class SpeakerDiarizer {
             // indistinguishable from a failure: the cloud path applies it with
             // `replaceExistingSpeakers: true`, so an empty result wipes the
             // provider's own labels. Log the count so the two can be told apart.
-            diarizerLog.info(
+            // Notice level: .info is unpersisted by default, and the zero-speaker
+            // case below is precisely what needs to be visible after the fact.
+            diarizerLog.notice(
                 "diarize: done — \(result.speakerCount, privacy: .public) speakers, \(result.segments.count, privacy: .public) segments"
             )
             return result
@@ -416,12 +418,20 @@ final class SpeakerDiarizer {
            let lastEntry = entries.last, let lastSeg = speakerSegments.last {
             // Two timelines that do not overlap assign nothing while looking
             // like a clean run, so both ranges are logged side by side.
-            diarizerLog.info(
+            diarizerLog.notice(
                 "assign: entries \(firstEntry.startTime, privacy: .public)-\(lastEntry.endTime, privacy: .public)s, speakerSegs \(Double(firstSeg.startTime), privacy: .public)-\(Double(lastSeg.endTime), privacy: .public)s, segCount=\(speakerSegments.count, privacy: .public)"
             )
         }
 
-        let spans = speakerSegments.compactMap { segment -> SpeakerAssignmentSpan? in
+        assignSpeakers(
+            entries: &entries,
+            spans: Self.assignmentSpans(from: speakerSegments),
+            replaceExistingSpeakers: replaceExistingSpeakers
+        )
+    }
+
+    nonisolated static func assignmentSpans(from speakerSegments: [SpeakerSegment]) -> [SpeakerAssignmentSpan] {
+        speakerSegments.compactMap { segment -> SpeakerAssignmentSpan? in
             let speakerID: Int
             switch segment.speaker {
             case .speakerId(let id):
@@ -437,11 +447,20 @@ final class SpeakerDiarizer {
                 endTime: TimeInterval(segment.endTime)
             )
         }
-        assignSpeakers(
-            entries: &entries,
-            spans: spans,
-            replaceExistingSpeakers: replaceExistingSpeakers
-        )
+    }
+
+    /// The cloud path's assignment, run off the main actor. Inputs are plain
+    /// values, so nothing here needs the diarizer instance; the synchronous
+    /// instance method used to hold the main thread for the whole sweep.
+    nonisolated static func assignSpeakersOffMain(
+        entries: [TranscriptEntry],
+        diarization: DiarizationResult,
+        replaceExistingSpeakers: Bool
+    ) async -> [TranscriptEntry] {
+        let spans = assignmentSpans(from: diarization.segments)
+        return await Task.detached(priority: ProcessingWorkPriority.shared.current) {
+            assignSpeakers(entries, spans: spans, replaceExistingSpeakers: replaceExistingSpeakers)
+        }.value
     }
 
     /// Reconciles transcript entries against one recording-wide diarization pass.
@@ -452,9 +471,22 @@ final class SpeakerDiarizer {
         spans: [SpeakerAssignmentSpan],
         replaceExistingSpeakers: Bool
     ) {
-        let validSpans = spans.filter {
-            $0.startTime.isFinite && $0.endTime.isFinite && $0.endTime > $0.startTime
-        }
+        entries = Self.assignSpeakers(entries, spans: spans, replaceExistingSpeakers: replaceExistingSpeakers)
+    }
+
+    /// Pure sweep form of the assignment. Spans are sorted once; for each
+    /// entry only the spans that can overlap it are visited (binary search on
+    /// start time, bounded backwards by the longest span), so a two-hour
+    /// meeting costs O((E + S) log S) instead of E x S nested comparisons.
+    nonisolated static func assignSpeakers(
+        _ entries: [TranscriptEntry],
+        spans: [SpeakerAssignmentSpan],
+        replaceExistingSpeakers: Bool
+    ) -> [TranscriptEntry] {
+        let validSpans = spans
+            .filter { $0.startTime.isFinite && $0.endTime.isFinite && $0.endTime > $0.startTime }
+            .sorted { $0.startTime < $1.startTime }
+        let longestSpan = validSpans.map { $0.endTime - $0.startTime }.max() ?? 0
         let firstAppearance = Dictionary(grouping: validSpans, by: \.speakerID)
             .mapValues { speakerSpans in speakerSpans.map(\.startTime).min() ?? .greatestFiniteMagnitude }
         let orderedSpeakerIDs = firstAppearance.keys.sorted {
@@ -467,12 +499,31 @@ final class SpeakerDiarizer {
             ($0.element, "Speaker \($0.offset + 1)")
         })
 
-        for i in entries.indices {
-            let entry = entries[i]
+        /// First span whose start is at or beyond `time`.
+        func firstSpanIndex(startingAtOrAfter time: TimeInterval) -> Int {
+            var low = 0
+            var high = validSpans.count
+            while low < high {
+                let mid = (low + high) / 2
+                if validSpans[mid].startTime < time { low = mid + 1 } else { high = mid }
+            }
+            return low
+        }
+
+        var result = entries
+        for i in result.indices {
+            let entry = result[i]
             if entry.speaker != nil && !replaceExistingSpeakers { continue }
             var overlapBySpeaker: [Int: TimeInterval] = [:]
 
-            for span in validSpans {
+            // Candidates start before the entry ends; walking backwards stops
+            // once a span starts too early to reach the entry even at the
+            // longest observed length.
+            var index = firstSpanIndex(startingAtOrAfter: entry.endTime) - 1
+            let earliestRelevantStart = entry.startTime - longestSpan
+            while index >= 0, validSpans[index].startTime >= earliestRelevantStart {
+                let span = validSpans[index]
+                index -= 1
                 let overlapStart = max(entry.startTime, span.startTime)
                 let overlapEnd = min(entry.endTime, span.endTime)
                 let overlap = max(0, overlapEnd - overlapStart)
@@ -499,11 +550,12 @@ final class SpeakerDiarizer {
                 && margin >= minimumMargin
             let label = isConfident ? top.flatMap { canonicalLabels[$0.key] } : nil
 
-            entries[i] = TranscriptEntry(
+            result[i] = TranscriptEntry(
                 startTime: entry.startTime, endTime: entry.endTime,
                 text: entry.text,
                 speaker: label ?? (replaceExistingSpeakers ? nil : entry.speaker)
             )
         }
+        return result
     }
 }

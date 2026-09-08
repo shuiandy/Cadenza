@@ -7,6 +7,7 @@ struct CalendarDayView: View {
 
     @Binding var selectedDate: Date
     let events: [MeetingEvent]
+    var recordingStates: [String: CalendarEventRecordingState] = [:]
     var onEventTap: (MeetingEvent) -> Void
 
     private let hourHeight = CalendarTimelineMetrics.hourHeight
@@ -70,7 +71,10 @@ struct CalendarDayView: View {
                                 Button {
                                     onEventTap(item.event)
                                 } label: {
-                                    CalendarEventBlock(event: item.event)
+                                    CalendarEventBlock(
+                                            event: item.event,
+                                            recordingState: recordingStates[CalendarEventRecordingState.occurrenceKey(for: item.event)] ?? .none
+                                        )
                                         .frame(width: w - 2, height: eventHeight(item.event))
                                 }
                                 .buttonStyle(.cadenzaPlain)
