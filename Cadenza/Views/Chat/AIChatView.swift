@@ -62,10 +62,6 @@ struct AIChatView: View {
                 messagesView
             }
 
-            if messages.isEmpty && !streamState.isActive {
-                suggestionsBar
-            }
-
             if !followUpSuggestions.isEmpty && !streamState.isActive {
                 followUpView
                     .transition(.asymmetric(
@@ -105,29 +101,25 @@ struct AIChatView: View {
     // MARK: - Top Bar
 
     private var topBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Spacer(minLength: 10)
 
-            HStack(spacing: 2) {
-                topBarButton("clock.arrow.circlepath", help: "History") {
-                    showHistory.toggle()
-                }
-                .popover(isPresented: $showHistory) {
-                    chatHistoryPopover
-                }
-
-                topBarButton("plus.message", help: "New Chat") {
-                    stopStreaming(savePartial: false)
-                    saveCurrentSessionIfNeeded()
-                    appState.aiChatMessages.removeAll()
-                    appState.aiChatScopeIDs.removeAll()
-                    currentSessionID = nil
-                    followUpSuggestions.removeAll()
-                }
-                .disabled(messages.isEmpty && !streamState.isActive)
+            topBarButton("plus", help: "New Chat") {
+                stopStreaming(savePartial: false)
+                saveCurrentSessionIfNeeded()
+                appState.aiChatMessages.removeAll()
+                appState.aiChatScopeIDs.removeAll()
+                currentSessionID = nil
+                followUpSuggestions.removeAll()
             }
-            .padding(4)
-            .cadenzaGlass(in: Capsule(), interactive: true)
+            .disabled(messages.isEmpty && !streamState.isActive)
+
+            topBarButton("clock.arrow.circlepath", help: "History") {
+                showHistory.toggle()
+            }
+            .popover(isPresented: $showHistory) {
+                chatHistoryPopover
+            }
         }
         .padding(.leading, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -177,20 +169,20 @@ struct AIChatView: View {
         help: LocalizedStringKey,
         action: @escaping () -> Void
     ) -> some View {
-        let controlSize = CadenzaControlMetrics.squareIconFrame(
-            base: 32,
-            symbolPointSize: 14,
-            scale: uiScale,
-            padding: 13
-        )
-        return Button(action: action) {
-            Image(systemName: icon)
-                .font(.cadenza(14, weight: .medium, scale: uiScale))
-                .foregroundStyle(.secondary)
-                .frame(width: controlSize, height: controlSize)
-                .contentShape(Rectangle())
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.cadenza(11, weight: .semibold, scale: uiScale))
+                Text(help)
+                    .font(.cadenza(12, weight: .semibold, scale: uiScale))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 28)
+            .contentShape(Capsule())
         }
         .buttonStyle(.cadenzaPlain)
+        .cadenzaGlass(in: Capsule(), interactive: true)
         .accessibilityLabel(Text(help))
         .help(Text(help))
     }
@@ -199,86 +191,99 @@ struct AIChatView: View {
 
     private var placeholderView: some View {
         ScrollView {
-            VStack(spacing: 0) {
-                Spacer(minLength: 40)
-                    .frame(maxWidth: .infinity)
-
-                VStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(spacing: 4) {
                     Image(systemName: "sparkles")
-                        .font(.cadenza(36, scale: uiScale))
-                        .foregroundStyle(.secondary.opacity(0.6))
+                        .font(.cadenza(26, scale: uiScale))
+                        .foregroundStyle(Color.accentColor.opacity(0.75))
 
-                    Text("\(recordingsCount) recordings available")
-                        .font(.cadenza(15, scale: uiScale))
-                        .foregroundStyle(.tertiary)
+                    Text("Ask your \(recordingsCount) recordings")
+                        .font(.cadenza(18, weight: .bold, scale: uiScale))
+
+                    Text("Ask across meetings, find decisions, track follow-ups")
+                        .font(.cadenza(12, scale: uiScale))
+                        .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 14)
 
-                // Recent Chats
+                suggestionCardsGrid
+
                 if !appState.chatHistory.sessions.isEmpty {
-                    Spacer(minLength: 24)
-                        .frame(maxWidth: .infinity)
-
                     recentChatsSection
-                        .padding(.bottom, 10)
                 }
             }
+            .frame(maxWidth: 640)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 8)
         }
     }
 
-    // MARK: - Suggestions Bar (pinned above input)
+    // MARK: - Suggestion Scenario Cards
 
-    private var suggestionsBar: some View {
-        AIChatSuggestionLayout(
-            stacked: usesAccessibleLayout,
-            spacing: 10,
-            accessibleColumns: 2
+    private var suggestionCardsGrid: some View {
+        LazyVGrid(
+            columns: Array(
+                repeating: GridItem(.flexible(), spacing: 10),
+                count: usesAccessibleLayout ? 1 : 2
+            ),
+            spacing: 10
         ) {
-            ForEach(suggestedQuestions, id: \.text) { question in
+            ForEach(suggestedQuestions, id: \.title) { scenario in
                 Button {
-                    startStreamingMessage(question.text)
+                    startStreamingMessage(scenario.title)
                 } label: {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(question.emoji)
-                            .font(.cadenza(26, scale: uiScale))
-                        Text(question.text)
-                            .font(.cadenza(14, scale: uiScale))
-                            .multilineTextAlignment(.leading)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(usesAccessibleLayout ? nil : 2)
-                            .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        Image(systemName: scenario.icon)
+                            .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                            .foregroundStyle(scenario.tint)
+                            .frame(width: 30, height: 30)
+                            .background(
+                                scenario.tint.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(scenario.title)
+                                .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                            Text(scenario.subtitle)
+                                .font(.cadenza(11, scale: uiScale))
+                                .foregroundStyle(.secondary)
+                        }
+                        .multilineTextAlignment(.leading)
+
+                        Spacer(minLength: 0)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
-                    .padding(14)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
                 .buttonStyle(.cadenzaPlain)
                 .disabled(!appState.startupPolicy.allowsContentGeneration)
                 .cadenzaGlass(
-                    in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous),
                     interactive: true
                 )
             }
         }
-        .frame(maxWidth: 640)
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 10)
-        .padding(.bottom, 6)
     }
 
     // MARK: - Recent Chats Section
 
     private var recentChatsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
+            HStack(alignment: .firstTextBaseline) {
                 Text("Recent Chats")
-                    .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                    .font(.cadenza(12, weight: .bold, scale: uiScale))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
                     showHistory = true
                 } label: {
                     Text("See All")
-                        .font(.cadenza(12, scale: uiScale))
-                        .foregroundStyle(.secondary)
+                        .font(.cadenza(11, weight: .semibold, scale: uiScale))
+                        .foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.cadenzaPlain)
                 .popover(isPresented: $showHistory) {
@@ -286,36 +291,39 @@ struct AIChatView: View {
                 }
             }
 
-            ForEach(appState.chatHistory.sessions.prefix(5)) { session in
+            ForEach(recentChatSessions) { session in
                 Button {
                     restoreSession(session)
                 } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "bubble.left.and.bubble.right")
+                    HStack(spacing: 9) {
+                        Image(systemName: "bubble.left")
                             .font(.cadenza(12, scale: uiScale))
                             .foregroundStyle(.tertiary)
-                        VStack(alignment: .leading, spacing: 2) {
+
+                        if usesAccessibleLayout {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.title)
+                                    .font(.cadenza(13, weight: .medium, scale: uiScale))
+                                    .lineLimit(2)
+                                sessionMetaLine(session)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
                             Text(session.title)
                                 .font(.cadenza(13, weight: .medium, scale: uiScale))
                                 .lineLimit(1)
-                            HStack(spacing: 4) {
-                                Text(session.updatedAt.formatted(.relative(presentation: .named)))
-                                    .font(.cadenza(11, scale: uiScale))
-                                    .foregroundStyle(.tertiary)
-                                Text("\u{00B7}")
-                                    .foregroundStyle(.quaternary)
-                                Text("\(session.messages.count) messages")
-                                    .font(.cadenza(11, scale: uiScale))
-                                    .foregroundStyle(.tertiary)
-                            }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            sessionMetaLine(session)
+                                .fixedSize()
                         }
-                        Spacer()
+
                         Image(systemName: "chevron.right")
                             .font(.cadenza(10, weight: .medium, scale: uiScale))
                             .foregroundStyle(.quaternary)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.cadenzaPlain)
@@ -325,7 +333,34 @@ struct AIChatView: View {
                 )
             }
         }
-        .frame(maxWidth: 640)
+    }
+
+    /// Retrying the same question leaves near-identical sessions back to back;
+    /// the shortlist keeps only the most recent session per title. The full
+    /// history popover still lists every session.
+    private var recentChatSessions: [ChatSession] {
+        var seenTitles = Set<String>()
+        var result: [ChatSession] = []
+        for session in appState.chatHistory.sessions {
+            let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard seenTitles.insert(title).inserted else { continue }
+            result.append(session)
+            if result.count == 5 { break }
+        }
+        return result
+    }
+
+    private func sessionMetaLine(_ session: ChatSession) -> some View {
+        HStack(spacing: 4) {
+            Text(session.updatedAt.formatted(.relative(presentation: .named)))
+                .font(.cadenza(10.5, scale: uiScale))
+                .foregroundStyle(.tertiary)
+            Text("\u{00B7}")
+                .foregroundStyle(.quaternary)
+            Text("\(session.messages.count) messages")
+                .font(.cadenza(10.5, scale: uiScale))
+                .foregroundStyle(.tertiary)
+        }
     }
 
     // MARK: - History Popover
@@ -450,12 +485,39 @@ struct AIChatView: View {
         followUpSuggestions.removeAll()
     }
 
-    private var suggestedQuestions: [(emoji: String, text: String)] {
+    private struct SuggestedScenario {
+        let icon: String
+        let tint: Color
+        let title: String
+        let subtitle: String
+    }
+
+    private var suggestedQuestions: [SuggestedScenario] {
         [
-            ("\u{1F4CB}", String(localized: "Action items from my last meeting")),
-            ("\u{1F4CA}", String(localized: "Key decisions this week")),
-            ("\u{1F50D}", String(localized: "Find meetings by topic")),
-            ("\u{1F4CC}", String(localized: "Open follow-ups"))
+            SuggestedScenario(
+                icon: "checklist",
+                tint: .blue,
+                title: String(localized: "Action items from my last meeting"),
+                subtitle: String(localized: "Pull action items from your most recent meeting")
+            ),
+            SuggestedScenario(
+                icon: "checkmark.seal",
+                tint: .green,
+                title: String(localized: "Key decisions this week"),
+                subtitle: String(localized: "Roll up what got decided in the last 7 days")
+            ),
+            SuggestedScenario(
+                icon: "magnifyingglass",
+                tint: .purple,
+                title: String(localized: "Find meetings by topic"),
+                subtitle: String(localized: "Search every transcript by theme")
+            ),
+            SuggestedScenario(
+                icon: "tray.and.arrow.down",
+                tint: .orange,
+                title: String(localized: "Open follow-ups"),
+                subtitle: String(localized: "Commitments that never closed out")
+            )
         ]
     }
 
@@ -584,24 +646,26 @@ struct AIChatView: View {
     // MARK: - Input Bar
 
     private var inputBar: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 9) {
             TextField("Ask about your recordings...", text: $inputText, axis: .vertical)
                 .textFieldStyle(.plain)
-                .font(.cadenza(16, weight: .medium, scale: uiScale))
+                .font(.cadenza(15, weight: .medium, scale: uiScale))
                 .lineLimit(1...6)
                 .onSubmit(submitInput)
                 .disabled(streamState.isActive || !appState.startupPolicy.allowsContentGeneration)
-                .padding(.horizontal, 18)
-                .padding(.top, 18)
-                .padding(.bottom, 14)
+                .frame(minHeight: 44, alignment: .topLeading)
+                .padding(.horizontal, 4)
 
-            Rectangle()
-                .fill(Color.primary.opacity(0.06))
-                .frame(height: 1)
-                .padding(.horizontal, 16)
-
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 modelMenu
+                    .font(.cadenza(11.5, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 24)
+                    .background(Color.primary.opacity(0.05), in: Capsule())
+                    .overlay(
+                        Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                    )
 
                 Spacer()
 
@@ -609,9 +673,7 @@ struct AIChatView: View {
                     Button {
                         stopStreaming(savePartial: true)
                     } label: {
-                        Image(systemName: "stop.circle.fill")
-                            .font(.cadenza(24, scale: uiScale))
-                            .foregroundStyle(.secondary)
+                        sendCircle(icon: "stop.fill", active: true)
                     }
                     .buttonStyle(.cadenzaPlain)
                     .help("Stop response")
@@ -619,21 +681,31 @@ struct AIChatView: View {
                     Button {
                         submitInput()
                     } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.cadenza(24, scale: uiScale))
-                            .foregroundStyle(canSend ? .primary : .tertiary)
+                        sendCircle(icon: "arrow.up", active: canSend)
                     }
                     .buttonStyle(.cadenzaPlain)
                     .disabled(!canSend)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
         }
-        .cadenzaGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, 14)
+        .padding(.top, 13)
+        .padding(.bottom, 10)
+        .cadenzaGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .frame(maxWidth: 640)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 10)
+    }
+
+    private func sendCircle(icon: String, active: Bool) -> some View {
+        Image(systemName: icon)
+            .font(.cadenza(12, weight: .bold, scale: uiScale))
+            .foregroundStyle(active ? Color.white : Color.secondary)
+            .frame(width: 28, height: 28)
+            .background(
+                Circle().fill(active ? Color.accentColor : Color.primary.opacity(0.1))
+            )
+            .contentShape(Circle())
     }
 
     private var canSend: Bool {

@@ -348,6 +348,23 @@ struct SummaryLanguageResolverTests {
 @Suite("SummaryPrompt.twoStagePrompts")
 struct TwoStagePromptTests {
 
+    @Test(arguments: SummaryDetailLevel.allCases)
+    func chosenDepthReachesSinglePassAndBothLongMeetingStages(level: SummaryDetailLevel) {
+        let prompts = [
+            SummaryPrompt.system(language: "en", detailLevel: level),
+            SummaryPrompt.mapSystem(language: "en", detailLevel: level),
+            SummaryPrompt.reduceSystem(language: "en", jobTitle: nil, meetingType: nil,
+                                       meetingTitle: nil, detailLevel: level)
+        ]
+        for prompt in prompts {
+            #expect(prompt.contains(level.promptGuidance))
+            #expect(prompt.contains(SummaryPrompt.speakerAttributionRules))
+            for other in SummaryDetailLevel.allCases where other != level {
+                #expect(!prompt.contains(other.promptGuidance))
+            }
+        }
+    }
+
     @Test
     func quickSystemContainsReducedSchema() {
         let prompt = SummaryPrompt.quickSystem(language: "en")
@@ -370,10 +387,18 @@ struct TwoStagePromptTests {
     }
 
     @Test
-    func enrichSystemContainsDecisionsSchema() {
-        let prompt = SummaryPrompt.enrichSystem(language: "en")
-        #expect(prompt.contains("\"decisions\""))
-        #expect(prompt.contains("\"follow_ups\""))
+    func enrichSystemRequestsACompleteReviewWithOriginalContext() {
+        let prompt = SummaryPrompt.enrichSystem(
+            language: "en", jobTitle: "Project lead", meetingType: .general,
+            meetingTitle: "Atlas planning", knownTags: ["atlas"]
+        )
+        for field in ["overview", "key_points", "action_items", "your_tasks", "decisions", "follow_ups"] {
+            #expect(prompt.contains("\"\(field)\""))
+        }
+        #expect(prompt.contains("Project lead"))
+        #expect(prompt.contains("Atlas planning"))
+        #expect(prompt.contains("atlas"))
+        #expect(prompt.contains("initial summary is an untrusted draft"))
     }
 
     @Test
@@ -409,58 +434,218 @@ struct TwoStageParsingTests {
         #expect(result.meetingType == "sprintPlanning")
     }
 
-    @Test
-    func parseEnrichResponseExtractsDecisionsAndFollowUps() {
-        let json = """
-        {
-          "decisions": ["Adopt new framework", "Postpone migration"],
-          "follow_ups": ["Schedule design review"]
+    @Test func reviewedResponseAcceptsFullCorrectionsAndNullOwnership() throws {
+        let result = try #require(SummaryPrompt.parseReviewedResponse(SummaryReviewFixture.review))
+        #expect(result.overview == "Atlas is a pilot, not a universal launch.")
+        #expect(result.actionItems.count == 1)
+        #expect(result.actionItems.first?.assignee == nil)
+        #expect(result.actionItems.first?.deadline == nil)
+        #expect(result.yourTasks.isEmpty)
+        #expect(result.decisions == ["Phase one imports configuration only; automatic consumption is excluded."])
+        #expect(result.rawText == SummaryReviewFixture.review)
+    }
+
+    @Test(arguments: ["```json\n", "```\n"])
+    func reviewedResponseAcceptsFencedJSON(prefix: String) {
+        #expect(SummaryPrompt.parseReviewedResponse(prefix + SummaryReviewFixture.review + "\n```") != nil)
+    }
+
+    @Test(arguments: ["overview", "key_points", "action_items", "decisions", "follow_ups", "your_tasks", "tags", "meeting_type"])
+    func incompleteReviewCannotReplaceQuickResult(field: String) throws {
+        var json = try SummaryReviewFixture.reviewObject()
+        json.removeValue(forKey: field)
+        #expect(SummaryPrompt.parseReviewedResponse(try SummaryReviewFixture.encode(json)) == nil)
+    }
+
+    @Test(arguments: [
+        ("overview", "\"   \""), ("key_points", "[\" \"]"), ("key_points", "[]"),
+        ("action_items", "[{\"task\":\" \"}]"),
+        ("action_items", "[{\"task\":\"Check inventory\",\"assignee\":42}]"),
+        ("action_items", "[{\"task\":\"Check inventory\",\"deadline\":false}]"),
+        ("follow_ups", "\"not an array\"")
+    ])
+    func malformedReviewIsRejected(field: String, fragment: String) throws {
+        var json = try SummaryReviewFixture.reviewObject()
+        json[field] = try JSONSerialization.jsonObject(with: Data(fragment.utf8), options: .fragmentsAllowed)
+        #expect(SummaryPrompt.parseReviewedResponse(try SummaryReviewFixture.encode(json)) == nil)
+    }
+
+    @Test func truncatedOrLegacyAppendOnlyReviewIsRejected() {
+        #expect(SummaryPrompt.parseReviewedResponse("{\"overview\":") == nil)
+        #expect(SummaryPrompt.parseReviewedResponse("{\"decisions\": [], \"follow_ups\": []}") == nil)
+    }
+
+    @Test func explicitEmptyTasksCanRemoveUnsupportedDraftTasks() throws {
+        var json = try SummaryReviewFixture.reviewObject()
+        json["action_items"] = [] as [String]
+        let result = try #require(SummaryPrompt.parseReviewedResponse(try SummaryReviewFixture.encode(json)))
+        #expect(result.actionItems.isEmpty)
+        #expect(result.yourTasks.isEmpty)
+    }
+}
+
+/// Fictional scripted provider responses test orchestration, not model accuracy.
+private enum SummaryReviewFixture {
+    static let transcript = """
+    Speaker roster: A=Alex; B=Blair
+    Transcript turns:
+    [00:00] A: Could every Atlas team launch in November?
+    [00:20] B: No. November is our pilot target only, conditional on the inventory cleanup.
+    [00:40] A: Agreed. Phase one imports configuration, not automatic consumption.
+    [01:00] B: Someone still needs to check inventory ownership; no owner or due date was assigned.
+    """
+    static let quick = """
+    {"title":"Atlas planning","overview":"Every team launches in November.",
+     "key_points":["Launch all teams in November"],
+     "action_items":[{"task":"Launch all teams","assignee":"Alex","deadline":"November"}],
+     "your_tasks":["Launch all teams"],"tags":["atlas"],"meeting_type":"general"}
+    """
+    static let review = """
+    {"title":"Atlas pilot scope","overview":"Atlas is a pilot, not a universal launch.",
+     "key_points":["November is Blair's pilot target only, conditional on inventory cleanup."],
+     "action_items":[{"task":"Check inventory ownership","assignee":null,"deadline":null}],
+     "decisions":["Phase one imports configuration only; automatic consumption is excluded."],
+     "follow_ups":["Inventory ownership remains unresolved."],"your_tasks":[],
+     "tags":["atlas"],"meeting_type":"general"}
+    """
+    static func reviewObject() throws -> [String: Any] {
+        try #require(JSONSerialization.jsonObject(with: Data(review.utf8)) as? [String: Any])
+    }
+    static func encode(_ json: [String: Any]) throws -> String {
+        String(decoding: try JSONSerialization.data(withJSONObject: json), as: UTF8.self)
+    }
+}
+
+@Suite("Summary review pipeline")
+struct SummaryReviewPipelineTests {
+    @MainActor @Test func cancellationStopsBeforeReviewWithoutUserError() async {
+        let calls = SummaryReviewCallLog()
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await run(service: SummaryReviewService(review: SummaryReviewFixture.review, calls: calls))
         }
-        """
-        let (decisions, followUps) = SummaryPrompt.parseEnrichResponse(json)
-        #expect(decisions.count == 2)
-        #expect(decisions[0] == "Adopt new framework")
-        #expect(followUps.count == 1)
+        let (_, result, error) = await task.value
+        #expect(result == nil)
+        #expect(error == nil)
+        #expect(await calls.requests.isEmpty)
     }
 
-    @Test
-    func parseEnrichResponseHandlesEmpty() {
-        let json = """
-        {"decisions": [], "follow_ups": []}
-        """
-        let (decisions, followUps) = SummaryPrompt.parseEnrichResponse(json)
-        #expect(decisions.isEmpty)
-        #expect(followUps.isEmpty)
-    }
-
-    @Test
-    func parseEnrichResponseHandlesInvalidJSON() {
-        let (decisions, followUps) = SummaryPrompt.parseEnrichResponse("not json")
-        #expect(decisions.isEmpty)
-        #expect(followUps.isEmpty)
-    }
-
-    @Test
-    func mergeQuickAndEnrichCombinesCorrectly() {
-        let quick = SummaryResult(
-            title: "Meeting", overview: "Overview", keyPoints: ["Point"],
-            actionItems: [], decisions: [], followUps: [], yourTasks: [],
-            tags: ["tag"], chapters: [], rawText: "quick raw",
-            meetingType: "general"
+    @MainActor @Test func reviewReplacesDraftFactsAndTasksAndKeepsQuickPreview() async throws {
+        let calls = SummaryReviewCallLog()
+        let preview = SummaryReviewPreview()
+        let (text, result, error) = await run(
+            service: SummaryReviewService(review: SummaryReviewFixture.review, calls: calls), preview: preview
         )
-        let merged = SummaryPrompt.mergeQuickAndEnrich(
-            quick: quick,
-            decisions: ["Decision A"],
-            followUps: ["Follow B"],
-            enrichRawText: "enrich raw"
+        #expect(error == nil)
+        #expect(preview.quick?.overview == "Every team launches in November.")
+        #expect(preview.reviewStarted)
+        let final = try #require(result)
+        #expect(final.overview == "Atlas is a pilot, not a universal launch.")
+        #expect(final.actionItems.first?.task == "Check inventory ownership")
+        #expect(final.yourTasks.isEmpty)
+        #expect(text == SummaryReviewFixture.review)
+        #expect(!text.contains("Launch all teams"))
+        let requests = await calls.requests
+        #expect(requests.count == 2)
+        #expect(requests[1].user.contains(SummaryReviewFixture.transcript))
+        #expect(requests[1].user.contains(SummaryReviewFixture.quick))
+        #expect(requests[1].system.contains("Project lead"))
+    }
+
+    @MainActor @Test(arguments: SummaryDetailLevel.allCases)
+    func quickAndReviewUseTheSameSelectedDepth(level: SummaryDetailLevel) async throws {
+        let calls = SummaryReviewCallLog()
+        let (_, result, error) = await run(
+            service: SummaryReviewService(review: SummaryReviewFixture.review, calls: calls),
+            detailLevel: level
         )
-        #expect(merged.title == "Meeting")
-        #expect(merged.overview == "Overview")
-        #expect(merged.keyPoints == ["Point"])
-        #expect(merged.decisions == ["Decision A"])
-        #expect(merged.followUps == ["Follow B"])
-        #expect(merged.tags == ["tag"])
-        #expect(merged.rawText.contains("quick raw"))
-        #expect(merged.rawText.contains("enrich raw"))
+        #expect(error == nil)
+        #expect(result != nil)
+        let requests = await calls.requests
+        #expect(requests.count == 2)
+        for request in requests {
+            #expect(request.system.contains(level.promptGuidance))
+        }
+    }
+
+    @MainActor @Test(arguments: ["{\"decisions\":[],\"follow_ups\":[]}", "truncated JSON"])
+    func incompleteReviewRestoresUsableQuickResult(review: String) async {
+        let (text, result, error) = await run(service: SummaryReviewService(review: review))
+        #expect(error == nil)
+        #expect(text == SummaryReviewFixture.quick)
+        #expect(result?.actionItems.first?.task == "Launch all teams")
+        #expect(result?.overview == "Every team launches in November.")
+    }
+
+    @MainActor @Test func transportFailureAfterPartialReviewRestoresQuickResult() async {
+        let (text, result, error) = await run(service: SummaryReviewService(review: "partial", failsReview: true))
+        #expect(error == nil)
+        #expect(text == SummaryReviewFixture.quick)
+        #expect(result?.rawText == SummaryReviewFixture.quick)
+    }
+
+    @MainActor @Test(arguments: [true, false])
+    func repairsAtMostOnceOnlyForSourceBackedIssues(hasEvidence: Bool) async throws {
+        var object = try SummaryReviewFixture.reviewObject()
+        object["review_issues"] = [["section": "action_items", "kind": "unsupported",
+            "evidence": hasEvidence ? "Someone still needs to check inventory ownership" : "Not in transcript",
+            "description": "Keep unassigned work as a follow-up", "resolved": false]]
+        let calls = SummaryReviewCallLog()
+        let (_, result, error) = await run(service: SummaryReviewService(review: try SummaryReviewFixture.encode(object), calls: calls), model: "gpt-5.6-sol")
+        #expect(error == nil)
+        #expect(await calls.requests.count == (hasEvidence ? 3 : 2))
+        // Provider repeats the unresolved issue; never keep retrying or claim completion.
+        #expect(result?.generationMetadata?.stage == .repairIncomplete)
+    }
+
+    @MainActor private func run(
+        service: SummaryReviewService, preview: SummaryReviewPreview = SummaryReviewPreview(),
+        detailLevel: SummaryDetailLevel = .detailed, model: String = "fixture-model"
+    ) async -> (String, SummaryResult?, String?) {
+        await SummaryGenerator.runTwoStageStreamGenerate(
+            service: service, transcript: SummaryReviewFixture.transcript, language: "en",
+            model: model, jobTitle: "Project lead", meetingType: .general,
+            meetingTitle: "Atlas planning", knownTags: ["atlas"], detailLevel: detailLevel,
+            onQuickChunk: { _ in }, onQuickDone: { preview.quick = $0 },
+            onEnrichStart: { preview.reviewStarted = true }, onEnrichChunk: { _ in }
+        )
+    }
+}
+
+@MainActor private final class SummaryReviewPreview {
+    var quick: SummaryResult?
+    var reviewStarted = false
+}
+
+private actor SummaryReviewCallLog {
+    var requests: [(system: String, user: String)] = []
+    func record(system: String, user: String) { requests.append((system, user)) }
+}
+
+private struct SummaryReviewService: AIServiceProtocol {
+    let provider: AIProvider = .openai
+    let review: String
+    var failsReview = false
+    var calls = SummaryReviewCallLog()
+
+    func streamChat(systemPrompt: String, userMessage: String, model: String?) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await calls.record(system: systemPrompt, user: userMessage)
+                let isReview = systemPrompt.contains("Review phase:")
+                continuation.yield(isReview ? review : SummaryReviewFixture.quick)
+                if isReview && failsReview {
+                    continuation.finish(throwing: AIServiceError.invalidResponse)
+                } else {
+                    continuation.finish()
+                }
+            }
+        }
+    }
+    func summarize(transcript: String, language: String, model: String?, jobTitle: String?, meetingType: MeetingType?, meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel) async throws -> SummaryResult {
+        throw AIServiceError.invalidResponse
+    }
+    func streamSummarize(transcript: String, language: String, model: String?, jobTitle: String?, meetingType: MeetingType?, meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { $0.finish(throwing: AIServiceError.invalidResponse) }
     }
 }

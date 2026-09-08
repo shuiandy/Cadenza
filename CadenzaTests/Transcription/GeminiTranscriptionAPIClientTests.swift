@@ -31,6 +31,48 @@ struct GeminiTranscriptionAPIClientTests {
         #expect(request.timeoutInterval == 300)
     }
 
+    @Test func interactionRequestUsesFixedEndpointWithoutModelInPath() async throws {
+        GeminiTranscriptionTestURLProtocol.reset()
+        let secret = "gemini-batch-secret"
+        let client = GeminiTranscriptionAPIClient(
+            apiKey: secret,
+            model: "gemini-3.5-transcribe",
+            transport: makeTransport()
+        )
+
+        _ = try await client.createInteraction(body: Data("{}".utf8))
+        let request = try #require(GeminiTranscriptionTestURLProtocol.capturedRequest)
+
+        #expect(
+            request.urlString
+                == "https://generativelanguage.googleapis.com/v1beta/interactions"
+        )
+        #expect(request.urlString.contains("gemini-3.5-transcribe") == false)
+        #expect(request.urlString.contains(secret) == false)
+        #expect(request.apiKey == secret)
+        #expect(request.method == "POST")
+    }
+
+    @Test(arguments: [
+        "",
+        "models/gemini-3.5-transcribe",
+        "gemini-3.5-transcribe?key=secret",
+        "gemini-" + String(repeating: "x", count: 257),
+    ])
+    func invalidModelIsRejectedBeforeAnInteractionIsSent(_ model: String) async throws {
+        GeminiTranscriptionTestURLProtocol.reset()
+        let client = GeminiTranscriptionAPIClient(
+            apiKey: "gemini-batch-secret",
+            model: model,
+            transport: makeTransport()
+        )
+
+        await #expect(throws: AITransportError.self) {
+            _ = try await client.createInteraction(body: Data("{}".utf8))
+        }
+        #expect(GeminiTranscriptionTestURLProtocol.totalRequestCount == 0)
+    }
+
     @Test(arguments: [302, 307, 308])
     func redirectIsRejectedBeforeTargetReceivesRequest(statusCode: Int) async throws {
         GeminiTranscriptionTestURLProtocol.reset(mode: .redirect(statusCode))

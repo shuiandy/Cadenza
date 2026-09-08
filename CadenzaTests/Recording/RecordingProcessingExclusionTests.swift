@@ -600,7 +600,9 @@ struct RecordingProcessingExclusionTests {
         // the meeting records without any new detector callback.
         spy.appleLanguageResult = true
         #expect(await waitUntil { !spy.captureRequests.isEmpty })
-        #expect(engine.recordingState == .recording)
+        // The capture request lands before startRecording publishes the state,
+        // so the state assertion must wait on its own.
+        #expect(await waitUntil { engine.recordingState == .recording })
         #expect(engine._test_pendingMeetingAutoStart == nil)
         engine.forceReset()
         #expect(await waitUntil { gate.isAllIdle })

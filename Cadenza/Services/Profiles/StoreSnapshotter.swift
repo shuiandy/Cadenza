@@ -84,16 +84,12 @@ enum StoreSnapshotter {
 
     /// Opens a store read-only and returns counts for the verified entities.
     static func readEntityCounts(storeURL: URL) throws -> [String: Int] {
-        let configuration = ModelConfiguration(url: storeURL, allowsSave: false)
-        let container: ModelContainer
-        do {
-            container = try ModelContainer(
-                for: RecordingsStore.schema, configurations: configuration
-            )
-        } catch {
-            throw StoreSnapshotError.openFailed(error.localizedDescription)
+        // Inspect legacy snapshots without asking SwiftData to migrate a read-only
+        // artifact merely to count the new additive private-context entity.
+        guard let counts = try LiveTransferStoreInspector(fileOperations: LiveFileOperations()).entityCounts(at: storeURL) else {
+            throw StoreSnapshotError.sourceMissing(storeURL.path)
         }
-        return try readEntityCounts(container: container)
+        return counts
     }
 
     static func readEntityCounts(container: ModelContainer) throws -> [String: Int] {
@@ -105,6 +101,7 @@ enum StoreSnapshotter {
             counts["Recording"] = try context.fetchCount(FetchDescriptor<Recording>())
             counts["Transcript"] = try context.fetchCount(FetchDescriptor<Transcript>())
             counts["MeetingSummary"] = try context.fetchCount(FetchDescriptor<MeetingSummary>())
+            counts["SummaryContextRecord"] = try context.fetchCount(FetchDescriptor<SummaryContextRecord>())
             counts["ExternalRecordingImport"] =
                 try context.fetchCount(FetchDescriptor<ExternalRecordingImport>())
             counts["Folder"] = try context.fetchCount(FetchDescriptor<Folder>())

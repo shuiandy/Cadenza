@@ -152,8 +152,8 @@ equivalents fold together, so `1-on-1`, `1on1`, and `1:1` stay one tag instead o
   manifest, and a deterministic byte-identical output for the same input. It never contains
   keys or tokens. Cadenza does not currently import or restore this archive in-app.
 - **Calendar** — EventKit and Google Calendar, plus Zoom meeting metadata.
-- **MCP server** — expose your transcripts to Claude Code, Claude Desktop, Codex, Gemini
-  CLI, or Hermes over a loopback HTTP server with bearer auth. Off by default; writes and
+- **MCP server** — expose your transcripts to Claude Code, Claude Desktop, Codex, Grok,
+  Gemini CLI, or Hermes over a loopback HTTP server with bearer auth. Off by default; writes and
   meeting-context access are separate opt-in switches. Settings can write the client
   config for you.
 

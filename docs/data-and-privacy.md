@@ -117,6 +117,12 @@ must present a bearer token. Read access, write access, and meeting-context acce
 separate scopes. Treat client configuration files containing a bearer token as sensitive,
 and revoke a client from Cadenza settings when it is no longer trusted.
 
+A second, read-only MCP endpoint lives on Cadenza Web (`POST /mcp`). It is opt-in
+and token-gated. It can only read synced `ready` recordings that are still stored
+in the cloud. Turning Web Sync off, signing out, or deleting a local recording
+does not wipe that cloud history. Revoke the Web token from Settings → Integrations
+when a remote agent should lose access.
+
 ## Test and screenshot isolation
 
 `CADENZA_DATA_ROOT` is a DEBUG-only seam for Cadenza-owned files: profile metadata,

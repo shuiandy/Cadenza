@@ -14,7 +14,10 @@ final class ProcessTapSystemAudioCapture {
     private var aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private(set) var isCapturing = false
-    private let callbackQueue = DispatchQueue(label: "com.shuiandy.Cadenza.processTapAudio", qos: .utility)
+    // Matches the microphone path. At `.utility` the system-audio writes and
+    // the realtime resample were eligible for efficiency-core scheduling while
+    // background transcription ran at `.userInitiated` above them.
+    private let callbackQueue = DispatchQueue(label: "com.shuiandy.Cadenza.processTapAudio", qos: .userInitiated)
 
     var onSystemAudio: (@Sendable (CMSampleBuffer) -> Void)?
 

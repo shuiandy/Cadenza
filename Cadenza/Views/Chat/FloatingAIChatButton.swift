@@ -307,6 +307,19 @@ struct FloatingChatPanelRoot: View {
     private var panelHeaderActions: some View {
         HStack(spacing: 10) {
             Button {
+                resetChat()
+            } label: {
+                Image(systemName: "plus")
+                    .font(.cadenza(12, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                    .frame(width: headerControlSize, height: headerControlSize)
+                    .background(Circle().fill(Color.primary.opacity(0.08)))
+            }
+            .buttonStyle(.cadenzaPlain(in: Circle()))
+            .help("New Chat")
+            .disabled(messages.isEmpty && !streamState.isActive)
+
+            Button {
                 showHistory.toggle()
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
@@ -334,19 +347,6 @@ struct FloatingChatPanelRoot: View {
             .help("Open in AI Assistant")
             // Disable while streaming — in-flight Task can't be transplanted, only completed messages can.
             .disabled(messages.isEmpty || streamState.isActive)
-
-            Button {
-                resetChat()
-            } label: {
-                Image(systemName: "arrow.counterclockwise")
-                    .font(.cadenza(12, weight: .semibold, scale: uiScale))
-                    .foregroundStyle(.secondary)
-                    .frame(width: headerControlSize, height: headerControlSize)
-                    .background(Circle().fill(Color.primary.opacity(0.08)))
-            }
-            .buttonStyle(.cadenzaPlain(in: Circle()))
-            .help("New Chat")
-            .disabled(messages.isEmpty && !streamState.isActive)
 
             Button {
                 controller.collapse()
@@ -471,25 +471,34 @@ struct FloatingChatPanelRoot: View {
     }
 
     private var modelMenu: some View {
+        // Concept I: the anonymous provider icon becomes a readable
+        // "Provider · model" chip, matching the full-page composer.
         AIChatModelMenu(
             availableProviders: availableChatProviders,
             selectedProvider: $selectedProvider,
             selectedModel: $selectedModel,
-            labelKind: .providerIcon(iconSize: 16, frameSize: 30, cornerRadius: 8)
+            labelKind: .title
         )
+        .font(.cadenza(10.5, scale: uiScale))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 9)
+        .frame(minHeight: 22)
+        .background(Color.primary.opacity(0.05), in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
         .help("Choose model")
     }
 
     // MARK: - Suggestions
 
     private var suggestionsView: some View {
-        // `bubble.left.and.bubble.right` is 24pt wide at a nominal 14pt
-        // font and 71pt wide at Cadenza's supported 3.105x maximum.
+        // Concept I: suggestion rows share the full-page scenario-card anatomy
+        // — a tinted icon tile plus a title/subtitle pair — laid out as a
+        // single column for the panel's width.
         let iconSize = CadenzaControlMetrics.squareIconFrame(
-            base: 24,
-            symbolPointSize: 18,
+            base: 26,
+            symbolPointSize: 13,
             scale: uiScale,
-            padding: 0
+            padding: 6
         )
         return ScrollView {
             VStack(alignment: .leading, spacing: 2) {
@@ -501,52 +510,159 @@ struct FloatingChatPanelRoot: View {
                     .padding(.top, 14)
                     .padding(.bottom, 4)
 
-                ForEach(suggestedQuestions, id: \.text) { q in
+                ForEach(suggestedQuestions, id: \.title) { q in
                     Button {
-                        startStreamingMessage(q.text)
+                        startStreamingMessage(q.title)
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: q.icon)
-                                .font(.cadenza(14, scale: uiScale))
-                                .foregroundStyle(.secondary)
+                                .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                                .foregroundStyle(q.tint)
                                 .frame(width: iconSize, height: iconSize)
-                            Text(q.text)
-                                .font(.cadenza(15, scale: uiScale))
-                                .foregroundStyle(.primary.opacity(0.85))
-                                .lineLimit(2)
-                                .multilineTextAlignment(.leading)
+                                .background(
+                                    q.tint.opacity(0.12),
+                                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                )
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(q.title)
+                                    .font(.cadenza(13, weight: .semibold, scale: uiScale))
+                                    .foregroundStyle(.primary.opacity(0.85))
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                                if let subtitle = q.subtitle {
+                                    Text(subtitle)
+                                        .font(.cadenza(10.5, scale: uiScale))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
                             Spacer()
                             Image(systemName: "chevron.right")
                                 .font(.cadenza(9, weight: .semibold, scale: uiScale))
                                 .foregroundStyle(.quaternary)
                         }
                         .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 8)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(SuggestionButtonStyle())
                     .disabled(!appState.startupPolicy.allowsContentGeneration)
+                }
+
+                if !recentPanelSessions.isEmpty {
+                    recentChatsSection
                 }
             }
             .padding(.bottom, 8)
         }
     }
 
-    private var suggestedQuestions: [(icon: String, text: String)] {
+    private struct PanelSuggestion {
+        let icon: String
+        let tint: Color
+        let title: String
+        let subtitle: String?
+    }
+
+    private var suggestedQuestions: [PanelSuggestion] {
         if allRecordings.count == 1 {
             return [
-                ("list.bullet", String(localized: "What are the key takeaways?")),
-                ("checkmark.circle", String(localized: "List the action items")),
-                ("arrow.triangle.branch", String(localized: "What decisions were made?")),
-                ("text.magnifyingglass", String(localized: "Summarize in 3 sentences"))
+                PanelSuggestion(icon: "list.bullet", tint: .blue, title: String(localized: "What are the key takeaways?"), subtitle: nil),
+                PanelSuggestion(icon: "checkmark.circle", tint: .green, title: String(localized: "List the action items"), subtitle: nil),
+                PanelSuggestion(icon: "arrow.triangle.branch", tint: .purple, title: String(localized: "What decisions were made?"), subtitle: nil),
+                PanelSuggestion(icon: "text.magnifyingglass", tint: .orange, title: String(localized: "Summarize in 3 sentences"), subtitle: nil)
             ]
         } else {
             return [
-                ("checkmark.circle", String(localized: "Action items from my last meeting")),
-                ("text.magnifyingglass", String(localized: "Summarize key decisions this week")),
-                ("bubble.left.and.bubble.right", String(localized: "Which meetings discussed a topic?")),
-                ("arrow.uturn.forward", String(localized: "What follow-ups are pending?"))
+                PanelSuggestion(
+                    icon: "checklist",
+                    tint: .blue,
+                    title: String(localized: "Action items from my last meeting"),
+                    subtitle: String(localized: "Pull action items from your most recent meeting")
+                ),
+                PanelSuggestion(
+                    icon: "checkmark.seal",
+                    tint: .green,
+                    title: String(localized: "Summarize key decisions this week"),
+                    subtitle: String(localized: "Roll up what got decided in the last 7 days")
+                ),
+                PanelSuggestion(
+                    icon: "magnifyingglass",
+                    tint: .purple,
+                    title: String(localized: "Which meetings discussed a topic?"),
+                    subtitle: String(localized: "Search every transcript by theme")
+                ),
+                PanelSuggestion(
+                    icon: "tray.and.arrow.down",
+                    tint: .orange,
+                    title: String(localized: "What follow-ups are pending?"),
+                    subtitle: String(localized: "Commitments that never closed out")
+                )
             ]
+        }
+    }
+
+    // MARK: - Recent Chats (panel)
+
+    /// Concept I: the panel offers continuation in place — the two most
+    /// recent sessions (deduplicated by title) restore without a detour
+    /// through the full-page assistant.
+    private var recentPanelSessions: [ChatSession] {
+        var seenTitles = Set<String>()
+        var result: [ChatSession] = []
+        for session in appState.chatHistory.sessions {
+            let title = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard seenTitles.insert(title).inserted else { continue }
+            result.append(session)
+            if result.count == 2 { break }
+        }
+        return result
+    }
+
+    private var recentChatsSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Recent Chats")
+                    .font(.cadenza(12, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+                    .textCase(.uppercase)
+                Spacer()
+                Button {
+                    showHistory = true
+                } label: {
+                    Text("See All")
+                        .font(.cadenza(11, weight: .semibold, scale: uiScale))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.cadenzaPlain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 4)
+
+            ForEach(recentPanelSessions) { session in
+                Button {
+                    restoreSession(session)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "bubble.left")
+                            .font(.cadenza(11, scale: uiScale))
+                            .foregroundStyle(.tertiary)
+                        Text(session.title)
+                            .font(.cadenza(12, weight: .medium, scale: uiScale))
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(session.updatedAt.formatted(.relative(presentation: .named)))
+                            .font(.cadenza(10, scale: uiScale))
+                            .foregroundStyle(.tertiary)
+                            .fixedSize()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(SuggestionButtonStyle())
+            }
         }
     }
 
@@ -729,100 +845,117 @@ struct FloatingChatPanelRoot: View {
     // MARK: - Input Bar
 
     private var panelInputBar: some View {
+        // Concept I: composer mirrors the full-page card — the field on top,
+        // then a chip row (scope, model) with the round send control trailing.
         Group {
             if uiScale >= CadenzaTextScale.factor(.accessibility1) {
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        mentionButton
-                        modelMenu
-                    }
                     composerField
+                    mentionButton
+                    HStack(spacing: 8) {
+                        modelMenu
+                        Spacer(minLength: 8)
+                        sendControl
+                    }
                 }
             } else {
-                HStack(spacing: 8) {
-                    mentionButton
-                    modelMenu
+                VStack(alignment: .leading, spacing: 7) {
                     composerField
+                    HStack(spacing: 6) {
+                        mentionButton
+                        modelMenu
+                        Spacer(minLength: 6)
+                        sendControl
+                    }
                 }
             }
         }
-        .padding(8)
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 9)
         .cadenzaGlass(in: RoundedRectangle(cornerRadius: AppStyle.Radius.card + 1, style: .continuous))
         .padding(.horizontal, 10)
         .padding(.vertical, 9)
     }
 
     private var mentionButton: some View {
-        HStack(spacing: 8) {
-            Button {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    showMentionPicker.toggle()
-                    if showMentionPicker {
-                        mentionFilter = ""
-                    }
+        Button {
+            withAnimation(.easeOut(duration: 0.15)) {
+                showMentionPicker.toggle()
+                if showMentionPicker {
+                    mentionFilter = ""
                 }
-            } label: {
-                Image(systemName: "at")
-                    .font(.cadenza(13, weight: .medium, scale: uiScale))
-                    .foregroundStyle(showMentionPicker ? Color.accentColor : .primary.opacity(0.7))
-                    .frame(width: mentionControlSize, height: mentionControlSize)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(showMentionPicker ? Color.accentColor.opacity(0.20) : Color.primary.opacity(0.08))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(
-                                showMentionPicker ? Color.accentColor.opacity(0.32) : AppStyle.ColorToken.stroke,
-                                lineWidth: 0.5
-                            )
-                    )
             }
-            .buttonStyle(.cadenzaPlain(in: RoundedRectangle(cornerRadius: 8)))
-            .help("Mention a recording")
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "at")
+                    .font(.cadenza(10, weight: .semibold, scale: uiScale))
+                Text("Scope")
+                    .font(.cadenza(10.5, scale: uiScale))
+            }
+            .foregroundStyle(showMentionPicker ? Color.accentColor : .secondary)
+            .padding(.horizontal, 9)
+            .frame(minHeight: 22)
+            .background(
+                showMentionPicker ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.05),
+                in: Capsule()
+            )
+            .overlay(
+                Capsule().strokeBorder(
+                    showMentionPicker ? Color.accentColor.opacity(0.32) : Color.primary.opacity(0.12),
+                    lineWidth: 1
+                )
+            )
+            .contentShape(Capsule())
         }
+        .buttonStyle(.cadenzaPlain)
+        .help("Mention a recording")
     }
 
     private var composerField: some View {
-        HStack(spacing: 6) {
-            TextField(placeholder, text: $inputText)
-                .font(.cadenza(14, weight: .medium, scale: uiScale))
-                .textFieldStyle(.plain)
-                .onSubmit(submitInput)
-                .disabled(streamState.isActive || !appState.startupPolicy.allowsContentGeneration)
-                .onChange(of: inputText) { _, newValue in
-                    handleInputChange(newValue)
-                }
-
-            if streamState.isActive {
-                Button {
-                    stopStreaming(savePartial: true)
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.cadenza(12, weight: .bold, scale: uiScale))
-                        .foregroundStyle(.white)
-                        .frame(width: sendControlSize, height: sendControlSize)
-                        .background(Circle().fill(Color.secondary.opacity(0.75)))
-                }
-                .buttonStyle(.cadenzaPlain)
-                .help("Stop response")
-            } else if appState.startupPolicy.allowsContentGeneration
-                        && (!inputText.trimmingCharacters(in: .whitespaces).isEmpty
-                            || !mentionedRecordings.isEmpty) {
-                Button(action: submitInput) {
-                    Image(systemName: "arrow.up")
-                        .font(.cadenza(13, weight: .bold, scale: uiScale))
-                        .foregroundStyle(.white)
-                        .frame(width: sendControlSize, height: sendControlSize)
-                        .background(Circle().fill(Color.accentColor.opacity(0.85)))
-                }
-                .buttonStyle(.cadenzaPlain)
-                .disabled(streamState.isActive || !appState.startupPolicy.allowsContentGeneration)
+        // Concept feedback: the composer should read as a 2-3 line writing
+        // area, not a single cramped line; it grows with the draft.
+        TextField(placeholder, text: $inputText, axis: .vertical)
+            .font(.cadenza(14, weight: .medium, scale: uiScale))
+            .textFieldStyle(.plain)
+            .lineLimit(1...6)
+            .onSubmit(submitInput)
+            .disabled(streamState.isActive || !appState.startupPolicy.allowsContentGeneration)
+            .onChange(of: inputText) { _, newValue in
+                handleInputChange(newValue)
             }
+            .frame(minHeight: 40, alignment: .topLeading)
+            .padding(.horizontal, 2)
+    }
+
+    @ViewBuilder
+    private var sendControl: some View {
+        if streamState.isActive {
+            Button {
+                stopStreaming(savePartial: true)
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.cadenza(11, weight: .bold, scale: uiScale))
+                    .foregroundStyle(.white)
+                    .frame(width: sendControlSize, height: sendControlSize)
+                    .background(Circle().fill(Color.accentColor))
+            }
+            .buttonStyle(.cadenzaPlain)
+            .help("Stop response")
+        } else {
+            let canSend = appState.startupPolicy.allowsContentGeneration
+                && (!inputText.trimmingCharacters(in: .whitespaces).isEmpty
+                    || !mentionedRecordings.isEmpty)
+            Button(action: submitInput) {
+                Image(systemName: "arrow.up")
+                    .font(.cadenza(12, weight: .bold, scale: uiScale))
+                    .foregroundStyle(canSend ? Color.white : Color.secondary)
+                    .frame(width: sendControlSize, height: sendControlSize)
+                    .background(Circle().fill(canSend ? Color.accentColor : Color.primary.opacity(0.1)))
+            }
+            .buttonStyle(.cadenzaPlain)
+            .disabled(!canSend)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .cadenzaGlass(in: RoundedRectangle(cornerRadius: AppStyle.Radius.card, style: .continuous))
     }
 
     private func handleInputChange(_ text: String) {

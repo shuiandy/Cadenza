@@ -3,6 +3,8 @@ import SwiftData
 
 @Model
 final class SpeakerProfile {
+    #Index<SpeakerProfile>([\.id])
+
     var id: UUID
     var displayName: String
     var aliases: [String]

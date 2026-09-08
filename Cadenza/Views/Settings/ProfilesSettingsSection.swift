@@ -85,8 +85,11 @@ struct ProfilesSettingsSection: View {
                     .font(.system(size: 24))
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(profile.name)
-                        .font(.cadenza(14, weight: .semibold))
+                    HStack(spacing: 6) {
+                        Text(profile.name)
+                            .font(.cadenza(14, weight: .semibold))
+                        SettingsStatusCapsule(kind: .connected, label: "Active")
+                    }
                     Text(sessionSubtitle(profile))
                         .font(.cadenza(12))
                         .foregroundStyle(.secondary)
@@ -230,6 +233,7 @@ struct ProfilesSettingsSection: View {
                             loginCoordinator = coordinator
                             Task { await coordinator.begin() }
                         }
+                        .buttonStyle(.borderedProminent)
                         .disabled(appState.profileTransitionBlockReason != nil)
                         .help(appState.profileTransitionBlockReason ?? String(
                             localized: "Adds a new account profile or switches to that account's existing profile."
@@ -270,9 +274,7 @@ struct ProfilesSettingsSection: View {
             }
             Spacer()
             if isActive {
-                Text("Active")
-                    .font(.cadenza(11, weight: .medium))
-                    .foregroundStyle(.secondary)
+                SettingsStatusCapsule(kind: .connected, label: "Active")
             } else if profile.isLocked {
                 HStack(spacing: 6) {
                     Image(systemName: "lock.fill")

@@ -53,6 +53,7 @@ struct ProfileScopedDefaults {
         // AI identity
         "userName",
         "userJobTitle",
+        "summaryFocus",
         // UI state embedding entity identifiers
         "smartFolders.overrides.v2",
         "smartFolders.pinned.v1",

@@ -286,7 +286,7 @@ final class AppState {
 
     @ObservationIgnored private var markdownMirrorService: MarkdownMirrorService?
     @ObservationIgnored private var markdownMirrorObserver: NSObjectProtocol?
-    @ObservationIgnored private var markdownMirrorRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var markdownMirrorQueue: MarkdownMirrorRefreshQueue?
 
     // MARK: - Calendar + OAuth + Export (main process — no XPC)
 
@@ -368,6 +368,9 @@ final class AppState {
     // Calendar (from CalendarManager directly)
     var upcomingMeetings: [MeetingEventDTO] = []
     var currentMeeting: MeetingEventDTO?
+    /// Library person filter (top-bar chips): show only recordings whose
+    /// mapped speakers include this display name. Session-scoped.
+    var librarySpeakerFilter: String?
     @ObservationIgnored private var calendarStateSyncTimer: Timer?
 
     // Permissions (checked directly in main process)
@@ -376,6 +379,10 @@ final class AppState {
     var hasAccessibilityPermission: Bool = false
     var hasCalendarPermission: Bool = false
     var calendarPermissionStatus: PermissionStatus = .notDetermined
+    /// Sheet-confirmed calendar grant for this process. EventKit's class-level
+    /// status can keep serving its pre-grant value until relaunch, and every
+    /// checkPermissions() would otherwise flip the UI back to unauthorized.
+    @ObservationIgnored private var calendarAccessGrantedInProcess = false
 
     // Connections (read directly from services)
     var googleCalendarConnected: Bool {
@@ -638,6 +645,62 @@ final class AppState {
     var searchResults: [RecordingDTO] = []
     var isSearchingRecordings = false
     var recordingsChangedToken: Int = 0
+
+    /// Library derivations memoized on `recordingsChangedToken`, which moves
+    /// whenever `recordings` is reassigned. Reading them in a body still
+    /// registers the `recordings` dependency; the work runs once per change.
+    @ObservationIgnored private var libraryDerivations = TokenKeyedMemo()
+
+    func sortedLibraryRecordings(sortKey: String) -> [RecordingDTO] {
+        let source = recordings
+        return libraryDerivations.value(token: recordingsChangedToken, key: "sorted:\(sortKey)") {
+            RecordingSorting.sort(source, by: sortKey)
+        }
+    }
+
+    func libraryRecordings(tag: String, sortKey: String) -> [RecordingDTO] {
+        let source = recordings
+        let tagKey = TagNormalizer.formatKey(tag)
+        return libraryDerivations.value(token: recordingsChangedToken, key: "tag:\(tagKey):\(sortKey)") {
+            RecordingSorting.sort(
+                source.filter { rec in rec.tags.contains { TagNormalizer.formatKey($0) == tagKey } },
+                by: sortKey
+            )
+        }
+    }
+
+    /// Most-recurring mapped speakers across the library, most frequent first.
+    func libraryTopSpeakers(limit: Int) -> [String] {
+        let source = recordings
+        return libraryDerivations.value(token: recordingsChangedToken, key: "speakers:\(limit)") {
+            var counts: [String: Int] = [:]
+            for recording in source {
+                for name in recording.speakerNames ?? [] {
+                    counts[name, default: 0] += 1
+                }
+            }
+            return counts
+                .sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value }
+                .prefix(limit)
+                .map(\.key)
+        }
+    }
+
+    /// Every tag in the library, most frequent first.
+    var libraryTagsByFrequency: [String] {
+        let source = recordings
+        return libraryDerivations.value(token: recordingsChangedToken, key: "tags") {
+            var counts: [String: Int] = [:]
+            for recording in source {
+                for tag in recording.tags {
+                    counts[tag, default: 0] += 1
+                }
+            }
+            return counts
+                .sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value }
+                .map(\.key)
+        }
+    }
     var smartFolderOverridesChangedToken: Int = 0
     var isLoadingRecordings = true
     private(set) var isBatchMutationInProgress = false
@@ -1054,6 +1117,26 @@ final class AppState {
         refreshFolders()
         refreshTrash()
 
+        // One-time fill of the list-projection columns for rows that predate
+        // them; refresh once afterwards so cards pick up their previews.
+        if !AppState.isRunningTests {
+            let store: RecordingsStore = store
+            Task.detached(priority: .utility) { [weak self] in
+                // One bounded batch per store turn: every `await` here lets
+                // queued list, detail and MCP work run between batches.
+                var filled = 0
+                while true {
+                    let step = await store.backfillListPreviews(batchSize: 50)
+                    filled += step.updated
+                    guard step.remaining, step.updated > 0 else { break }
+                    await Task.yield()
+                }
+                guard filled > 0 else { return }
+                NSLog("[AppState] backfilled list previews for %d recordings", filled)
+                await MainActor.run { self?.refreshRecordings() }
+            }
+        }
+
         // Back up the live store off the main actor. Awaiting here preserves
         // the recovery point before normalization, recovery, and purge work.
         let startupBackupPlan = AppState.startupBackupPlan(
@@ -1139,6 +1222,33 @@ final class AppState {
             recaps = await store.fetchRecaps()
         }
 
+        // Persistent-history retention (RecordingsStore+HistoryMaintenance).
+        // Delayed so the first seconds belong to list loads, recovery and MCP
+        // clients; each slice commits on its own and interleaves with them.
+        if !AppState.isRunningTests {
+            let store: RecordingsStore = store
+            Task.detached(priority: .utility) { [weak self] in
+                try? await Task.sleep(for: .seconds(20))
+                let cutoff = Date().addingTimeInterval(-RecordingsStore.historyRetention)
+                var slices = 0
+                while true {
+                    // One slice per store turn, and none while a recording is
+                    // live: the capture path's writes must not queue behind
+                    // a bulk delete.
+                    if await MainActor.run(body: { self?.isRecording ?? false }) {
+                        try? await Task.sleep(for: .seconds(60))
+                        continue
+                    }
+                    guard await store.pruneHistorySlice(olderThan: cutoff) == .deleted else { break }
+                    slices += 1
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                if slices > 0 {
+                    NSLog("[AppState] pruned persistent history in %d slices", slices)
+                }
+            }
+        }
+
         // F3: detect legacy Notion token → surface forced-reconnect banner if needed.
         detectNotionForcedReconnect()
     }
@@ -1213,6 +1323,19 @@ final class AppState {
         }
 
         let token = MCPServer.loadOrCreateToken()
+
+        // First-party CLI credential: `cadenza-mcp <subcommand>` authenticates
+        // as its own client so usage is attributed and revocable like any
+        // other. Runs on every reconcile so its scopes track the permission
+        // toggles.
+        if let cliToken = try? MCPClientAccessStore.shared.token(
+            for: MCPBridgeCLI.cliClientID,
+            name: "Cadenza CLI",
+            scopes: MCPServer.scopesForNewConnection()
+        ) {
+            try? MCPBridgeRuntime.standard().writeCredential(cliToken, for: MCPBridgeCLI.cliClientID)
+        }
+
         let registry = MCPToolRegistry(
             store: store,
             writesEnabled: {
@@ -1239,6 +1362,13 @@ final class AppState {
             // start() tears down any previous listener first, so port/token
             // changes are plain restarts.
             await server.start(port: mcpServerPort, token: token, router: router, onStatus: { [weak self] status in
+                // Publish the live URL for the cadenza-mcp stdio bridge the
+                // moment the listener is up: the bridge re-reads this file on
+                // every reconnect, so client configs survive port changes.
+                if case .running(let port) = status {
+                    try? MCPBridgeRuntime.standard()
+                        .writeEndpoint(url: "http://127.0.0.1:\(port)/mcp")
+                }
                 Task { @MainActor [weak self] in
                     self?.mcpServerStatus = status
                 }
@@ -1256,6 +1386,15 @@ final class AppState {
         "http://127.0.0.1:\(mcpServerPort)/mcp"
     }
 
+    /// Absolute path of the bundled `cadenza-mcp` stdio bridge — the command
+    /// every bridge-based client config points at. Falls back to the
+    /// canonical in-bundle location when the auxiliary executable is missing
+    /// (test hosts), so manual snippets always show a plausible path.
+    var mcpBridgePath: String {
+        Bundle.main.url(forAuxiliaryExecutable: "cadenza-mcp")?.path
+            ?? Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/cadenza-mcp").path
+    }
+
     /// Mint a new shared legacy token and restart the server with it.
     /// Per-client credentials remain valid.
     func regenerateMCPToken() {
@@ -1270,20 +1409,21 @@ final class AppState {
         if let observer = markdownMirrorObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        markdownMirrorQueue?.cancel()
+        markdownMirrorQueue = MarkdownMirrorRefreshQueue { [weak self] ids in
+            guard let service = self?.markdownMirrorService else { return }
+            _ = await service.refreshIfEnabled(recordingIDs: ids)
+        }
         markdownMirrorObserver = NotificationCenter.default.addObserver(
             forName: .cadenzaRecordingsChanged,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            let changed = notification.userInfo?[RecordingsStore.changedRecordingIDsUserInfoKey] as? Set<UUID> ?? []
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.markdownMirrorRefreshTask?.cancel()
-                self.markdownMirrorRefreshTask = Task { @MainActor [weak self] in
-                    try? await Task.sleep(for: .milliseconds(500))
-                    guard !Task.isCancelled,
-                          let service = self?.markdownMirrorService else { return }
-                    _ = await service.refreshIfEnabled()
-                }
+                // Only the recordings that changed; a full pass materialized
+                // every transcript in the library after any single save.
+                self?.markdownMirrorQueue?.enqueue(changed)
             }
         }
     }
@@ -1320,17 +1460,28 @@ final class AppState {
         guard startupPolicy.startsCalendarMonitoring else { return }
         calendarManager.refreshCurrentMeetingFromCache()
         let meetings = calendarManager.upcomingMeetings
-        upcomingMeetings = meetings.map { MeetingEventDTO(from: $0) }
+        // Every 5 s. Assigning an equal array still invalidates every view
+        // that reads `upcomingMeetings` (the library root did, and re-ran the
+        // whole grid on each tick). Write only on a real change; time-derived
+        // state such as "in progress" is the strip's own clock to keep.
+        let nextUpcoming = meetings.map { MeetingEventDTO(from: $0) }
+        if upcomingMeetings != nextUpcoming {
+            upcomingMeetings = nextUpcoming
+        }
 
         let previousDetectorMeeting = meetingDetector.currentCalendarMeeting
         let previousMeetingID = previousDetectorMeeting?.id
 
         if let current = calendarManager.currentMeeting {
             let dto = MeetingEventDTO(from: current)
-            currentMeeting = dto
+            if currentMeeting != dto {
+                currentMeeting = dto
+            }
             meetingDetector.currentCalendarMeeting = dto
         } else {
-            currentMeeting = nil
+            if currentMeeting != nil {
+                currentMeeting = nil
+            }
             if let previousDetectorMeeting, previousDetectorMeeting.isWithinDetectionContext() {
                 meetingDetector.currentCalendarMeeting = previousDetectorMeeting
             } else if let contextMeeting = calendarManager.currentMeetingForDetectionContext() {
@@ -1383,7 +1534,10 @@ final class AppState {
         if accessibilityWasGranted {
             refreshGlobalHotkeysForAccessibility()
         }
-        let calendarStatus = Permissions.calendarStatus()
+        var calendarStatus = Permissions.calendarStatus()
+        if calendarAccessGrantedInProcess, calendarStatus != .granted {
+            calendarStatus = .granted
+        }
         calendarPermissionStatus = calendarStatus
         hasCalendarPermission = calendarStatus == .granted
         recordingEngine.refreshSystemAudioCapturePreparation()
@@ -1393,12 +1547,28 @@ final class AppState {
     /// Refresh the calendar cache only on the denied/not-determined → granted
     /// edge. Both in-app recovery buttons and AppDelegate activation use this
     /// boundary so returning from the TCC sheet cannot leave the visible
-    /// calendar stuck on its pre-authorization empty state.
+    /// calendar stuck on its pre-authorization empty state. Monitoring is
+    /// re-armed here because the boot-time startMonitoring call no-ops while
+    /// the service is unauthorized.
     func checkPermissionsAndRefreshCalendarIfNeeded() async {
         let calendarAccessWasGranted = await checkPermissions()
         guard calendarAccessWasGranted,
               startupPolicy.externalAccessEnabled else { return }
+        if startupPolicy.startsCalendarMonitoring {
+            calendarManager.startMonitoring()
+        }
         refreshCalendars()
+    }
+
+    /// Route the TCC sheet's own result around the possibly-stale class
+    /// status: granting used to leave the row on "Not authorized" (and
+    /// monitoring dead) until the app was relaunched.
+    func applyCalendarAccessRequestOutcome(granted: Bool) async {
+        if granted, Permissions.calendarStatus() != .granted {
+            calendarAccessGrantedInProcess = true
+            calendarManager.appleCalendarService.adoptAuthorizationGrantedInProcess()
+        }
+        await checkPermissionsAndRefreshCalendarIfNeeded()
     }
 
     // MARK: - Recording Commands
@@ -2567,6 +2737,13 @@ final class AppState {
         }
     }
 
+    func addTag(recordingID: UUID, tag: String) {
+        Task {
+            _ = await store.addTag(recordingID: recordingID, tag: tag)
+            refreshRecordings()
+        }
+    }
+
     func toggleActionItem(recordingID: UUID, actionItemID: UUID) {
         Task {
             await store.toggleActionItem(recordingID: recordingID, actionItemID: actionItemID)
@@ -2810,6 +2987,19 @@ final class AppState {
         }
     }
 
+    func linkCalendarEvent(recordingID: UUID, event: MeetingEventDTO) {
+        Task {
+            await store.linkCalendarEvent(
+                recordingID: recordingID,
+                calendarEventID: event.id,
+                snapshot: RecordingsStore.CalendarEventSnapshot(
+                    title: event.title, startAt: event.startDate, endAt: event.endDate
+                )
+            )
+            recordingsChangedToken += 1
+        }
+    }
+
     /// Auto-link a recording to the best-matching calendar event by time overlap.
     func autoLinkCalendarEvent(recordingID: UUID, startDate: Date, endDate: Date) {
         Task { @MainActor [weak self] in
@@ -2886,7 +3076,13 @@ final class AppState {
             _ = await store.markCalendarAutoLinkNoMatch(recordingID: recordingID)
             return .noMatch
         }
-        let saved = await store.linkCalendarEvent(recordingID: recordingID, calendarEventID: event.id)
+        let saved = await store.linkCalendarEvent(
+            recordingID: recordingID,
+            calendarEventID: event.id,
+            snapshot: RecordingsStore.CalendarEventSnapshot(
+                title: event.title, startAt: event.startDate, endAt: event.endDate
+            )
+        )
         if saved {
             recordingsChangedToken += 1
         }

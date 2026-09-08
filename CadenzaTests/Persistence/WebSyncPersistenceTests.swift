@@ -127,4 +127,76 @@ struct WebSyncPersistenceTests {
         #expect(recoveredServer?.attemptCount == 0)
         #expect(recoveredServer?.nextAttemptAt == nil)
     }
+
+    @Test @MainActor
+    func schemaRejectionRecoveryRevivesUpdatesAndInitialsAlike() async throws {
+        let container = try RecordingsStore.makeContainer(inMemory: true)
+        let store = RecordingsStore(modelContainer: container)
+        await store.clearAll()
+
+        // An update failure: the row synced once (it has a remote identity),
+        // then a later upsert with new payload fields was rejected with 400.
+        let updateID = UUID()
+        var update = WebSyncMutation(userID: "user-a", recordingID: updateID)
+        update.remoteRecordingID = "remote-1"
+        update.structuredState = WebStructuredSyncState.failed.rawValue
+        update.audioState = WebAudioSyncState.failed.rawValue
+        update.attemptCount = 4
+        update.nextAttemptAt = .distantFuture
+        update.lastErrorCode = "backend(status:400,code:bad_payload)"
+        _ = try await store.upsertWebSyncRecord(update)
+
+        // An initial failure: never accepted, no remote identity.
+        let initialID = UUID()
+        var initial = WebSyncMutation(userID: "user-a", recordingID: initialID)
+        initial.structuredState = WebStructuredSyncState.failed.rawValue
+        initial.audioState = WebAudioSyncState.failed.rawValue
+        initial.attemptCount = 2
+        initial.nextAttemptAt = .distantFuture
+        initial.lastErrorCode = "backend(status:400,code:bad_payload)"
+        _ = try await store.upsertWebSyncRecord(initial)
+
+        // A genuine server failure stays parked for its own recovery path.
+        let serverID = UUID()
+        var server = WebSyncMutation(userID: "user-a", recordingID: serverID)
+        server.structuredState = WebStructuredSyncState.failed.rawValue
+        server.attemptCount = 1
+        server.nextAttemptAt = .distantFuture
+        server.lastErrorCode = "server(status: 500)"
+        _ = try await store.upsertWebSyncRecord(server)
+
+        // Another account's 400 is not this account's rollout to recover.
+        let otherAccountID = UUID()
+        var otherAccount = WebSyncMutation(userID: "user-b", recordingID: otherAccountID)
+        otherAccount.structuredState = WebStructuredSyncState.failed.rawValue
+        otherAccount.attemptCount = 1
+        otherAccount.nextAttemptAt = .distantFuture
+        otherAccount.lastErrorCode = "backend(status:400,code:bad_payload)"
+        _ = try await store.upsertWebSyncRecord(otherAccount)
+
+        let count = try await store.requeueWebSyncSchemaRejectionFailures(userID: "user-a")
+        #expect(count == 2)
+
+        let revivedUpdate = await store.fetchWebSyncRecord(userID: "user-a", recordingID: updateID)
+        #expect(revivedUpdate?.structuredState == WebStructuredSyncState.pending.rawValue)
+        #expect(revivedUpdate?.audioState == WebAudioSyncState.pending.rawValue)
+        #expect(revivedUpdate?.remoteRecordingID == "remote-1")
+        #expect(revivedUpdate?.attemptCount == 0)
+        #expect(revivedUpdate?.nextAttemptAt == nil)
+        #expect(revivedUpdate?.lastErrorCode == nil)
+
+        let revivedInitial = await store.fetchWebSyncRecord(userID: "user-a", recordingID: initialID)
+        #expect(revivedInitial?.structuredState == WebStructuredSyncState.pending.rawValue)
+        #expect(revivedInitial?.attemptCount == 0)
+
+        let preservedServer = await store.fetchWebSyncRecord(userID: "user-a", recordingID: serverID)
+        #expect(preservedServer?.structuredState == WebStructuredSyncState.failed.rawValue)
+        #expect(preservedServer?.nextAttemptAt == .distantFuture)
+
+        let preservedAccount = await store.fetchWebSyncRecord(userID: "user-b", recordingID: otherAccountID)
+        #expect(preservedAccount?.structuredState == WebStructuredSyncState.failed.rawValue)
+
+        // Recovered rows carry no error code, so a second pass finds nothing.
+        #expect(try await store.requeueWebSyncSchemaRejectionFailures(userID: "user-a") == 0)
+    }
 }

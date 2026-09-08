@@ -207,6 +207,28 @@ actor MCPServer {
         )
     }
 
+    // MARK: - Scopes
+
+    /// Scope set matching the current permission toggles. Single source for
+    /// newly connected clients (Settings) and the auto-provisioned CLI
+    /// credential, so the two can never drift apart.
+    static func scopesForNewConnection(defaults: UserDefaults = .standard) -> Set<MCPPermissionScope> {
+        var scopes: Set<MCPPermissionScope> = [.recordingRead]
+        let writes = defaults.bool(forKey: Constants.writesEnabledDefaultsKey)
+        if writes {
+            scopes.insert(.recordingWrite)
+            scopes.insert(.exportWrite)
+        }
+        if defaults.bool(forKey: Constants.meetingContextEnabledDefaultsKey) {
+            scopes.insert(.calendarContextRead)
+            if writes { scopes.insert(.prepWrite) }
+        }
+        if defaults.bool(forKey: Constants.externalImportEnabledDefaultsKey) {
+            scopes.insert(.externalImportWrite)
+        }
+        return scopes
+    }
+
     // MARK: - Token management
 
     static func generateToken() -> String {

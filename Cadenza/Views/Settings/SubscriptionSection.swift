@@ -49,28 +49,71 @@ struct SubscriptionSection: View {
 
     @ViewBuilder
     private func limitsContent(_ limits: EntitlementsPresentation.Limits) -> some View {
+        // Concept N: one plan row with a lifecycle capsule, then scannable
+        // usage tiles instead of five label:value prose lines.
         VStack(alignment: .leading, spacing: 10) {
-            // The plan id is opaque deployment data, shown exactly as received.
-            field(EntitlementsCopy.planLabel(), limits.plan, monospaced: true)
-            field(EntitlementsCopy.statusLabel(), EntitlementsCopy.lifecycle(limits.lifecycle))
-            field(EntitlementsCopy.textSyncLabel(), EntitlementsCopy.textUsage(limits))
-            field(EntitlementsCopy.audioStorageLabel(), EntitlementsCopy.storageUsage(limits))
-            field(
-                EntitlementsCopy.audioUploadLabel(),
-                EntitlementsCopy.audioEntitlement(limits.audioUploadEntitled)
-            )
+            HStack(spacing: 8) {
+                // The plan id is opaque deployment data, shown exactly as received.
+                Text(verbatim: limits.plan)
+                    .font(.cadenza(13, weight: .semibold))
+                    .monospaced()
+                SettingsStatusCapsule(
+                    kind: lifecycleCapsuleKind(limits.lifecycle),
+                    verbatimLabel: EntitlementsCopy.lifecycle(limits.lifecycle)
+                )
+                Spacer(minLength: 0)
+            }
+            .accessibilityElement(children: .combine)
+
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 150, maximum: 260), spacing: 8)],
+                alignment: .leading,
+                spacing: 8
+            ) {
+                statTile(EntitlementsCopy.textSyncLabel(), EntitlementsCopy.textUsage(limits))
+                statTile(EntitlementsCopy.audioStorageLabel(), EntitlementsCopy.storageUsage(limits))
+                statTile(
+                    EntitlementsCopy.audioUploadLabel(),
+                    EntitlementsCopy.audioEntitlement(limits.audioUploadEntitled),
+                    positive: limits.audioUploadEntitled
+                )
+            }
         }
     }
 
+    private func lifecycleCapsuleKind(
+        _ lifecycle: EntitlementsPresentation.Known<EntitlementsPresentation.Lifecycle>
+    ) -> SettingsStatusCapsule.Kind {
+        if case .defined(.active) = lifecycle { return .connected }
+        return .attention
+    }
+
     @ViewBuilder
-    private func field(_ label: String, _ value: String, monospaced: Bool = false) -> some View {
-        LabeledContent {
+    private func statTile(_ label: String, _ value: String, positive: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(verbatim: label)
+                .font(.cadenza(10))
+                .foregroundStyle(.secondary)
             Text(verbatim: value)
-                .font(.cadenza(13))
-                .monospaced(monospaced)
-        } label: {
-            Text(verbatim: label).font(.cadenza(12)).foregroundStyle(.secondary)
+                .font(.cadenza(12, weight: .medium))
+                .foregroundStyle(positive ? Color.green : Color.primary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            positive ? Color.green.opacity(0.07) : Color.primary.opacity(0.04),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(
+                    positive ? Color.green.opacity(0.2) : Color.primary.opacity(0.09),
+                    lineWidth: 1
+                )
+        )
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder

@@ -184,6 +184,20 @@ struct GeminiRealtimeTranscriberTests {
         return data
     }
 
+    @Test func audioInputMimeTypeDeclaresTheCaptureSampleRate() throws {
+        // Capture converts to AudioConverter.transcriptionFormat before handing
+        // PCM to sendAudio. Gemini resamples from the declared rate, so a
+        // declaration that drifts from the capture format changes playback
+        // speed on the server side. Lock the two together.
+        let message = GeminiRealtimeTranscriber.audioInputMessage(base64Audio: "AAAA")
+        let realtimeInput = try #require(message["realtimeInput"] as? [String: Any])
+        let audio = try #require(realtimeInput["audio"] as? [String: Any])
+        let captureRate = Int(AudioConverter.transcriptionFormat.sampleRate)
+        #expect(audio["mimeType"] as? String == "audio/pcm;rate=\(captureRate)")
+        #expect(audio["mimeType"] as? String == "audio/pcm;rate=24000")
+        #expect(audio["data"] as? String == "AAAA")
+    }
+
     @Test func upgradeHeaderAccumulatorPreservesCoalescedFrameBytes() throws {
         var accumulator = GeminiRealtimeUpgradeHeaderAccumulator()
         #expect(
@@ -420,7 +434,7 @@ struct GeminiRealtimeTranscriberTests {
 
         #expect(
             request.hasPrefix(
-                "GET /ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained HTTP/1.1\r\n"
+                "GET /ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained HTTP/1.1\r\n"
             )
         )
         #expect(request.contains("Authorization: Token auth_tokens/ephemeral-one\r\n"))
@@ -897,5 +911,123 @@ struct GeminiRealtimeTranscriberTests {
 
         await manager.stopRealtime(abandonStartup: true)
         #expect(await waitUntil { await transportB.cancelCount == 1 })
+    }
+}
+
+@Suite("Gemini realtime model families")
+struct GeminiRealtimeModelFamilyTests {
+
+    private func service(model: String) -> GeminiRealtimeTranscriber {
+        GeminiRealtimeTranscriber(apiKey: "fake", model: model)
+    }
+
+    private func setupMessage(
+        model: String,
+        language: String?
+    ) async throws -> [String: Any] {
+        let config = await service(model: model).buildSetupConfig(language: language)
+        return try #require(config["setup"] as? [String: Any])
+    }
+
+    // MARK: - Setup message
+
+    @Test func dedicatedTranscriberAsksForTextAndStructuredLanguageHints() async throws {
+        let setup = try await setupMessage(model: "gemini-3.5-transcribe-live", language: "zh")
+
+        #expect(setup["model"] as? String == "models/gemini-3.5-transcribe-live")
+
+        let generation = try #require(setup["generationConfig"] as? [String: Any])
+        #expect(generation["responseModalities"] as? [String] == ["TEXT"])
+
+        let input = try #require(setup["inputAudioTranscription"] as? [String: Any])
+        #expect(input["languageCodes"] as? [String] == ["zh-CN"])
+
+        // An ASR has nothing to instruct and no spoken reply to caption back.
+        #expect(setup["systemInstruction"] == nil)
+        #expect(setup["outputAudioTranscription"] == nil)
+    }
+
+    @Test func autoLanguageLeavesTheHintListEmptyForCodeSwitching() async throws {
+        let setup = try await setupMessage(model: "gemini-3.5-transcribe-live", language: nil)
+        let input = try #require(setup["inputAudioTranscription"] as? [String: Any])
+        #expect((input["languageCodes"] as? [String])?.isEmpty == true)
+    }
+
+    @Test func dialogueModelKeepsItsAudioModalityAndPromptWorkaround() async throws {
+        let setup = try await setupMessage(model: "gemini-3.1-flash-live-preview", language: nil)
+        let generation = try #require(setup["generationConfig"] as? [String: Any])
+
+        #expect(generation["responseModalities"] as? [String] == ["AUDIO"])
+        #expect(setup["systemInstruction"] != nil)
+        #expect(setup["outputAudioTranscription"] != nil)
+    }
+
+    // MARK: - Transcript extraction
+
+    @Test func interimHypothesisIsNotFinalForTheDedicatedTranscriber() async throws {
+        let extracted = await service(model: "gemini-3.5-transcribe-live").extractTranscript(
+            from: ["interimInputTranscription": ["text": "we should ship"]],
+            turnComplete: false
+        )
+        let transcript = try #require(extracted)
+        #expect(transcript.text == "we should ship")
+        #expect(transcript.isFinal == false)
+    }
+
+    @Test func inputTranscriptionIsAuthoritativeForTheDedicatedTranscriber() async throws {
+        // The ASR emits this once the utterance settles, so it is final even
+        // though the frame carries no turnComplete.
+        let extracted = await service(model: "gemini-3.5-transcribe-live").extractTranscript(
+            from: ["inputTranscription": ["text": "we should ship it today"]],
+            turnComplete: false
+        )
+        #expect(try #require(extracted).isFinal)
+    }
+
+    @Test func dialogueModelStillDefersFinalityToTurnComplete() async throws {
+        let dialogue = service(model: "gemini-3.1-flash-live-preview")
+
+        let running = await dialogue.extractTranscript(
+            from: ["inputTranscription": ["text": "we should"]],
+            turnComplete: false
+        )
+        #expect(try #require(running).isFinal == false)
+
+        let done = await dialogue.extractTranscript(
+            from: ["inputTranscription": ["text": "we should ship"]],
+            turnComplete: true
+        )
+        #expect(try #require(done).isFinal)
+    }
+
+    @Test func dialogueModelIgnoresInterimFramesItWouldOtherwiseAppendTwice() async {
+        let extracted = await service(model: "gemini-3.1-flash-live-preview").extractTranscript(
+            from: ["interimInputTranscription": ["text": "partial"]],
+            turnComplete: false
+        )
+        #expect(extracted == nil)
+    }
+
+    @Test func snakeCaseFramesParseIdentically() async throws {
+        let extracted = await service(model: "gemini-3.5-transcribe-live").extractTranscript(
+            from: ["interim_input_transcription": ["text": "partial"]],
+            turnComplete: false
+        )
+        let transcript = try #require(extracted)
+        #expect(transcript.text == "partial")
+        #expect(transcript.isFinal == false)
+    }
+
+    @Test func emptyAndAbsentTranscriptsYieldNothing() async {
+        let dedicated = service(model: "gemini-3.5-transcribe-live")
+
+        let absent = await dedicated.extractTranscript(from: [:], turnComplete: true)
+        #expect(absent == nil)
+
+        let blank = await dedicated.extractTranscript(
+            from: ["inputTranscription": ["text": "   "]],
+            turnComplete: true
+        )
+        #expect(blank == nil)
     }
 }

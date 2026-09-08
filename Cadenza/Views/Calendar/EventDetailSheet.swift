@@ -64,6 +64,31 @@ struct EventDetailPopover: View {
     let event: MeetingEvent
     var onDismiss: () -> Void
 
+    @State private var showsAllAttendees = false
+
+    /// Recordings for THIS occurrence: recurring events share one id across
+    /// every occurrence, so matching the id alone lists the meeting's entire
+    /// history. The recording must also fall on this occurrence's day.
+    private var linkedRecordings: [RecordingDTO] {
+        let calendar = Calendar.current
+        return appState.recordings.filter {
+            $0.linkedCalendarEventID == event.id
+                && $0.trashedDate == nil
+                && calendar.isDate($0.startDate, inSameDayAs: event.startDate)
+        }
+    }
+
+    private var visibleAttendees: [EventAttendee] {
+        showsAllAttendees ? event.attendees : Array(event.attendees.prefix(6))
+    }
+
+    private func recordingMetaString(_ recording: RecordingDTO) -> String {
+        let minutes = Int(recording.duration) / 60
+        let durationString = minutes < 1 ? "<1m" : "\(minutes)m"
+        guard recording.hasTranscript else { return durationString }
+        return "\(durationString) · \(String(localized: "Transcribed"))"
+    }
+
     private var trustedMeetingURL: URL? {
         guard let url = event.meetingURL, MeetingURLParser.isMeetingURL(url) else {
             return nil
@@ -160,6 +185,61 @@ struct EventDetailPopover: View {
                         }
                     }
 
+                    // Linked recordings — the jump the timeline's waveform
+                    // mark promises. Tapping closes the sheet and opens the
+                    // recording detail.
+                    if !linkedRecordings.isEmpty {
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(linkedRecordings) { recording in
+                                Button {
+                                    onDismiss()
+                                    appState.openRecordingDetail(
+                                        recordingID: recording.id,
+                                        title: recording.title
+                                    )
+                                } label: {
+                                    HStack(spacing: 9) {
+                                        // Card-internal icon, not a metadata
+                                        // column row: fixed width on purpose.
+                                        Image(systemName: "waveform")
+                                            .font(.cadenza(12, weight: .semibold, scale: uiScale))
+                                            .foregroundStyle(event.displayColor)
+                                            .frame(width: 20)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(recording.title)
+                                                .font(.cadenza(13, weight: .medium, scale: uiScale))
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                            Text(verbatim: recordingMetaString(recording))
+                                                .font(.cadenza(11, scale: uiScale))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer(minLength: 6)
+                                        Image(systemName: "chevron.right")
+                                            .font(.cadenza(10, weight: .semibold, scale: uiScale))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(AppStyle.ColorToken.softFill)
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .strokeBorder(AppStyle.ColorToken.stroke, lineWidth: 0.75)
+                                    )
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.cadenzaPlain)
+                                .accessibilityLabel(Text(recording.title))
+                                .accessibilityHint("Open recording")
+                            }
+                        }
+                    }
+
                     // Location
                     if let location = event.location, !location.isEmpty {
                         HStack(alignment: .top) {
@@ -173,12 +253,13 @@ struct EventDetailPopover: View {
                         }
                     }
 
-                    // Attendees
+                    // Attendees — collapsed past six so a big invite list
+                    // doesn't push notes and prep out of the sheet.
                     if !event.attendees.isEmpty {
                         Divider()
 
                         VStack(alignment: .leading, spacing: 7) {
-                            ForEach(event.attendees) { attendee in
+                            ForEach(visibleAttendees) { attendee in
                                 HStack(spacing: 7) {
                                     Image(systemName: attendee.status.icon)
                                         .font(.cadenza(12, scale: uiScale))
@@ -193,6 +274,18 @@ struct EventDetailPopover: View {
                                             .foregroundStyle(.secondary)
                                     }
                                 }
+                            }
+
+                            if event.attendees.count > 6 && !showsAllAttendees {
+                                Button {
+                                    showsAllAttendees = true
+                                } label: {
+                                    Text("Show all \(event.attendees.count) attendees")
+                                        .font(.cadenza(12, weight: .semibold, scale: uiScale))
+                                        .foregroundStyle(Color.accentColor)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.cadenzaPlain)
                             }
                         }
                     }

@@ -1,7 +1,9 @@
 import Foundation
 
 /// Lightweight recording struct for list display (no SwiftData dependency).
-struct RecordingDTO: Codable, Sendable, Identifiable {
+/// `Equatable` so SwiftUI can prove a card or list input unchanged instead
+/// of re-evaluating its body, and so AppState can guard observable writes.
+struct RecordingDTO: Codable, Sendable, Identifiable, Equatable {
     let id: UUID
     var title: String
     var startDate: Date
@@ -26,6 +28,10 @@ struct RecordingDTO: Codable, Sendable, Identifiable {
     var hasSummary: Bool
     var transcriptPreview: String?
     var summaryPreview: String?
+    /// Mapped speaker display names, resolved at the store boundary.
+    /// Only confirmed mappings appear here; raw `SPEAKER_N` labels don't.
+    /// Optional so previously encoded DTOs keep decoding.
+    var speakerNames: [String]? = nil
     /// Resolve to a URL via `ProfileStorageResolver`; the DTO never exposes
     /// a raw path string (spec §10.1).
     var audioFile: AudioFileReference?

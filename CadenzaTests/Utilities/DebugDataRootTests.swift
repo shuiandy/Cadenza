@@ -260,6 +260,10 @@ struct DebugDataRootTests {
             "DebugDataRoot.swift",
             "StorageLocationManager.swift",
             "WhisperModelManager.swift",
+            // The stdio bridge is a separate process (the `cadenza-mcp` tool
+            // target does not compile DebugDataRoot) and must find the app's
+            // endpoint file at the real Application Support location.
+            "MCPBridgeRuntime.swift",
         ]
         // Match the search-path argument, not the bare enum case: the seam's
         // own accessors are named after these directories.

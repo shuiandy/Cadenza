@@ -15,17 +15,41 @@ enum CalendarTimelineMetrics {
     static var thirtyMinuteSlotHeight: CGFloat { hourHeight / 2 }
 }
 
+/// Recording relationship a timeline block visualizes (Concept D): recorded
+/// meetings render as filled blocks with a waveform mark, future meetings as
+/// dashed outlines, with a sparkle when the meeting-prep brief is ready.
+enum CalendarEventRecordingState: Equatable {
+    case none
+    case recorded(transcribed: Bool)
+    case upcoming(prepReady: Bool)
+
+    /// Occurrence-unique map key: recurring events share `id` across every
+    /// occurrence, so keying by id alone would paint the whole series with
+    /// one occurrence's state.
+    static func occurrenceKey(for event: MeetingEvent) -> String {
+        "\(event.id)|\(event.startDate.timeIntervalSince1970)"
+    }
+}
+
 struct CalendarEventBlock: View {
     @Environment(\.uiScale) private var uiScale: CGFloat
     @Environment(\.locale) private var locale
 
     let event: MeetingEvent
+    var recordingState: CalendarEventRecordingState = .none
 
     var body: some View {
         HStack(spacing: 4) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(eventColor)
                 .frame(width: 3)
+
+            if case .recorded = recordingState {
+                Image(systemName: "waveform")
+                    .font(.cadenza(10, weight: .semibold, scale: uiScale))
+                    .foregroundStyle(eventColor)
+                    .accessibilityHidden(true)
+            }
 
             ViewThatFits(in: .vertical) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -44,6 +68,14 @@ struct CalendarEventBlock: View {
 
             Spacer(minLength: 0)
 
+            if case .upcoming(prepReady: true) = recordingState {
+                Image(systemName: "sparkles")
+                    .font(.cadenza(10, scale: uiScale))
+                    .foregroundStyle(Color.accentColor)
+                    .help("Meeting Prep")
+                    .accessibilityHidden(true)
+            }
+
             if let app = event.meetingApp {
                 Image(systemName: appIcon(app))
                     .font(.cadenza(11, scale: uiScale))
@@ -53,11 +85,31 @@ struct CalendarEventBlock: View {
         .padding(.horizontal, 4)
         .padding(.vertical, 1)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(eventColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
+        .background(blockBackground)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Text(event.title))
         .accessibilityValue(Text(timeString))
         .accessibilityHint("Open event details")
+    }
+
+    @ViewBuilder
+    private var blockBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 4)
+        switch recordingState {
+        case .recorded:
+            shape.fill(eventColor.opacity(0.22))
+                .overlay(shape.strokeBorder(eventColor.opacity(0.45), lineWidth: 1))
+        case .upcoming:
+            shape.fill(eventColor.opacity(0.07))
+                .overlay(
+                    shape.strokeBorder(
+                        eventColor.opacity(0.55),
+                        style: StrokeStyle(lineWidth: 1, dash: [3, 2])
+                    )
+                )
+        case .none:
+            shape.fill(eventColor.opacity(0.15))
+        }
     }
 
     private var eventColor: Color {

@@ -18,21 +18,36 @@ struct MarkdownMirrorSettingsView: View {
             scale: uiScale,
             padding: 13
         )
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 12) {
+        // Concept P: a status capsule states configured-ness, choosing the
+        // folder is THE primary action while unconfigured, and the dependent
+        // options ride a rail that only lights up once a folder exists.
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "doc.text")
                     .font(.cadenza(16, scale: uiScale))
                     .frame(width: iconSize, height: iconSize)
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Markdown mirror")
-                        .font(.cadenza(14, weight: .medium, scale: uiScale))
+                    HStack(spacing: 7) {
+                        Text("Markdown mirror")
+                            .font(.cadenza(14, weight: .medium, scale: uiScale))
+                        SettingsStatusCapsule(
+                            kind: displayPath == nil ? .disconnected : .connected,
+                            label: displayPath == nil ? "Not configured" : "Ready"
+                        )
+                    }
                     Text(displayPath ?? String(localized: "No folder selected"))
                         .font(.cadenza(12, scale: uiScale))
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 Spacer()
+                if displayPath == nil {
+                    Button("Choose folder…") { chooseFolder() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
                 Toggle("", isOn: $enabled)
                     .labelsHidden()
                     .toggleStyle(.switch)
@@ -48,35 +63,57 @@ struct MarkdownMirrorSettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Toggle("Include full transcript", isOn: $includeTranscript)
-                .controlSize(.small)
-                .disabled(!enabled)
-                .onChange(of: includeTranscript) { _, _ in
-                    if enabled { rebuild() }
-                }
-
-            HStack {
-                Button(displayPath == nil ? "Choose folder…" : "Change folder…") { chooseFolder() }
-                    .controlSize(.small)
-                Button("Rebuild now") { rebuild() }
-                    .controlSize(.small)
-                    .disabled(displayPath == nil || isRebuilding)
-                if displayPath != nil {
-                    Button("Disconnect", role: .destructive) {
-                        MarkdownMirrorLocationManager.clearDirectory()
-                        displayPath = nil
-                        status = nil
+            SettingsDependentRow {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 8) {
+                        Text("Include full transcript")
+                            .font(.cadenza(12.5, scale: uiScale))
+                        Spacer()
+                        Toggle("Include full transcript", isOn: $includeTranscript)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .disabled(!enabled)
+                            .accessibilityLabel(Text("Include full transcript"))
+                            .onChange(of: includeTranscript) { _, _ in
+                                if enabled { rebuild() }
+                            }
                     }
-                    .controlSize(.small)
+                    .padding(.vertical, 6)
+
+                    Divider().opacity(0.5)
+
+                    HStack(spacing: 8) {
+                        if displayPath != nil {
+                            Button("Change folder…") { chooseFolder() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            Button("Disconnect", role: .destructive) {
+                                MarkdownMirrorLocationManager.clearDirectory()
+                                displayPath = nil
+                                status = nil
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        if isRebuilding { ProgressView().controlSize(.small) }
+                        Spacer()
+                        Button("Rebuild now") { rebuild() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(displayPath == nil || isRebuilding)
+                    }
+                    .padding(.vertical, 6)
+
+                    if let status {
+                        Text(status)
+                            .font(.cadenza(11, scale: uiScale))
+                            .foregroundStyle(.secondary)
+                            .padding(.bottom, 4)
+                    }
                 }
-                if isRebuilding { ProgressView().controlSize(.small) }
-                Spacer()
             }
-            if let status {
-                Text(status)
-                    .font(.cadenza(11, scale: uiScale))
-                    .foregroundStyle(.secondary)
-            }
+            .opacity(displayPath == nil ? 0.5 : 1)
         }
         .padding(.vertical, 10)
     }

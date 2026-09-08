@@ -7,6 +7,7 @@ struct CalendarWeekView: View {
 
     @Binding var selectedDate: Date
     let events: [MeetingEvent]
+    var recordingStates: [String: CalendarEventRecordingState] = [:]
     var onEventTap: (MeetingEvent) -> Void
 
     private let hourHeight = CalendarTimelineMetrics.hourHeight
@@ -105,7 +106,10 @@ struct CalendarWeekView: View {
                                     Button {
                                         onEventTap(item.event)
                                     } label: {
-                                        CalendarEventBlock(event: item.event)
+                                        CalendarEventBlock(
+                                            event: item.event,
+                                            recordingState: recordingStates[CalendarEventRecordingState.occurrenceKey(for: item.event)] ?? .none
+                                        )
                                             .frame(width: w - 2, height: eventHeight(item.event))
                                     }
                                     .buttonStyle(.cadenzaPlain)
@@ -267,11 +271,10 @@ struct CalendarWeekView: View {
     }
 
     private func dayNumberString(_ date: Date) -> String {
-        LocalizedDateFormatting.string(
-            from: date,
-            style: .dateTime.day(),
-            locale: locale
-        )
+        // Bare digits only: the day() field style appends a day-unit suffix
+        // in zh/ja/ko locales that cannot fit the fixed 30pt badge.
+        Calendar.autoupdatingCurrent.component(.day, from: date)
+            .formatted(.number.grouping(.never).locale(locale))
     }
 
     private func hourString(_ hour: Int) -> String {

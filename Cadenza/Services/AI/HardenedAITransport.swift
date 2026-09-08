@@ -341,8 +341,13 @@ struct HardenedAITransport: Sendable {
         provider: AIProvider? = nil,
         redacting secrets: [String] = []
     ) async throws -> Data {
+        let trace = AIGenerationObservation.trace
+        let traceID = trace?.begin(request: request, provider: provider)
+        defer { if let traceID { trace?.finish(traceID) } }
         do {
-            return try await performData(for: request, provider: provider, redacting: secrets)
+            let data = try await performData(for: request, provider: provider, redacting: secrets)
+            if let traceID { trace?.observe(data: data, requestID: traceID) }
+            return data
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as AITransportError {
@@ -398,6 +403,9 @@ struct HardenedAITransport: Sendable {
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
+                let trace = AIGenerationObservation.trace
+                let traceID = trace?.begin(request: request, provider: provider)
+                defer { if let traceID { trace?.finish(traceID) } }
                 do {
                     let expectedOrigin = try validatedOrigin(
                         for: request,
@@ -432,12 +440,14 @@ struct HardenedAITransport: Sendable {
                     for try await byte in bytes {
                         try Task.checkCancellation()
                         if let payload = try parser.consume(byte: byte) {
+                            if let traceID { trace?.observe(data: Data(payload.utf8), requestID: traceID) }
                             guard case .enqueued = continuation.yield(payload) else {
                                 throw CancellationError()
                             }
                         }
                     }
                     if let payload = try parser.finish() {
+                        if let traceID { trace?.observe(data: Data(payload.utf8), requestID: traceID) }
                         _ = continuation.yield(payload)
                     }
                     continuation.finish()

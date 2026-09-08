@@ -71,21 +71,22 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
 
     /// Default model for summary (intelligence-heavy, accuracy-first).
     ///
-    /// Rationale (2026-07):
+    /// Rationale (2026-08):
     /// - OpenAI: GPT-5.6 Sol is the current accuracy-first flagship.
     /// - Claude: Sonnet 4.6 keeps the best speed/intelligence/price
     ///   trade-off for meeting summaries. Opus 4.7 is the most capable
     ///   model but ~5x more expensive and aimed at complex agentic work,
     ///   not chunked summary generation.
-    /// - Gemini: 3.5 Flash is stable and is the current recommended
-    ///   frontier-speed default for coding, agentic work, and multimodal
-    ///   text output.
+    /// - Gemini: 3.7 Flash is stable and supersedes 3.5 Flash as the
+    ///   recommended Flash-tier default — more capable on multi-step work
+    ///   and roughly half the price ($0.75/$3.75 per 1M vs $1.50/$9.00,
+    ///   promotional through 2026-12-31).
     /// - MiniMax: M2.7 (April 2026) is the latest.
     var defaultModel: String {
         switch self {
         case .openai: "gpt-5.6-sol"
         case .claude: "claude-sonnet-4-6"
-        case .gemini: "gemini-3.5-flash"
+        case .gemini: "gemini-3.7-flash"
         case .minimax: "MiniMax-M2.7"
         case .apple: "default"
         case .whisperLocal: "base"
@@ -97,14 +98,14 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
     /// cheaper/faster small-model tier maps to it here. Currently:
     /// - OpenAI: gpt-5.6-terra balances capability, latency, and cost.
     /// - Claude: Haiku 4.5 (~5x cheaper, ~3-5x faster than Sonnet 4.6)
-    /// - Gemini: 3.5 Flash (stable, current Flash-tier default)
+    /// - Gemini: 3.7 Flash (stable, current Flash-tier default)
     /// - MiniMax: M2.7-highspeed (identical results, faster latency variant)
     /// - Apple / Whisper Local: fall through to defaultModel.
     var defaultChatModel: String {
         switch self {
         case .openai: "gpt-5.6-terra"
         case .claude: "claude-haiku-4-5"
-        case .gemini: "gemini-3.5-flash"
+        case .gemini: "gemini-3.7-flash"
         case .minimax: "MiniMax-M2.7-highspeed"
         default: defaultModel
         }
@@ -112,12 +113,18 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var defaultTranscriptionModel: String {
         switch self {
-        // gpt-4o-transcribe-diarize is GA through 2027-04-16; still
-        // Cadenza's preferred OpenAI transcription model.
+        // gpt-4o-transcribe-diarize remains OpenAI's only diarizing
+        // transcription model: gpt-transcribe (2026-07-28) is more accurate
+        // but emits no speaker labels, and the speech-to-text guide still
+        // routes diarized workloads here.
         case .openai: "gpt-4o-transcribe-diarize"
-        // gemini-3.5-flash accepts audio input and text output through
-        // generateContent, so it also backs post-recording transcription.
-        case .gemini: "gemini-3.5-flash"
+        // gemini-3.5-transcribe (2026-08-27) is a purpose-built ASR reached
+        // through the Interactions API, not generateContent: native
+        // diarization (<=8 speakers), word timestamps, 85+ languages with
+        // code-switching. GeminiTranscriber routes transcribe-family models
+        // to /v1beta/interactions and everything else to the legacy
+        // prompt-driven generateContent path.
+        case .gemini: "gemini-3.5-transcribe"
         case .apple: "default"
         case .whisperLocal: "base"
         case .claude, .minimax: ""
@@ -126,18 +133,23 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
 
     /// Default model for realtime (live-caption) transcription sessions.
     ///
-    /// Rationale (2026-06):
-    /// - OpenAI: gpt-4o-transcribe via the Realtime API transcription mode —
-    ///   a purpose-built streaming ASR; current quality bar for live captions.
-    /// - Gemini: gemini-3.1-flash-live-preview is a dialogue model; captions
-    ///   come from its input_audio_transcription side channel (notably worse
-    ///   than OpenAI). Google ships no dedicated live-transcription model in
-    ///   the 3.5 generation yet (3.5 live = translate only) — when one lands,
-    ///   flip it here or override via UserDefaults without a rebuild.
+    /// Rationale (2026-08):
+    /// - OpenAI: gpt-live-transcribe (2026-07-28) is the model the Realtime
+    ///   transcription guide now recommends; gpt-4o-transcribe is demoted to
+    ///   "only when you need turn-committed transcription or detected-language
+    ///   output". Cadenza never consumed the detected language from a realtime
+    ///   delta (batch transcription sets it), so the trade is free.
+    /// - Gemini: gemini-3.5-transcribe-live is the dedicated live ASR the old
+    ///   comment here was waiting for. It replaces the 3.1 dialogue model,
+    ///   whose captions were a side channel of a conversational model. It
+    ///   emits whole-hypothesis interim text plus an authoritative final, so
+    ///   GeminiRealtimeTranscriber marks its deltas replacesHypothesis. Live
+    ///   sessions cap at 10 minutes; the RecordingEngine reconnect path
+    ///   rotates them (its budget refills on every healthy stream).
     var defaultRealtimeModel: String {
         switch self {
-        case .openai: "gpt-4o-transcribe"
-        case .gemini: "gemini-3.1-flash-live-preview"
+        case .openai: "gpt-live-transcribe"
+        case .gemini: "gemini-3.5-transcribe-live"
         case .apple: "default"
         case .claude, .minimax, .whisperLocal: ""
         }

@@ -5,93 +5,173 @@ struct RecordingCardView: View {
 
     let recording: RecordingDTO
     var viewMode: ContentViewMode = .grid
+    /// Active post-processing phase, threaded in by the collection so each
+    /// cell stays a pure value view (no per-cell coordinator observation).
+    var processingPhase: JobPhase? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(recording.title)
-                .font(.cadenza(13 + 2, weight: .semibold, scale: uiScale))
-                .lineLimit(2)
-
-            HStack(spacing: 6) {
-                chip(durationString, icon: "clock", tint: .accentColor)
-
-                Spacer(minLength: 4)
-
-                if recording.hasTranscript {
-                    iconBadge("text.bubble")
-                }
-                if recording.hasSummary {
-                    iconBadge("sparkles")
-                }
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(typeTint)
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
+                Text(recording.title)
+                    .font(.cadenza(13 + 1, weight: .semibold, scale: uiScale))
+                    .lineLimit(viewMode == .waterfall ? 2 : 1)
             }
 
             if let preview = contentPreview {
                 Text(preview)
                     .font(.cadenza(13 - 1, scale: uiScale))
                     .foregroundStyle(.secondary)
-                    .lineLimit(viewMode == .waterfall ? 6 : 3)
+                    .lineLimit(viewMode == .waterfall ? 6 : 3, reservesSpace: viewMode == .grid)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Divider()
+            HStack(spacing: 6) {
+                Text(metaString)
+                    .font(.cadenza(13 - 2, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
 
-            HStack(spacing: 12) {
-                Label(dateString, systemImage: "calendar")
-                Label(timeString, systemImage: "clock")
+                Spacer(minLength: 4)
+
+                statusChip
+
+                speakerAvatarStack
             }
-            .font(.cadenza(13 - 2, scale: uiScale))
-            .foregroundStyle(.secondary)
 
             if !recording.tags.isEmpty {
-                FlowLayout(spacing: 6) {
-                    ForEach(recording.tags.prefix(5), id: \.self) { tag in
-                        chip(tag, icon: "tag", tint: Self.tagColor(for: tag))
+                FlowLayout(spacing: 5) {
+                    ForEach(recording.tags.prefix(3), id: \.self) { tag in
+                        tagChip(tag)
+                    }
+                    if recording.tags.count > 3 {
+                        Text(verbatim: "+\(recording.tags.count - 3)")
+                            .font(.cadenza(13 - 3, weight: .medium, scale: uiScale))
+                            .foregroundStyle(.tertiary)
+                            .padding(.vertical, 3)
                     }
                 }
-                .lineLimit(2)
+                .lineLimit(1)
             }
         }
-        .padding(14)
+        // The day grid breathes more than the waterfall: extra padding plus
+        // the reserved three-line preview keeps its rows tall and even.
+        .padding(viewMode == .grid ? 16 : 14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .appCollectionCard(cornerRadius: AppStyle.Radius.card)
     }
 
-    private func iconBadge(_ icon: String) -> some View {
-        let controlSize = CadenzaControlMetrics.squareIconFrame(
-            base: 24,
-            symbolPointSize: 10,
-            scale: uiScale,
-            padding: 10
-        )
-        return Image(systemName: icon)
-            .font(.cadenza(13 - 3, weight: .medium, scale: uiScale))
-            .foregroundStyle(.secondary)
-            .frame(width: controlSize, height: controlSize)
-            .background(
-                Circle()
-                    .fill(AppStyle.ColorToken.mutedCapsuleFill)
-            )
-            .overlay(
-                Circle()
-                    .strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 0.6)
-            )
+    /// Status appears only while a job is running or when the transcript is
+    /// genuinely missing; the old per-card transcript/summary badges carried
+    /// no information once nearly every card had both.
+    @ViewBuilder
+    private var statusChip: some View {
+        switch processingPhase {
+        case .pendingTranscription, .transcribing:
+            progressChip(String(localized: "Transcribing..."))
+        case .pendingSummary, .summarizing:
+            progressChip(String(localized: "Generating summary..."))
+        case nil:
+            if !recording.hasTranscript {
+                Text("No transcript")
+                    .font(.cadenza(13 - 4, weight: .medium, scale: uiScale))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(AppStyle.ColorToken.mutedCapsuleFill)
+                    )
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 0.6)
+                    )
+            }
+        }
     }
 
-    private func chip(_ text: String, icon: String, tint: Color) -> some View {
-        Label(text, systemImage: icon)
-            .font(.cadenza(13 - 3, weight: .medium, scale: uiScale))
-            .foregroundStyle(tint)
-            .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(AppStyle.ColorToken.mutedCapsuleFill)
-            )
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 0.6)
-            )
+    private func progressChip(_ text: String) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(Color.orange)
+                .frame(width: 5, height: 5)
+                .accessibilityHidden(true)
+            Text(verbatim: text)
+                .font(.cadenza(13 - 4, weight: .semibold, scale: uiScale))
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 0.6)
+        )
+    }
+
+    /// Up to two mapped-speaker initials, overlapped; the tail collapses
+    /// into a +N bubble. Hidden entirely when no speakers are mapped.
+    @ViewBuilder
+    private var speakerAvatarStack: some View {
+        if let names = recording.speakerNames, !names.isEmpty {
+            HStack(spacing: -5) {
+                ForEach(names.prefix(2), id: \.self) { name in
+                    speakerAvatar(initial: String(name.prefix(1)).uppercased(), tint: Self.tagColor(for: name))
+                }
+                if names.count > 2 {
+                    speakerAvatar(initial: "+\(names.count - 2)", tint: .secondary)
+                }
+            }
+            .accessibilityLabel(Text(names.joined(separator: ", ")))
+        }
+    }
+
+    private func speakerAvatar(initial: String, tint: Color) -> some View {
+        ZStack {
+            Circle()
+                .fill(tint.opacity(0.2))
+            Text(verbatim: initial)
+                .font(.cadenza(13 - 5, weight: .bold, scale: uiScale))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(width: 18, height: 18)
+        .overlay(Circle().strokeBorder(AppStyle.ColorToken.stroke, lineWidth: 0.75))
+    }
+
+    /// Neutral chip with a small hue dot: the tag hue survives as a marker
+    /// without the old full-color chips fighting each other across the grid.
+    private func tagChip(_ tag: String) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(Self.tagColor(for: tag))
+                .frame(width: 5, height: 5)
+                .accessibilityHidden(true)
+            Text(tag)
+                .font(.cadenza(13 - 3, weight: .medium, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AppStyle.ColorToken.mutedCapsuleFill)
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(AppStyle.ColorToken.mutedCapsuleStroke, lineWidth: 0.6)
+        )
     }
 
     private var contentPreview: String? {
@@ -102,6 +182,15 @@ struct RecordingCardView: View {
             return preview
         }
         return nil
+    }
+
+    /// Grid and list cells sit under a day header, so the date would be
+    /// redundant; the ungrouped waterfall keeps it on the card.
+    private var metaString: String {
+        if viewMode == .waterfall {
+            return "\(dateString) · \(timeString) · \(durationString)"
+        }
+        return "\(timeString) · \(durationString)"
     }
 
     private var dateString: String {
@@ -116,6 +205,24 @@ struct RecordingCardView: View {
         let minutes = Int(recording.duration) / 60
         if minutes < 1 { return "<1m" }
         return "\(minutes)m"
+    }
+
+    private var typeTint: Color {
+        guard let raw = recording.meetingType,
+              let type = MeetingType(rawValue: raw) else {
+            return Color.secondary.opacity(0.35)
+        }
+        return Self.typeTint(for: type)
+    }
+
+    static func typeTint(for type: MeetingType) -> Color {
+        switch type {
+        case .oneOnOne: .purple
+        case .clientMeeting: .orange
+        case .interview: .pink
+        case .general: Color.secondary.opacity(0.35)
+        default: .teal
+        }
     }
 
     private static let tagColors: [Color] = [

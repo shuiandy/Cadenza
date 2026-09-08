@@ -1584,6 +1584,45 @@ struct RecordingEngineProviderBoundaryTests {
         #expect(engine._test_hasQueuedRealtimeSpeechRetry)
     }
 
+    @Test func contentDeltaClearsStaleInterruptionHint() async throws {
+        struct StreamFailed: Error {}
+
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+        isolated.defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
+        isolated.defaults.set("en", forKey: "transcriptionLanguage")
+        isolated.defaults.set(AIProvider.openai.rawValue, forKey: "realtimeTranscriptionProvider")
+        isolated.defaults.set(true, forKey: "enableRealtimeTranscription")
+
+        let spy = RecordingEngineBoundarySpy()
+        spy.keys[.openai] = "openai-key"
+        let engine = RecordingEngine(dependencies: spy.dependencies(defaults: isolated.defaults))
+        try await attachIsolatedStore(to: engine, audioRoot: spy.storageRoot)
+        defer { engine.forceReset() }
+
+        try await engine.startRecording(captureMicrophone: false, skipPermissionPrompt: true)
+        #expect(await waitUntil { spy.realtimeRequests.count == 1 })
+
+        for expected in 2...4 {
+            engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+            #expect(await waitUntil {
+                spy.realtimeRequests.count == expected && !engine._test_isReconnectingRealtime
+            })
+        }
+        engine._test_triggerRealtimeFailure(StreamFailed(), provider: .openai)
+        #expect(engine.realtimeHint != nil)
+        #expect(engine._test_hasQueuedRealtimeSpeechRetry)
+
+        // The give-up branch leaves its stream open, so a first delta can
+        // arrive with no reconnect in between. The session has recovered on
+        // its own: the interruption banner must come down with the queue.
+        engine._test_triggerRealtimeStreamHealthy()
+        #expect(engine.realtimeHint == nil)
+        #expect(!engine._test_hasQueuedRealtimeSpeechRetry)
+        #expect(engine._test_realtimeReconnectCount == 0)
+        #expect(engine.recordingState == .recording)
+    }
+
     @Test func forceResetCancelsHungRealtimeStartup() async throws {
         let isolated = makeDefaults()
         defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }

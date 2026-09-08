@@ -3,23 +3,50 @@ import SwiftUI
 // MARK: - Summary Detail Level
 
 enum SummaryDetailLevel: String, CaseIterable, Sendable {
+    // Keep stored values compatible with existing installations.
     case highlights
     case detailed
     case fullBreakdown
 
+    static let defaultsKey = "summaryDetailLevel"
+
+    static func load(defaults: UserDefaults = .standard) -> Self {
+        defaults.string(forKey: defaultsKey).flatMap(Self.init(rawValue:)) ?? .detailed
+    }
+
     var displayName: String {
         switch self {
-        case .highlights: String(localized: "Highlights Only")
-        case .detailed: String(localized: "Detailed")
-        case .fullBreakdown: String(localized: "Full Breakdown")
+        case .highlights: String(localized: "Brief")
+        case .detailed: String(localized: "Standard")
+        case .fullBreakdown: String(localized: "Detailed")
         }
     }
 
     var description: String {
         switch self {
-        case .highlights: String(localized: "Key points and action items only")
-        case .detailed: String(localized: "Key points, decisions, and follow-ups")
-        case .fullBreakdown: String(localized: "Comprehensive analysis with full context")
+        case .highlights: String(localized: "A short overview with essential decisions, actions, and blockers.")
+        case .detailed: String(localized: "All main topics with key context, decisions, actions, and follow-ups.")
+        case .fullBreakdown: String(localized: "A thorough meeting record with context, reasoning, conditions, disagreements, and action details.")
+        }
+    }
+
+    /// Instructions change narrative depth, never the evidence or attribution rules.
+    var promptGuidance: String {
+        switch self {
+        case .highlights:
+            "Summary detail: BRIEF. Write a short executive digest using compact topic bullets. Compress background, examples and repeated explanations. Retain material decisions, actionable commitments, blockers and qualifications that change their meaning. Do not impose a fixed bullet quota or omit an important topic just to shorten the result."
+        case .detailed:
+            "Summary detail: STANDARD. Cover all main topics with enough context and rationale to understand the outcome and next steps. Keep material facts, decisions, conditions, blockers and actions; summarize supporting examples and omit incidental discussion. Use focused topic paragraphs or bullets."
+        case .fullBreakdown:
+            "Summary detail: DETAILED. Produce a thorough standalone meeting record that a reader or assistant can use without routinely opening the transcript. Cover every substantive topic and subtopic, including secondary updates, questions and answers, material examples, alternatives considered, reasons for rejection, dependencies, risks and unresolved disagreements. Preserve exact names, systems, quantities, dates, scope, exceptions, later clarifications and the distinction between proposals and decisions. Keep concrete task deliverables, evidenced owners, deadlines and prerequisites. Group related facts into coherent topic entries. Do not impose a word count or bullet limit; expand according to source information density. Exclude repetition and small talk, and never invent detail to make the record seem complete."
+        }
+    }
+
+    var compactPromptGuidance: String {
+        switch self {
+        case .highlights: "Detail: BRIEF. Compress context; keep essential decisions, tasks, blockers and qualifications."
+        case .detailed: "Detail: STANDARD. Cover main topics with key context, reasons, decisions and next steps."
+        case .fullBreakdown: "Detail: DETAILED. Preserve substantive subtopics, reasons, alternatives, questions and answers, exact facts, conditions, disagreements, clarifications and task details. Remove repetition, not evidence."
         }
     }
 }

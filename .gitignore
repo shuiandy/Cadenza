@@ -57,3 +57,6 @@ PLAN.md
 task_plan.md
 findings.md
 progress.md
+
+# Local signing identity (personal team ID, never committed)
+Signing.local.xcconfig

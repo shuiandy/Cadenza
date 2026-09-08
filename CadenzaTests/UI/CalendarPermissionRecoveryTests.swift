@@ -66,8 +66,13 @@ struct CalendarPermissionRecoveryTests {
         #expect(app.contains("func applicationDidBecomeActive"))
         #expect(app.contains("if appState.startupPolicy.checksPermissions"))
         #expect(app.contains("await appState.checkPermissionsAndRefreshCalendarIfNeeded()"))
-        #expect(connections.contains("await appState.checkPermissionsAndRefreshCalendarIfNeeded()"))
-        #expect(settings.contains("await appState.checkPermissionsAndRefreshCalendarIfNeeded()"))
+        // The in-app request surfaces must route the TCC sheet's own result:
+        // EventKit's class status can stay on its pre-grant value for the rest
+        // of the process, so re-reading it there loses the grant until relaunch.
+        #expect(appState.contains("func applyCalendarAccessRequestOutcome(granted: Bool) async"))
+        #expect(appState.contains("adoptAuthorizationGrantedInProcess()"))
+        #expect(connections.contains("await appState.applyCalendarAccessRequestOutcome(granted: granted)"))
+        #expect(settings.contains("await appState.applyCalendarAccessRequestOutcome(granted: granted)"))
         #expect(calendar.contains(".task(id: calendarContentReloadKey)"))
         #expect(calendar.contains("hasCalendarPermission: appState.hasCalendarPermission"))
     }

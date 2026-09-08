@@ -69,6 +69,43 @@ struct ExportBackupAdaptiveControls<Content: View>: View {
     }
 }
 
+/// Selected-state pill for the export format toggles (concept J): a checked
+/// accent capsule reads as "will be written", the plain outline as "won't".
+struct ExportFormatPillToggleStyle: ToggleStyle {
+    let uiScale: CGFloat
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                if configuration.isOn {
+                    Image(systemName: "checkmark")
+                        .font(.cadenza(8, weight: .bold, scale: uiScale))
+                }
+                configuration.label
+                    .font(.cadenza(11.5, weight: configuration.isOn ? .semibold : .regular, scale: uiScale))
+            }
+            .foregroundStyle(configuration.isOn ? Color.accentColor : Color.secondary)
+            .padding(.horizontal, 10)
+            .frame(minHeight: 22)
+            .background(
+                configuration.isOn ? Color.accentColor.opacity(0.1) : Color.clear,
+                in: Capsule()
+            )
+            .overlay(
+                Capsule().strokeBorder(
+                    configuration.isOn ? Color.accentColor.opacity(0.32) : Color.primary.opacity(0.16),
+                    lineWidth: 1
+                )
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.cadenzaPlain(in: Capsule()))
+        .accessibilityAddTraits(configuration.isOn ? .isSelected : [])
+    }
+}
+
 /// Settings → General → "Export & Backup": local batch export of
 /// transcripts / summaries / audio into one directory per recording.
 /// Observes the shared BatchFileExporter on ExportService so progress
@@ -116,15 +153,14 @@ struct ExportBackupSection: View {
                 .fixedSize()
                 .disabled(exporter.isBusy)
 
-                ExportBackupAdaptiveControls(regularSpacing: 14) {
+                ExportBackupAdaptiveControls(regularSpacing: 6) {
                     Toggle("Transcript (.txt)", isOn: $options.transcriptTxt)
                     Toggle("Subtitles (.srt)", isOn: $options.transcriptSRT)
                     Toggle("Transcript (.md)", isOn: $options.transcriptMarkdown)
                     Toggle("Summary", isOn: $options.summaryMarkdown)
                     Toggle("Audio", isOn: $options.audio)
                 }
-                .toggleStyle(.checkbox)
-                .font(.cadenza(12, scale: uiScale))
+                .toggleStyle(ExportFormatPillToggleStyle(uiScale: uiScale))
                 .disabled(exporter.isBusy)
 
                 resultLine
@@ -144,11 +180,18 @@ struct ExportBackupSection: View {
                     archiveTrailing
                 }
 
-                Toggle("Include voice embeddings (speaker recognition data)", isOn: $includeVoiceEmbeddings)
-                    .toggleStyle(.checkbox)
-                    .font(.cadenza(12, scale: uiScale))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .disabled(archiver.isBusy)
+                HStack(spacing: 12) {
+                    Text("Include voice embeddings (speaker recognition data)")
+                        .font(.cadenza(12, scale: uiScale))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 12)
+                    Toggle("Include voice embeddings (speaker recognition data)", isOn: $includeVoiceEmbeddings)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(archiver.isBusy)
+                        .accessibilityLabel(Text("Include voice embeddings (speaker recognition data)"))
+                }
 
                 archiveResultLine
 

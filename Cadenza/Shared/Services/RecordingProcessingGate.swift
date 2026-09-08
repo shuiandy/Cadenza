@@ -31,8 +31,15 @@ final class RecordingProcessingGate {
     }
 
     private let id = UUID()
+    private let workPriority: ProcessingWorkPriority
     private var recordingIntentID: UUID?
-    private var recordingLeaseID: UUID?
+    private var recordingLeaseID: UUID? {
+        didSet { workPriority.setRecordingActive(recordingLeaseID != nil) }
+    }
+
+    init(workPriority: ProcessingWorkPriority = .shared) {
+        self.workPriority = workPriority
+    }
     private var processingLeaseIDs: Set<UUID> = []
     private var allIdleObservers: [UUID: @MainActor () -> Void] = [:]
     private var isNotifyingLeaseIdle = false

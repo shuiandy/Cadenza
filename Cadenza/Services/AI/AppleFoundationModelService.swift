@@ -41,7 +41,8 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
         jobTitle: String?,
         meetingType: MeetingType?,
         meetingTitle: String?,
-        knownTags: [String]
+        knownTags: [String],
+        detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()
     ) async throws -> SummaryResult {
         do {
             // Always use map-reduce for Apple FM due to small context window
@@ -54,7 +55,7 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
                         knownTags: knownTags,
                         jobTitle: jobTitle,
                         meetingType: meetingType,
-                        meetingTitle: meetingTitle
+                        meetingTitle: meetingTitle, detailLevel: detailLevel
                     ),
                     prompt: chunks[0]
                 )
@@ -64,7 +65,7 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
             return try await mapReduceSummarize(
                 chunks: chunks, language: language,
                 jobTitle: jobTitle, meetingType: meetingType,
-                meetingTitle: meetingTitle, knownTags: knownTags
+                meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel
             )
         } catch is CancellationError {
             throw CancellationError()
@@ -81,7 +82,8 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
         jobTitle: String?,
         meetingType: MeetingType?,
         meetingTitle: String?,
-        knownTags: [String]
+        knownTags: [String],
+        detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -91,7 +93,7 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
                         transcript: transcript, language: language,
                         model: model, jobTitle: jobTitle,
                         meetingType: meetingType, meetingTitle: meetingTitle,
-                        knownTags: knownTags
+                        knownTags: knownTags, detailLevel: detailLevel
                     )
                     try Task.checkCancellation()
                     continuation.yield(result.rawText)
@@ -217,10 +219,11 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
         knownTags: [String],
         jobTitle: String?,
         meetingType: MeetingType?,
-        meetingTitle: String?
+        meetingTitle: String?,
+        detailLevel: SummaryDetailLevel
     ) -> String {
         let outputLanguage = SummaryPrompt.languageName(language)
-        let userName = UserDefaults.standard.string(forKey: ActiveProfileDefaults.key("userName")) ?? ""
+        let userName = SummaryPrompt.evaluationUserName ?? UserDefaults.standard.string(forKey: ActiveProfileDefaults.key("userName")) ?? ""
         var context: [String] = []
         if !userName.isEmpty {
             var identity = "Configured user: \(userName)"
@@ -235,6 +238,8 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
         return """
         Summarize this meeting transcript. Respond in \(outputLanguage). Output ONLY valid JSON:
         \(SummaryPrompt.compactSpeakerAttributionRules)
+        \(SummaryPrompt.compactSummaryCoverageRules)
+        \(detailLevel.compactPromptGuidance)
         \(context.joined(separator: " "))
         {"title":"...","overview":"...","key_points":["..."],"action_items":[{"assignee":null,"task":"...","deadline":null}],"decisions":["..."],"follow_ups":["..."],"your_tasks":["..."],"tags":["..."],"meeting_type":"general"}
         Write the title in \(outputLanguage). \(reuse)Tags in the same language as the summary; avoid tags obvious from the user's role.
@@ -255,11 +260,12 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
         jobTitle: String?,
         meetingType: MeetingType?,
         meetingTitle: String?,
-        knownTags: [String]
+        knownTags: [String],
+        detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()
     ) async throws -> SummaryResult {
         // Map phase: summarize each chunk with a minimal prompt
         let outputLanguage = SummaryPrompt.languageName(language)
-        let mapPrompt = "Summarize this meeting segment concisely. \(SummaryPrompt.compactSpeakerAttributionRules) Include key points, decisions, action items. Respond in \(outputLanguage). Use plain text."
+        let mapPrompt = "Summarize this meeting segment concisely. \(SummaryPrompt.compactSpeakerAttributionRules) \(SummaryPrompt.compactSummaryCoverageRules) \(detailLevel.compactPromptGuidance) Include key points, decisions, action items. Respond in \(outputLanguage). Use plain text."
 
         var chunkSummaries: [String] = []
         for chunk in chunks {
@@ -272,7 +278,7 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
 
         let reduceInput = try await reduceChunkSummaries(
             chunkSummaries,
-            outputLanguage: outputLanguage
+            outputLanguage: outputLanguage, detailLevel: detailLevel
         )
 
         let response = try await generate(
@@ -281,7 +287,7 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
                 knownTags: knownTags,
                 jobTitle: jobTitle,
                 meetingType: meetingType,
-                meetingTitle: meetingTitle
+                meetingTitle: meetingTitle, detailLevel: detailLevel
             ),
             prompt: reduceInput
         )
@@ -291,6 +297,7 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
     private func reduceChunkSummaries(
         _ summaries: [String],
         outputLanguage: String,
+        detailLevel: SummaryDetailLevel,
         depth: Int = 0
     ) async throws -> String {
         let combined = summaries.enumerated().map { index, summary in
@@ -303,14 +310,14 @@ final class AppleFoundationModelService: AIServiceProtocol, Sendable {
         var reduced: [String] = []
         for batch in batches {
             let result = try await generate(
-                instructions: "Condense all supplied segment summaries to at most 500 characters without dropping facts or changing speaker attribution. \(SummaryPrompt.compactSpeakerAttributionRules) Respond in \(outputLanguage). Use plain text.",
+                instructions: "Condense all supplied segment summaries to at most 500 characters without dropping facts or changing speaker attribution. \(SummaryPrompt.compactSpeakerAttributionRules) \(SummaryPrompt.compactSummaryCoverageRules) \(detailLevel.compactPromptGuidance) Respond in \(outputLanguage). Use plain text.",
                 prompt: batch
             )
             reduced.append(result)
         }
         return try await reduceChunkSummaries(
             reduced,
-            outputLanguage: outputLanguage,
+            outputLanguage: outputLanguage, detailLevel: detailLevel,
             depth: depth + 1
         )
     }

@@ -37,6 +37,9 @@ enum WebSyncPersistenceError: Error, LocalizedError {
 
 @Model
 final class WebSyncRecord {
+    // Every 60 s pass fetches this account's rows by userID.
+    #Index<WebSyncRecord>([\.userID])
+
     @Attribute(.unique) var syncKey: String
     var userID: String
     var recordingID: UUID

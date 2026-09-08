@@ -3042,7 +3042,11 @@ struct ProfileTransferExecutorWebSyncConsentTests {
                 #expect(record?.structuredState == WebStructuredSyncState.synced.rawValue)
                 #expect(record?.audioState == WebAudioSyncState.localOnly.rawValue)
             }
-            #expect(harness.http.requests.count == 3)
+            // One structured upsert per recording; the once-per-pass
+            // /me/mcp-prefs read is not sync traffic and is not counted.
+            #expect(harness.http.requests.filter {
+                $0.url?.path.hasSuffix("/me/mcp-prefs") != true
+            }.count == 3)
             #expect(!harness.http.requests.contains {
                 let path = $0.url?.path ?? ""
                 return path.contains("/audio/sessions") || path.contains("/parts/")

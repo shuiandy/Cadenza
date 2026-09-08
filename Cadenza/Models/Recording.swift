@@ -23,6 +23,11 @@ enum RecordingSource: String, CaseIterable, Codable, Sendable {
 
 @Model
 final class Recording {
+    // Every list fetch filters on trashedDate and sorts on startDate; every
+    // detail path looks a row up by id. Without these the store scanned the
+    // table and sorted through a temporary b-tree on each call.
+    #Index<Recording>([\.id], [\.startDate], [\.trashedDate], [\.trashedDate, \.startDate])
+
     var id: UUID
     var title: String
     var startDate: Date
@@ -41,8 +46,21 @@ final class Recording {
     var trashedDate: Date?
     var audioSegmentsDirectory: String?
     var linkedCalendarEventID: String?
+    /// Last linked meeting, written at link time so web sync can send it
+    /// without asking EventKit again (permission revoked still keeps this).
+    var calendarEventTitle: String?
+    var calendarEventStartAt: Date?
+    var calendarEventEndAt: Date?
     var speakerMappings: [SpeakerLabelMapping]?
     var speakerSuggestions: [SpeakerLabelSuggestion]?
+    /// List-projection columns. The library card shows a short preview of the
+    /// summary or transcript; deriving it from `transcript.fullText` faulted
+    /// the whole Transcript row (text plus segments blob) for every recording
+    /// on every list refresh. The store maintains these wherever transcript or
+    /// summary content is written; `backfillListPreviews` fills rows that
+    /// predate the columns.
+    var transcriptPreview: String?
+    var summaryPreview: String?
     var processingAttempts: Int = 0
     var postProcessingBackfillState: String?
     var postProcessingBackfillRequestedAt: Date?

@@ -262,6 +262,8 @@ private func seedEntity(_ name: String, into context: ModelContext) throws {
         context.insert(Transcript(fullText: "seed"))
     case "MeetingSummary":
         context.insert(MeetingSummary(overview: "seed"))
+    case "SummaryContextRecord":
+        context.insert(SummaryContextRecord(recordingID: UUID(), inputJSON: "{}"))
     case "ExternalRecordingImport":
         context.insert(ExternalRecordingImport(
             externalKey: "k", provider: "p", externalID: "x", sourceTitle: "t",

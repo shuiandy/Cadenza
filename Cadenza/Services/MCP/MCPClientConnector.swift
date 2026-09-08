@@ -3,6 +3,12 @@ import Synchronization
 
 /// Detects external MCP clients and writes their configuration in one click.
 ///
+/// Every client except Hermes is configured with the SAME stdio entry — run
+/// the bundled `cadenza-mcp` bridge with `--client <id>` — so a client config
+/// never carries a URL, a port, or a token. Endpoint and credential live in
+/// the app's own runtime files (`MCPBridgeRuntime`), which is why a token
+/// reset or port change no longer invalidates anything written here.
+///
 /// Detection is purely filesystem-based (no shell calls — fast and testable):
 /// a client counts as installed when its config root exists. Connecting:
 /// - Claude Code goes through the official `claude mcp add` CLI (its
@@ -11,16 +17,21 @@ import Synchronization
 /// - Gemini CLI / Claude Desktop get a semantic JSON merge: parse, upsert
 ///   `mcpServers.cadenza`, rewrite. Every other key/value is preserved
 ///   (formatting and key order are JSONSerialization's).
-/// - Codex / Hermes are TOML / YAML: no Swift stdlib parser, so we do a
-///   text-level replacement of ONLY our own `cadenza` block, refusing
-///   (throwing) on any structure we don't recognize so we never corrupt the
-///   user's hand-tuned config. On refusal the UI shows a copyable snippet.
+/// - Codex / Grok are TOML: no Swift stdlib parser, so we do a text-level
+///   replacement of ONLY our own `cadenza` table, refusing (throwing) on any
+///   structure we don't recognize so we never corrupt the user's hand-tuned
+///   config. Upserting also removes the legacy managed `url`/header keys
+///   from the pre-bridge HTTP layout. On refusal the UI shows a copyable
+///   snippet.
+/// - Hermes stays on direct HTTP (YAML `url` + `headers.Authorization`
+///   block replacement) — its gateway has no verified stdio transport.
 struct MCPClientConnector: Sendable {
     enum Client: String, CaseIterable, Identifiable, Sendable {
         case claudeCode = "Claude Code"
         case geminiCLI = "Gemini CLI"
         case claudeDesktop = "Claude Desktop"
         case codexCLI = "Codex (GPT)"
+        case grokCLI = "Grok"
         case hermes = "Hermes"
         var id: String { rawValue }
         var accessID: String {
@@ -29,17 +40,22 @@ struct MCPClientConnector: Sendable {
             case .geminiCLI: "gemini-cli"
             case .claudeDesktop: "claude-desktop"
             case .codexCLI: "codex-cli"
+            case .grokCLI: "grok-cli"
             case .hermes: "hermes"
             }
         }
+        /// Hermes connects straight to the loopback HTTP endpoint; everyone
+        /// else runs the stdio bridge.
+        var usesBridge: Bool { self != .hermes }
     }
 
     enum ConnectionState: Equatable, Sendable {
         case notInstalled(hint: String)
         case disconnected
         case connected
-        /// Configured, but with a token/URL that no longer matches ours
-        /// (e.g. after a token reset or port change).
+        /// Configured, but not in the exact shape Connect would write today
+        /// (legacy HTTP entry, moved app bundle, or a credential file that
+        /// no longer matches the access store).
         case stale
     }
 
@@ -72,6 +88,11 @@ struct MCPClientConnector: Sendable {
 
     static let serverName = "cadenza"
 
+    /// The one argv every bridge-based client entry carries.
+    static func bridgeArguments(for client: Client) -> [String] {
+        ["--client", client.accessID]
+    }
+
     /// Injectable roots so tests run against a temp directory.
     let home: URL
     let applicationsDirectory: URL
@@ -90,12 +111,22 @@ struct MCPClientConnector: Sendable {
         home.appendingPathComponent("Library/Application Support/Claude/claude_desktop_config.json")
     }
     var codexConfigURL: URL { home.appendingPathComponent(".codex/config.toml") }
+    var grokConfigURL: URL { home.appendingPathComponent(".grok/config.toml") }
     var hermesConfigURL: URL { home.appendingPathComponent(".hermes/config.yaml") }
 
     // MARK: - Detection
 
-    func detect(_ client: Client, url: String, token: String) -> ConnectionState {
-        let bearer = "Bearer \(token)"
+    /// `storedCredential` is the current content of our own credential file
+    /// for this client (`MCPBridgeRuntime.credential(for:)`): a bridge entry
+    /// only counts as connected when that file still carries the expected
+    /// token — the config itself has no secret to compare.
+    func detect(
+        _ client: Client,
+        bridgePath: String,
+        url: String,
+        token: String,
+        storedCredential: String?
+    ) -> ConnectionState {
         switch client {
         case .claudeCode:
             // Every Claude Code install materializes ~/.claude.json on first run.
@@ -105,10 +136,8 @@ struct MCPClientConnector: Sendable {
             guard let entry = (root["mcpServers"] as? [String: Any])?[Self.serverName] as? [String: Any] else {
                 return .disconnected
             }
-            let headers = entry["headers"] as? [String: Any]
-            let matches = (entry["url"] as? String) == url
-                && (headers?["Authorization"] as? String) == bearer
-            return matches ? .connected : .stale
+            return bridgeEntryState(entry, client: client, bridgePath: bridgePath,
+                                    token: token, storedCredential: storedCredential)
 
         case .geminiCLI:
             guard FileManager.default.fileExists(atPath: home.appendingPathComponent(".gemini").path) else {
@@ -118,10 +147,8 @@ struct MCPClientConnector: Sendable {
                   let entry = (root["mcpServers"] as? [String: Any])?[Self.serverName] as? [String: Any] else {
                 return .disconnected
             }
-            let headers = entry["headers"] as? [String: Any]
-            let matches = (entry["httpUrl"] as? String) == url
-                && (headers?["Authorization"] as? String) == bearer
-            return matches ? .connected : .stale
+            return bridgeEntryState(entry, client: client, bridgePath: bridgePath,
+                                    token: token, storedCredential: storedCredential)
 
         case .claudeDesktop:
             guard FileManager.default.fileExists(atPath: applicationsDirectory.appendingPathComponent("Claude.app").path) else {
@@ -131,24 +158,24 @@ struct MCPClientConnector: Sendable {
                   let entry = (root["mcpServers"] as? [String: Any])?[Self.serverName] as? [String: Any] else {
                 return .disconnected
             }
-            let args = entry["args"] as? [String] ?? []
-            let env = entry["env"] as? [String: Any]
-            let matches = args.contains(url) && (env?["AUTH_HEADER"] as? String) == bearer
-            return matches ? .connected : .stale
+            return bridgeEntryState(entry, client: client, bridgePath: bridgePath,
+                                    token: token, storedCredential: storedCredential)
 
         case .codexCLI:
             guard FileManager.default.fileExists(atPath: home.appendingPathComponent(".codex").path) else {
                 return .notInstalled(hint: String(localized: "Install Codex CLI or the Codex app first"))
             }
-            guard let text = try? String(contentsOf: codexConfigURL, encoding: .utf8),
-                  let section = Self.codexCadenzaSection(in: text) else {
-                return .disconnected
+            return tomlBridgeState(configURL: codexConfigURL, client: client,
+                                   legacyHeadersField: .httpHeaders, bridgePath: bridgePath,
+                                   token: token, storedCredential: storedCredential)
+
+        case .grokCLI:
+            guard FileManager.default.fileExists(atPath: home.appendingPathComponent(".grok").path) else {
+                return .notInstalled(hint: String(localized: "Install Grok CLI first (creates ~/.grok)"))
             }
-            // Compare parsed values, not text: Codex rewrites config.toml
-            // through its own serializer (spacing, quotes, inline vs nested),
-            // so format matching would misreport cosmetic rewrites as stale.
-            let values = Self.codexManagedValues(inSection: section)
-            return (values.url == url && values.token == token) ? .connected : .stale
+            return tomlBridgeState(configURL: grokConfigURL, client: client,
+                                   legacyHeadersField: .headers, bridgePath: bridgePath,
+                                   token: token, storedCredential: storedCredential)
 
         case .hermes:
             guard FileManager.default.fileExists(atPath: home.appendingPathComponent(".hermes").path) else {
@@ -165,11 +192,41 @@ struct MCPClientConnector: Sendable {
         }
     }
 
-    // MARK: - Connect (idempotent upsert; safe to re-run to refresh token)
+    private func bridgeEntryState(
+        _ entry: [String: Any],
+        client: Client,
+        bridgePath: String,
+        token: String,
+        storedCredential: String?
+    ) -> ConnectionState {
+        let entryMatches = (entry["command"] as? String) == bridgePath
+            && (entry["args"] as? [String]) == Self.bridgeArguments(for: client)
+        return (entryMatches && storedCredential == token) ? .connected : .stale
+    }
 
-    func connect(_ client: Client, url: String, token: String) async throws {
+    private func tomlBridgeState(
+        configURL: URL,
+        client: Client,
+        legacyHeadersField: TOMLHeaderField,
+        bridgePath: String,
+        token: String,
+        storedCredential: String?
+    ) -> ConnectionState {
+        guard let text = try? String(contentsOf: configURL, encoding: .utf8),
+              let section = Self.codexCadenzaSection(in: text, headersField: legacyHeadersField) else {
+            return .disconnected
+        }
+        let values = Self.codexBridgeManagedValues(inSection: section, legacyHeadersField: legacyHeadersField)
+        let entryMatches = values.command == bridgePath
+            && values.args == Self.bridgeArguments(for: client)
+        return (entryMatches && storedCredential == token) ? .connected : .stale
+    }
+
+    // MARK: - Connect (idempotent upsert; safe to re-run to refresh the entry)
+
+    func connect(_ client: Client, bridgePath: String, url: String, token: String) async throws {
         do {
-            try await connectImplementation(client, url: url, token: token)
+            try await connectImplementation(client, bridgePath: bridgePath, url: url, token: token)
         } catch is CancellationError {
             throw CancellationError()
         } catch let connectorError as ConnectorError {
@@ -189,42 +246,20 @@ struct MCPClientConnector: Sendable {
         }
     }
 
-    private func connectImplementation(_ client: Client, url: String, token: String) async throws {
+    private func connectImplementation(_ client: Client, bridgePath: String, url: String, token: String) async throws {
         switch client {
         case .claudeCode:
-            try await connectClaudeCode(url: url, token: token)
+            try await connectClaudeCode(bridgePath: bridgePath)
         case .geminiCLI:
-            try upsertConfigFile(at: geminiSettingsURL, entry: [
-                "httpUrl": url,
-                "headers": ["Authorization": "Bearer \(token)"],
-            ])
+            try upsertConfigFile(at: geminiSettingsURL, entry: Self.bridgeJSONEntry(bridgePath: bridgePath, client: client))
         case .claudeDesktop:
-            try upsertConfigFile(at: claudeDesktopConfigURL, entry: [
-                "command": "npx",
-                "args": ["-y", "mcp-remote", url, "--header", "Authorization:${AUTH_HEADER}"],
-                "env": ["AUTH_HEADER": "Bearer \(token)"],
-            ])
+            try upsertConfigFile(at: claudeDesktopConfigURL, entry: Self.bridgeJSONEntry(bridgePath: bridgePath, client: client))
         case .codexCLI:
-            // Codex's `mcp add` CLI only takes --bearer-token-env-var (an env
-            // indirection the user would have to plumb); config.toml's static
-            // `http_headers` is a first-class field (shows in `codex mcp get`)
-            // with zero friction — so we upsert our own section textually.
-            let existing = try existingFileContents(at: codexConfigURL).map { data -> String in
-                guard let text = String(data: data, encoding: .utf8) else {
-                    throw ConnectorError.configUnreadable(codexConfigURL.path)
-                }
-                return text
-            }
-            let merged = try Self.upsertCodexServerEntry(
-                in: existing,
-                url: url,
-                token: token,
-                configPath: codexConfigURL.path
-            )
-            try FileManager.default.createDirectory(at: codexConfigURL.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            try Data(merged.utf8).write(to: codexConfigURL, options: .atomic)
-
+            try upsertTOMLBridgeEntry(at: codexConfigURL, client: client,
+                                      bridgePath: bridgePath, legacyHeadersField: .httpHeaders)
+        case .grokCLI:
+            try upsertTOMLBridgeEntry(at: grokConfigURL, client: client,
+                                      bridgePath: bridgePath, legacyHeadersField: .headers)
         case .hermes:
             // YAML config.yaml — Hermes reads headers.Authorization (its CLI
             // path only prompts interactively + stashes the token in .env).
@@ -242,6 +277,34 @@ struct MCPClientConnector: Sendable {
                                                     withIntermediateDirectories: true)
             try Data(merged.utf8).write(to: hermesConfigURL, options: .atomic)
         }
+    }
+
+    static func bridgeJSONEntry(bridgePath: String, client: Client) -> [String: Any] {
+        ["command": bridgePath, "args": bridgeArguments(for: client)]
+    }
+
+    private func upsertTOMLBridgeEntry(
+        at configURL: URL,
+        client: Client,
+        bridgePath: String,
+        legacyHeadersField: TOMLHeaderField
+    ) throws {
+        let existing = try existingFileContents(at: configURL).map { data -> String in
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw ConnectorError.configUnreadable(configURL.path)
+            }
+            return text
+        }
+        let merged = try Self.upsertCodexBridgeEntry(
+            in: existing,
+            bridgePath: bridgePath,
+            clientID: client.accessID,
+            configPath: configURL.path,
+            legacyHeadersField: legacyHeadersField
+        )
+        try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try Data(merged.utf8).write(to: configURL, options: .atomic)
     }
 
     static func userVisibleMessage(for error: Error, locale: Locale? = nil) -> String {
@@ -265,7 +328,7 @@ struct MCPClientConnector: Sendable {
         }
     }
 
-    private func connectClaudeCode(url: String, token: String) async throws {
+    private func connectClaudeCode(bridgePath: String) async throws {
         // Login shell so Homebrew/nvm PATHs resolve from a GUI app context.
         let probe = try await Self.runShell("command -v claude")
         guard probe.status == 0, !probe.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -274,26 +337,29 @@ struct MCPClientConnector: Sendable {
         // Add first — atomic for the common (not-yet-configured) case. Only
         // when the CLI refuses a DUPLICATE do we remove and re-add; any other
         // failure must not delete a working existing entry.
-        let addCommand = "claude mcp add --transport http \(Self.serverName) '\(url)' --header 'Authorization: Bearer \(token)' -s user"
+        let arguments = Self.bridgeArguments(for: .claudeCode).joined(separator: " ")
+        let addCommand = "claude mcp add \(Self.serverName) -s user -- \(Self.shellQuoted(bridgePath)) \(arguments)"
         let firstTry = try await Self.runShell(addCommand)
         if firstTry.status == 0 { return }
         guard firstTry.output.localizedCaseInsensitiveContains("already exist") else {
-            throw ConnectorError.cliFailed(Self.redactingToken(firstTry.output, token: token))
+            throw ConnectorError.cliFailed(Self.truncatedCLIOutput(firstTry.output))
         }
 
         _ = try? await Self.runShell("claude mcp remove \(Self.serverName) -s user")
         let retry = try await Self.runShell(addCommand)
         guard retry.status == 0 else {
-            throw ConnectorError.cliFailed(Self.redactingToken(retry.output, token: token))
+            throw ConnectorError.cliFailed(Self.truncatedCLIOutput(retry.output))
         }
     }
 
-    /// CLI output can echo argv (and with it the bearer token) — scrub it
-    /// before the text reaches the UI, and keep the message short.
-    static func redactingToken(_ output: String, token: String) -> String {
-        let scrubbed = output.replacingOccurrences(of: token, with: "●●●")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return String(scrubbed.prefix(300))
+    /// Keep CLI failure text short enough for the UI. Bridge entries carry no
+    /// secrets, so truncation is the only scrubbing needed.
+    static func truncatedCLIOutput(_ output: String) -> String {
+        String(output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))
+    }
+
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: - JSON plumbing
@@ -311,14 +377,21 @@ struct MCPClientConnector: Sendable {
         try merged.write(to: url, options: .atomic)
     }
 
-    // MARK: TOML (Codex)
+    // MARK: TOML (Codex / Grok)
 
-    /// Text-level TOML support for the two Codex representations seen in the
-    /// wild: an inline `http_headers = {...}` key and a nested
-    /// `[mcp_servers.cadenza.http_headers]` table. Unknown or ambiguous
-    /// equivalents are refused so a refresh can never append a duplicate key.
+    /// Legacy managed header fields from the pre-bridge HTTP layout. Codex
+    /// used `http_headers`; Grok's documented field was `headers`. The stdio
+    /// upsert removes them (inline key or nested table) so a migrated entry
+    /// never carries both transports.
+    enum TOMLHeaderField: String, Sendable {
+        case httpHeaders = "http_headers"
+        case headers = "headers"
+    }
+
     private static let codexParentTable = "mcp_servers.\(serverName)"
-    private static let codexHTTPHeadersTable = "\(codexParentTable).http_headers"
+    private static func tomlHeadersTable(_ field: TOMLHeaderField) -> String {
+        "\(codexParentTable).\(field.rawValue)"
+    }
 
     private static func tomlTableHeaderName(in line: Substring) -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -407,11 +480,6 @@ struct MCPClientConnector: Sendable {
         String(key.filter { !$0.isWhitespace && $0 != "\"" && $0 != "'" })
     }
 
-    private static func isTOMLAuthorizationAssignment(_ line: String) -> Bool {
-        guard let key = tomlAssignmentKey(in: line) else { return false }
-        return normalizedTOMLKey(key) == "Authorization"
-    }
-
     /// Parses a TOML scalar string value (basic "…" / literal '…'; bare
     /// values are cut before any trailing comment).
     private static func tomlScalarString(_ raw: String) -> String? {
@@ -446,40 +514,91 @@ struct MCPClientConnector: Sendable {
         return bare.trimmingCharacters(in: .whitespaces)
     }
 
-    private static func bearerToken(fromTOMLScalar raw: String) -> String? {
-        guard let scalar = tomlScalarString(raw), scalar.hasPrefix("Bearer ") else { return nil }
-        return String(scalar.dropFirst("Bearer ".count))
-    }
-
-    /// Extracts the bearer token from an inline `{ Authorization = "Bearer …" }`
-    /// value; nil for any other shape. Shared by detection and merge validation
-    /// so the two never diverge.
-    private static func inlineHeaderBearerToken(fromValue rawValue: String) -> String? {
-        guard rawValue.hasPrefix("{"), let close = rawValue.lastIndex(of: "}") else { return nil }
-        let trailing = rawValue[rawValue.index(after: close)...].trimmingCharacters(in: .whitespaces)
+    /// Parses a TOML inline array of strings (`["--client", "codex-cli"]`).
+    /// nil for anything else: non-string elements, unterminated strings, or
+    /// trailing garbage after the closing bracket (a comment is fine).
+    static func tomlStringArray(_ raw: String) -> [String]? {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        guard value.hasPrefix("["), let close = value.lastIndex(of: "]") else { return nil }
+        let trailing = value[value.index(after: close)...].trimmingCharacters(in: .whitespaces)
         guard trailing.isEmpty || trailing.hasPrefix("#") else { return nil }
-        let inside = String(rawValue[rawValue.index(after: rawValue.startIndex)..<close])
-            .trimmingCharacters(in: .whitespaces)
-        guard !inside.contains(","),
-              let innerEquals = inside.firstIndex(of: "="),
-              normalizedTOMLKey(String(inside[..<innerEquals])) == "Authorization" else { return nil }
-        return bearerToken(
-            fromTOMLScalar: String(inside[inside.index(after: innerEquals)...])
-                .trimmingCharacters(in: .whitespaces)
-        )
+        let inside = value[value.index(after: value.startIndex)..<close]
+
+        var result: [String] = []
+        var expectElement = true
+        var i = inside.startIndex
+        while i < inside.endIndex {
+            let char = inside[i]
+            if char == " " || char == "\t" || char == "\n" || char == "\r" {
+                i = inside.index(after: i)
+                continue
+            }
+            if char == "," {
+                guard !expectElement else { return nil }  // leading or doubled comma
+                expectElement = true
+                i = inside.index(after: i)
+                continue
+            }
+            guard expectElement else { return nil }  // elements without a comma
+            if char == "\"" {
+                var text = ""
+                var escaped = false
+                var closed = false
+                var j = inside.index(after: i)
+                while j < inside.endIndex {
+                    let c = inside[j]
+                    j = inside.index(after: j)
+                    if escaped {
+                        switch c {
+                        case "n": text.append("\n")
+                        case "r": text.append("\r")
+                        case "t": text.append("\t")
+                        default: text.append(c)
+                        }
+                        escaped = false
+                    } else if c == "\\" {
+                        escaped = true
+                    } else if c == "\"" {
+                        closed = true
+                        break
+                    } else {
+                        text.append(c)
+                    }
+                }
+                guard closed else { return nil }
+                result.append(text)
+                i = j
+            } else if char == "'" {
+                let start = inside.index(after: i)
+                guard let closeQuote = inside[start...].firstIndex(of: "'") else { return nil }
+                result.append(String(inside[start..<closeQuote]))
+                i = inside.index(after: closeQuote)
+            } else {
+                return nil  // non-string element
+            }
+            expectElement = false
+        }
+        return result
     }
 
-    /// Structural read of the managed url + bearer token from the combined
-    /// cadenza section, parsed strictly by table context. Duplicate or
-    /// misplaced keys invalidate the section (returns nils → stale):
+    private static func tomlStringArrayLiteral(_ values: [String]) -> String {
+        "[" + values.map { "\"\(tomlBasicString($0))\"" }.joined(separator: ", ") + "]"
+    }
+
+    /// Structural read of the managed bridge entry from the combined cadenza
+    /// section, parsed strictly by table context. Any legacy HTTP key
+    /// (`url`, the headers field, or its nested table), duplicate keys, or
+    /// unparseable values invalidate the read (returns nils → stale):
     /// duplicate TOML keys are illegal rather than last-wins, and a
     /// last-wins read could report a config as connected that a standard
     /// parser rejects, hiding the repair entry point.
-    static func codexManagedValues(inSection section: String) -> (url: String?, token: String?) {
-        enum Context { case parent, headers, other }
-        var context: Context = .parent
-        var urls: [String] = []
-        var tokens: [String] = []
+    static func codexBridgeManagedValues(
+        inSection section: String,
+        legacyHeadersField: TOMLHeaderField = .httpHeaders
+    ) -> (command: String?, args: [String]?) {
+        var inParent = true
+        var commands: [String] = []
+        var argsValues: [[String]] = []
         var invalid = false
 
         for rawLine in section.components(separatedBy: .newlines) {
@@ -487,91 +606,80 @@ struct MCPClientConnector: Sendable {
             if line.isEmpty || line.hasPrefix("#") { continue }
             if let table = tomlTableHeaderName(in: Substring(rawLine)) {
                 let normalized = normalizedTOMLKey(table)
-                context = normalized == codexParentTable ? .parent
-                    : normalized == codexHTTPHeadersTable ? .headers : .other
+                if normalized == codexParentTable {
+                    inParent = true
+                } else {
+                    // Any nested table inside our combined section is the
+                    // legacy headers table — a shape Connect must repair.
+                    inParent = false
+                    invalid = true
+                }
                 continue
             }
-            guard let equals = line.firstIndex(of: "=") else { continue }
+            guard inParent, let equals = line.firstIndex(of: "=") else { continue }
             let key = normalizedTOMLKey(String(line[..<equals]))
             let rawValue = String(line[line.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
-            switch (context, key) {
-            case (.parent, "url"):
-                if let value = tomlScalarString(rawValue) { urls.append(value) } else { invalid = true }
-            case (.parent, "http_headers"):
-                if let token = inlineHeaderBearerToken(fromValue: rawValue) {
-                    tokens.append(token)
-                } else {
-                    invalid = true
-                }
-            case (.headers, "Authorization"):
-                if let token = bearerToken(fromTOMLScalar: rawValue) {
-                    tokens.append(token)
-                } else {
-                    invalid = true
-                }
-            case (.parent, "Authorization"), (.headers, "url"):
-                invalid = true // misplaced key
+            switch key {
+            case "command":
+                if let value = tomlScalarString(rawValue) { commands.append(value) } else { invalid = true }
+            case "args":
+                if let values = tomlStringArray(rawValue) { argsValues.append(values) } else { invalid = true }
+            case "url", legacyHeadersField.rawValue:
+                invalid = true  // legacy HTTP entry
             default:
-                break
+                if key.hasPrefix(legacyHeadersField.rawValue + ".") { invalid = true }
             }
         }
-        guard !invalid, urls.count == 1, tokens.count == 1 else { return (nil, nil) }
-        return (urls[0], tokens[0])
+        guard !invalid, commands.count == 1, argsValues.count == 1 else { return (nil, nil) }
+        return (commands[0], argsValues[0])
     }
 
-    /// Final structural check before any upsert result is written. Inline and
-    /// nested headers together (a duplicate key to TOML parsers), duplicate
-    /// tables, or an unexpected Authorization count throw configUnrecognized
-    /// (fall back to the manual snippet) — enforced on the output,
-    /// independent of branch logic.
-    static func validateCodexMergeResult(_ text: String, configPath: String) throws {
+    /// Final structural check before any upsert result is written: exactly
+    /// one parent table, no legacy headers table, and inside the parent
+    /// exactly one parseable `command` and one `args`, with zero legacy
+    /// keys — enforced on the output, independent of branch logic.
+    static func validateCodexBridgeMergeResult(
+        _ text: String,
+        configPath: String,
+        legacyHeadersField: TOMLHeaderField = .httpHeaders
+    ) throws {
         let parents = tomlTableRanges(in: text, named: codexParentTable)
-        let headers = tomlTableRanges(in: text, named: codexHTTPHeadersTable)
-        guard parents.count == 1, headers.count <= 1 else {
+        guard parents.count == 1,
+              tomlTableRanges(in: text, named: tomlHeadersTable(legacyHeadersField)).isEmpty else {
             throw ConnectorError.configUnrecognized(configPath)
         }
-        let parentSection = String(text[parents[0]])
-        let inlineHeaderCount = parentSection.components(separatedBy: .newlines).filter { line in
-            guard let key = tomlAssignmentKey(in: line) else { return false }
-            return normalizedTOMLKey(key) == "http_headers"
-        }.count
-        if let headerRange = headers.first {
-            guard inlineHeaderCount == 0 else { throw ConnectorError.configUnrecognized(configPath) }
-            let authCount = String(text[headerRange]).components(separatedBy: .newlines)
-                .filter(isTOMLAuthorizationAssignment).count
-            guard authCount == 1 else { throw ConnectorError.configUnrecognized(configPath) }
-        } else {
-            guard inlineHeaderCount == 1 else { throw ConnectorError.configUnrecognized(configPath) }
-            // The inline form must carry exactly one Bearer Authorization.
-            let inlineLine = parentSection.components(separatedBy: .newlines).first { line in
-                guard let key = tomlAssignmentKey(in: line) else { return false }
-                return normalizedTOMLKey(key) == "http_headers"
-            }
-            guard let inlineLine,
-                  let equals = inlineLine.firstIndex(of: "="),
-                  inlineHeaderBearerToken(
-                      fromValue: String(inlineLine[inlineLine.index(after: equals)...])
-                          .trimmingCharacters(in: .whitespaces)
-                  ) != nil else {
+        var commandCount = 0
+        var argsCount = 0
+        for line in String(text[parents[0]]).components(separatedBy: .newlines) {
+            guard let key = tomlAssignmentKey(in: line) else { continue }
+            let normalized = normalizedTOMLKey(key)
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let rawValue = String(line[line.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
+            switch normalized {
+            case "command":
+                guard tomlScalarString(rawValue) != nil else { throw ConnectorError.configUnrecognized(configPath) }
+                commandCount += 1
+            case "args":
+                guard tomlStringArray(rawValue) != nil else { throw ConnectorError.configUnrecognized(configPath) }
+                argsCount += 1
+            case "url", legacyHeadersField.rawValue:
                 throw ConnectorError.configUnrecognized(configPath)
+            default:
+                if normalized.hasPrefix(legacyHeadersField.rawValue + ".") {
+                    throw ConnectorError.configUnrecognized(configPath)
+                }
             }
+        }
+        guard commandCount == 1, argsCount == 1 else {
+            throw ConnectorError.configUnrecognized(configPath)
         }
     }
 
-    private static func updatingNestedCodexHeaders(_ section: String, token: String) -> String {
-        let newline = section.contains("\r\n") ? "\r\n" : "\n"
-        var lines = section.components(separatedBy: newline)
-        lines.removeAll(where: isTOMLAuthorizationAssignment)
-        let authorization = "Authorization = \"Bearer \(tomlBasicString(token))\""
-        lines.insert(authorization, at: min(1, lines.endIndex))
-        return lines.joined(separator: newline)
-    }
-
-    private static func updatingCodexParent(
+    private static func updatingCodexBridgeParent(
         _ section: String,
-        url: String,
-        token: String,
-        usesNestedHeaders: Bool
+        bridgePath: String,
+        clientID: String,
+        legacyHeadersField: TOMLHeaderField
     ) -> String {
         let newline = section.contains("\r\n") ? "\r\n" : "\n"
         var lines = section.components(separatedBy: newline)
@@ -581,41 +689,21 @@ struct MCPClientConnector: Sendable {
         lines.removeAll { line in
             guard let key = tomlAssignmentKey(in: line) else { return false }
             let normalized = normalizedTOMLKey(key)
-            return normalized == "url" || normalized == "http_headers"
+            return normalized == "command" || normalized == "args" || normalized == "url"
+                || normalized == legacyHeadersField.rawValue
+                || normalized.hasPrefix(legacyHeadersField.rawValue + ".")
         }
 
-        var managed = ["url = \"\(tomlBasicString(url))\""]
-        if !usesNestedHeaders {
-            managed.append("http_headers = { Authorization = \"Bearer \(tomlBasicString(token))\" }")
-        }
+        let managed = [
+            "command = \"\(tomlBasicString(bridgePath))\"",
+            "args = \(tomlStringArrayLiteral(["--client", clientID]))",
+        ]
         lines.insert(contentsOf: managed, at: 0)
         lines.insert(header, at: 0)
         return lines.joined(separator: newline)
     }
 
-    private static func codexParentHasUnsafeHeaders(_ section: String, newline: String) -> Bool {
-        section.components(separatedBy: newline).contains { line in
-            guard let key = tomlAssignmentKey(in: line) else { return false }
-            let normalized = normalizedTOMLKey(key)
-            if normalized.hasPrefix("http_headers.") { return true }
-            guard normalized == "http_headers",
-                  let equals = line.firstIndex(of: "=") else { return false }
-
-            let value = line[line.index(after: equals)...]
-                .trimmingCharacters(in: .whitespaces)
-            guard value.hasPrefix("{"), let close = value.lastIndex(of: "}") else { return true }
-            let trailing = value[value.index(after: close)...]
-                .trimmingCharacters(in: .whitespaces)
-            guard trailing.isEmpty || trailing.hasPrefix("#") else { return true }
-
-            let inside = value[value.index(after: value.startIndex)..<close]
-                .trimmingCharacters(in: .whitespaces)
-            guard !inside.contains(","), let innerKey = tomlAssignmentKey(in: inside) else { return true }
-            return normalizedTOMLKey(innerKey) != "Authorization"
-        }
-    }
-
-    /// Our own parent table plus its optional nested HTTP-header table.
+    /// Our own parent table plus its optional (legacy) nested header table.
     /// Ambiguous duplicate tables return nil so detection never reports a
     /// malformed config as connected.
     static func codexCadenzaSectionRange(in text: String) -> Range<String.Index>? {
@@ -624,95 +712,83 @@ struct MCPClientConnector: Sendable {
         return ranges[0]
     }
 
-    static func codexCadenzaSection(in text: String) -> String? {
+    static func codexCadenzaSection(
+        in text: String,
+        headersField: TOMLHeaderField = .httpHeaders
+    ) -> String? {
         guard !codexHasAmbiguousEquivalent(in: text) else { return nil }
         guard let parent = codexCadenzaSectionRange(in: text) else { return nil }
-        let headers = tomlTableRanges(in: text, named: codexHTTPHeadersTable)
+        let headers = tomlTableRanges(in: text, named: tomlHeadersTable(headersField))
         guard headers.count <= 1 else { return nil }
-        let parentSection = String(text[parent])
-        if !headers.isEmpty {
-            let hasParentHeaders = parentSection.components(separatedBy: "\n").contains { line in
-                guard let key = tomlAssignmentKey(in: line) else { return false }
-                let normalized = normalizedTOMLKey(key)
-                return normalized == "http_headers" || normalized.hasPrefix("http_headers.")
-            }
-            guard !hasParentHeaders else { return nil }
-        }
-        return parentSection + (headers.first.map { String(text[$0]) } ?? "")
+        return String(text[parent]) + (headers.first.map { String(text[$0]) } ?? "")
     }
 
-    /// Replace our managed fields while leaving every unrelated byte intact.
-    /// Multiple/equivalent parent tables are rejected before any file write.
-    static func upsertCodexServerEntry(
+    /// Replace our managed table with the stdio bridge entry while leaving
+    /// every unrelated byte intact: unmanaged keys and comments in our table
+    /// survive, the legacy HTTP keys (`url`, headers inline or nested table)
+    /// are removed, and multiple/equivalent parent tables are rejected before
+    /// any file write.
+    static func upsertCodexBridgeEntry(
         in existing: String?,
-        url: String,
-        token: String,
-        configPath: String = "~/.codex/config.toml"
+        bridgePath: String,
+        clientID: String,
+        configPath: String = "~/.codex/config.toml",
+        legacyHeadersField: TOMLHeaderField = .httpHeaders
     ) throws -> String {
-        let escapedURL = tomlBasicString(url)
-        let escapedToken = tomlBasicString(token)
         let newline = existing?.contains("\r\n") == true ? "\r\n" : "\n"
-        let inlineSection = """
+        let freshSection = """
         [mcp_servers.\(serverName)]
-        url = "\(escapedURL)"
-        http_headers = { Authorization = "Bearer \(escapedToken)" }
+        command = "\(tomlBasicString(bridgePath))"
+        args = \(tomlStringArrayLiteral(["--client", clientID]))
 
         """.replacingOccurrences(of: "\n", with: newline)
 
         guard var text = existing, !text.isEmpty else {
-            try validateCodexMergeResult(inlineSection, configPath: configPath)
-            return inlineSection
+            try validateCodexBridgeMergeResult(freshSection, configPath: configPath,
+                                               legacyHeadersField: legacyHeadersField)
+            return freshSection
         }
         guard !codexHasAmbiguousEquivalent(in: text) else {
             throw ConnectorError.configUnrecognized(configPath)
         }
 
         var parentRanges = tomlTableRanges(in: text, named: codexParentTable)
-        var headerRanges = tomlTableRanges(in: text, named: codexHTTPHeadersTable)
-        guard parentRanges.count <= 1, headerRanges.count <= 1 else {
+        let legacyRanges = tomlTableRanges(in: text, named: tomlHeadersTable(legacyHeadersField))
+        guard parentRanges.count <= 1, legacyRanges.count <= 1 else {
             throw ConnectorError.configUnrecognized(configPath)
         }
-        guard !parentRanges.isEmpty || headerRanges.isEmpty else {
+        guard !parentRanges.isEmpty || legacyRanges.isEmpty else {
             throw ConnectorError.configUnrecognized(configPath)
         }
 
-        if let headerRange = headerRanges.first {
-            let updatedHeaders = updatingNestedCodexHeaders(String(text[headerRange]), token: token)
-            text.replaceSubrange(headerRange, with: updatedHeaders)
+        // The nested legacy header table was ours (Authorization); stdio has
+        // no headers, so the whole table goes.
+        if let legacyRange = legacyRanges.first {
+            text.removeSubrange(legacyRange)
             parentRanges = tomlTableRanges(in: text, named: codexParentTable)
-            guard let parentRange = parentRanges.first else {
+            guard parentRanges.count == 1 else {
                 throw ConnectorError.configUnrecognized(configPath)
             }
-            let parentSection = String(text[parentRange])
-            guard !codexParentHasUnsafeHeaders(parentSection, newline: newline) else {
-                throw ConnectorError.configUnrecognized(configPath)
-            }
-            text.replaceSubrange(
-                parentRange,
-                with: updatingCodexParent(parentSection, url: url, token: token, usesNestedHeaders: true)
-            )
-            try validateCodexMergeResult(text, configPath: configPath)
-            return text
         }
 
         if let parentRange = parentRanges.first {
-            let parentSection = String(text[parentRange])
-            guard !codexParentHasUnsafeHeaders(parentSection, newline: newline) else {
-                throw ConnectorError.configUnrecognized(configPath)
-            }
             text.replaceSubrange(
                 parentRange,
-                with: updatingCodexParent(parentSection, url: url, token: token, usesNestedHeaders: false)
+                with: updatingCodexBridgeParent(
+                    String(text[parentRange]),
+                    bridgePath: bridgePath,
+                    clientID: clientID,
+                    legacyHeadersField: legacyHeadersField
+                )
             )
-            try validateCodexMergeResult(text, configPath: configPath)
+            try validateCodexBridgeMergeResult(text, configPath: configPath,
+                                               legacyHeadersField: legacyHeadersField)
             return text
         }
-        headerRanges = tomlTableRanges(in: text, named: codexHTTPHeadersTable)
-        guard headerRanges.isEmpty else {
-            throw ConnectorError.configUnrecognized(configPath)
-        }
-        let appended = text + (text.hasSuffix(newline) ? newline : newline + newline) + inlineSection
-        try validateCodexMergeResult(appended, configPath: configPath)
+
+        let appended = text + (text.hasSuffix(newline) ? newline : newline + newline) + freshSection
+        try validateCodexBridgeMergeResult(appended, configPath: configPath,
+                                           legacyHeadersField: legacyHeadersField)
         return appended
     }
 

@@ -84,6 +84,22 @@ struct WebSyncAudioCommitResponse: Decodable, Sendable {
     }
 }
 
+struct MCPPrefsSnapshot: Decodable, Sendable, Equatable {
+    let searchIndexEnabled: Bool
+    let searchIndexGeneration: Int64
+    let speakerIdentityEnabled: Bool
+    let speakerIdentityGeneration: Int64
+    let updatedAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case searchIndexEnabled = "search_index_enabled"
+        case searchIndexGeneration = "search_index_generation"
+        case speakerIdentityEnabled = "speaker_identity_enabled"
+        case speakerIdentityGeneration = "speaker_identity_generation"
+        case updatedAt = "updated_at"
+    }
+}
+
 @MainActor
 final class WebSyncAPIClient {
     private let auth: CadenzaAuthService
@@ -195,6 +211,18 @@ final class WebSyncAPIClient {
     /// what it already had. The status is what reaches the classifier, so a
     /// missing endpoint is read against the caller-proven service identity
     /// instead of being guessed from the body.
+    /// Server-authoritative MCP privacy switches. Failures return nil so a
+    /// sync pass keeps last-known local rev and does not invent consent.
+    func fetchMCPPrefs() async -> MCPPrefsSnapshot? {
+        do {
+            let (data, response) = try await auth.requestResponse(path: "me/mcp-prefs")
+            guard response.statusCode == 200 else { return nil }
+            return try decoder.decode(MCPPrefsSnapshot.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+
     func fetchEntitlements(service: EntitlementsService) async -> EntitlementsResolution {
         do {
             let (data, response) = try await auth.requestResponse(path: "me/entitlements")

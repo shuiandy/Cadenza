@@ -17,6 +17,8 @@ struct SettingsLocalizationTests {
         "Model ID for live captions. Leave empty for the default.",
         "Model ID for %@ transcription. Leave empty for the default.",
         "Model could not be deleted. Please try again.",
+        "Interface & Startup",
+        "Usage",
         "Open main window after login",
         "When Launch at login is enabled, show the main window after sign in",
         "Required for reliable Teams auto-start and auto-stop.",

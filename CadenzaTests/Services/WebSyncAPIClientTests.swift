@@ -41,7 +41,7 @@ struct WebSyncAPIClientTests {
             audioSourceState: .eligible,
             transcript: nil,
             summary: nil,
-            calendarEvent: nil
+            calendarEvent: .omitted
         )
         _ = try await client.upsert(
             clientRecordingID: UUID(uuidString: "12345678-1234-1234-1234-123456789ABC")!,
@@ -73,6 +73,23 @@ struct WebSyncAPIClientTests {
         #expect(status.totalSize == 524_288)
         #expect(status.chunkSize == 262_144)
         #expect(status.partsReceived == [1])
+    }
+
+    @Test @MainActor
+    func mcpPrefsDecodeUsesServerWireKeys() async throws {
+        let http = FakeAuthHTTP()
+        let client = WebSyncAPIClient(auth: signedIn(http: http))
+        http.mcpPrefsOutcome = .success(
+            data: Data(#"{"search_index_enabled":true,"search_index_generation":3,"speaker_identity_enabled":false,"speaker_identity_generation":1,"updated_at":1780000000}"#.utf8),
+            response: response(status: 200)
+        )
+
+        let prefs = try #require(await client.fetchMCPPrefs())
+        #expect(prefs.searchIndexEnabled)
+        #expect(prefs.searchIndexGeneration == 3)
+        #expect(!prefs.speakerIdentityEnabled)
+        #expect(prefs.speakerIdentityGeneration == 1)
+        #expect(prefs.updatedAt == 1_780_000_000)
     }
 
     private func response(status: Int) -> HTTPURLResponse {

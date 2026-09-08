@@ -27,6 +27,32 @@ enum TimePeriod: Hashable, Comparable {
     }
 }
 
+/// Calendar-day buckets for the date-first library layout. The grid and list
+/// modes group by day so the timeline carries the scan; `TimePeriodGrouper`
+/// below stays for surfaces that still bucket by period.
+enum RecordingDayGrouper {
+    struct Group {
+        let day: Date
+        let recordings: [RecordingDTO]
+        let totalDuration: TimeInterval
+    }
+
+    static func group(
+        _ recordings: [RecordingDTO],
+        calendar: Calendar = .current
+    ) -> [Group] {
+        Dictionary(grouping: recordings) { calendar.startOfDay(for: $0.startDate) }
+            .map { day, dayRecordings in
+                Group(
+                    day: day,
+                    recordings: dayRecordings.sorted { $0.startDate > $1.startDate },
+                    totalDuration: dayRecordings.reduce(0) { $0 + $1.duration }
+                )
+            }
+            .sorted { $0.day > $1.day }
+    }
+}
+
 enum TimePeriodGrouper {
     static func group(_ recordings: [Recording]) -> [(period: TimePeriod, recordings: [Recording])] {
         let calendar = Calendar.current

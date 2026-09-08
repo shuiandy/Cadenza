@@ -63,8 +63,8 @@ struct AIProviderModelConfigTests {
 
     @Test func realtimeModelHonorsOverrideAndFallback() {
         withCleanDefaults {
-            #expect(AIProvider.openai.realtimeModel == "gpt-4o-transcribe")
-            #expect(AIProvider.gemini.realtimeModel == "gemini-3.1-flash-live-preview")
+            #expect(AIProvider.openai.realtimeModel == "gpt-live-transcribe")
+            #expect(AIProvider.gemini.realtimeModel == "gemini-3.5-transcribe-live")
             UserDefaults.standard.set("gemini-3.5-flash-live", forKey: "realtimeModel.gemini")
             #expect(AIProvider.gemini.realtimeModel == "gemini-3.5-flash-live")
         }
@@ -106,8 +106,9 @@ struct AIProviderModelConfigTests {
                 "claude-haiku-4-5",
                 "claude-sonnet-4-6",
             ])
+            // Chat and summary share one Gemini default, so the list dedups to one.
             #expect(AIChatModelCatalog.fallbackPresets(for: .gemini).map(\.modelID) == [
-                "gemini-3.5-flash",
+                "gemini-3.7-flash",
             ])
             #expect(AIChatModelCatalog.fallbackPresets(for: .minimax).map(\.modelID) == [
                 "MiniMax-M2.7-highspeed",

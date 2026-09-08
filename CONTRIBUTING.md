@@ -21,6 +21,25 @@ The no-sign build is intended for compilation and automated tests. To run record
 features, select your own Apple Development team in Xcode and use a stable, unique
 bundle identifier so macOS permissions remain attached to the same signed app.
 
+## Release candidates
+
+Installed candidates must be built with explicit `-configuration Release` and the
+stable development signing identity. Record the commit and verify the actual
+build settings use Release optimization. Before installation, inspect
+`Cadenza.app/Contents/MacOS`: reject any `*.debug.dylib` or `__preview.dylib`.
+A valid signature alone does not establish a Release build. Verify both the
+bundle layout and `codesign --verify --deep --strict` after signing. Keep the
+reviewed installed app until the candidate has passed review. Save the exact
+`xcodebuild -configuration Release -showBuildSettings -json` output, then run:
+
+```bash
+python3 scripts/validate_release_candidate.py /path/to/Cadenza.app /path/to/build-settings.json --expected-team YOUR_TEAM_ID
+```
+
+The settings file must come from the same build invocation options as the
+candidate. The script validates those settings, layout and signature; it does
+not launch the app or establish runtime/permission acceptance.
+
 ## Tests
 
 Run the complete discovered suite before opening a pull request:

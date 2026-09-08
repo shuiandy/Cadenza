@@ -23,6 +23,15 @@ final class SummaryGenerator {
     /// Closure to resolve API keys. Defaults to KeychainManager; overridden in XPC Core.
     var apiKeyResolver: (AIProvider) -> String? = { KeychainManager.shared.apiKey(for: $0) }
 
+#if DEBUG
+    /// Completes the injected coordinator task without a network request. Tests
+    /// can interleave store writes before delivering the generated result.
+    func completeForTesting(with result: SummaryResult) {
+        self.result = result
+        self.error = nil
+    }
+#endif
+
     /// Resolve API key for provider, returning empty string for local providers.
     private func resolveKey(for provider: AIProvider) -> String? {
         if !provider.requiresAPIKey { return "" }
@@ -54,19 +63,24 @@ final class SummaryGenerator {
 
         // Resolve settings on MainActor, then run network I/O off MainActor.
         let modelID = model ?? provider.summaryModel
-        let jobTitle = defaults.string(forKey: preferenceKey("userJobTitle"))
+        let jobTitle: String? = nil
+        let userName = defaults.string(forKey: preferenceKey("userName")) ?? ""
+        let detailLevel = SummaryDetailLevel.load(defaults: defaults)
 
         do {
-            let summaryResult = try await Self.runGenerate(
+            var summaryResult = try await SummaryPrompt.$evaluationUserName.withValue(userName) { try await Self.runGenerate(
                 provider: provider, apiKey: apiKey,
                 transcript: transcript, language: language,
                 model: modelID, jobTitle: jobTitle, meetingType: meetingType,
-                meetingTitle: meetingTitle, knownTags: knownTags
+                meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel
             )
+            }
+            summaryResult.generationMetadata = .init(detailLevel: detailLevel.rawValue, stage: .singlePass)
+            try Task.checkCancellation()
             self.result = summaryResult
             self.streamedText = summaryResult.rawText
         } catch {
-            self.error = error.localizedDescription
+            if !Task.isCancelled && !(error is CancellationError) { self.error = error.localizedDescription }
         }
 
         isGenerating = false
@@ -98,7 +112,9 @@ final class SummaryGenerator {
 
         // Resolve settings on MainActor, then stream off MainActor.
         let modelID = model ?? provider.summaryModel
-        let jobTitle = defaults.string(forKey: preferenceKey("userJobTitle"))
+        let jobTitle: String? = nil
+        let userName = defaults.string(forKey: preferenceKey("userName")) ?? ""
+        let detailLevel = SummaryDetailLevel.load(defaults: defaults)
 
         // Provider callbacks carry only deltas. The coalescer owns one delayed
         // flush at a time and closes it before final state is committed.
@@ -121,19 +137,22 @@ final class SummaryGenerator {
             self?.isEnriching = true
         }
 
-        let (text, parsedResult, errorMsg) = await Self.runStreamGenerate(
+        let (text, parsedResult, errorMsg) = await SummaryPrompt.$evaluationUserName.withValue(userName) { await Self.runStreamGenerate(
             provider: provider, apiKey: apiKey,
             transcript: transcript, language: language,
             model: modelID, jobTitle: jobTitle, meetingType: meetingType,
-            meetingTitle: meetingTitle, knownTags: knownTags,
+            meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel,
             onChunk: onChunk,
             onQuickDone: onQuickDone,
             onEnrichStart: onEnrichStart
         )
 
+        }
         await streamUpdates.finish(finalText: text)
-        if let parsedResult { result = parsedResult }
-        if let errorMsg { error = errorMsg }
+        if !Task.isCancelled {
+            if let parsedResult { result = parsedResult }
+            if let errorMsg { error = errorMsg }
+        }
         quickResult = nil
         isEnriching = false
         isGenerating = false
@@ -145,25 +164,26 @@ final class SummaryGenerator {
     func generateChapters(
         transcript: String,
         provider: AIProvider,
-        language: String = "en"
+        language: String = "en",
+        summaryContext: String? = nil
     ) async -> [ChapterResult] {
         guard let apiKey = resolveKey(for: provider) else { return [] }
         let modelID = provider.summaryModel
         return await Self.runGenerateChapters(
             provider: provider, apiKey: apiKey,
-            transcript: transcript, language: language, model: modelID
+            transcript: transcript, language: language, model: modelID, summaryContext: summaryContext
         )
     }
 
     private nonisolated static func runGenerateChapters(
         provider: AIProvider, apiKey: String,
-        transcript: String, language: String, model: String
+        transcript: String, language: String, model: String, summaryContext: String?
     ) async -> [ChapterResult] {
         guard let service = makeService(provider: provider, apiKey: apiKey) else { return [] }
         let systemPrompt = SummaryPrompt.chaptersSystem(language: language)
-        let userMessage = SummaryPrompt.user(transcript: transcript)
+        let userMessage = SummaryPrompt.user(transcript: transcript) + (summaryContext.map { "\nSaved summary (derived context, not new evidence):\n" + $0 + "\nKeep chapter descriptions consistent with final clarified scope and dates; use transcript timestamps for navigation." } ?? "")
         do {
-            let response = try await AIGenerationGate.shared.run { () async throws -> String in
+            let response = try await AIGenerationGate.shared.run(provider: service.provider, priority: .background) { () async throws -> String in
                 var response = ""
                 let stream = service.streamChat(
                     systemPrompt: systemPrompt,
@@ -189,53 +209,51 @@ final class SummaryGenerator {
         provider: AIProvider, apiKey: String,
         transcript: String, language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
-        meetingTitle: String?, knownTags: [String]
+        meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel
     ) async throws -> SummaryResult {
         guard let service = makeService(provider: provider, apiKey: apiKey) else {
             throw AIServiceError.noProvider("\(provider.displayName) is not available on this device")
         }
-        return try await service.summarize(
+        return try await AIGenerationGate.shared.run(provider: provider) {
+            try await service.summarize(
             transcript: transcript,
             language: language,
             model: model,
             jobTitle: jobTitle,
             meetingType: meetingType,
             meetingTitle: meetingTitle,
-            knownTags: knownTags
+            knownTags: knownTags, detailLevel: detailLevel
         )
+        }
     }
 
-    /// Two-stage summary: quick (overview/keyPoints/actionItems) then enrich (decisions/followUps).
-    private nonisolated static func runTwoStageStreamGenerate(
-        provider: AIProvider, apiKey: String,
+    /// Two-stage summary: a quick draft followed by a complete source-grounded review.
+    nonisolated static func runTwoStageStreamGenerate(
+        service: any AIServiceProtocol,
         transcript: String, language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
-        meetingTitle: String?, knownTags: [String],
+        meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel = .detailed,
         onQuickChunk: @Sendable (String) async -> Void,
         onQuickDone: @MainActor @Sendable (SummaryResult) -> Void,
         onEnrichStart: @MainActor @Sendable () async -> Void,
         onEnrichChunk: @Sendable (String) async -> Void
     ) async -> (String, SummaryResult?, String?) {
-        guard let service = makeService(provider: provider, apiKey: apiKey) else {
-            return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
-        }
-
         // --- Quick phase ---
         let quickPrompt = SummaryPrompt.quickSystem(
             language: language, jobTitle: jobTitle,
-            meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags
+            meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel
         )
         let quickUserMsg = SummaryPrompt.user(transcript: transcript)
 
         var quickText = ""
-        let quickResult: SummaryResult
+        var quickResult: SummaryResult
         do {
-            quickText = try await AIGenerationGate.shared.run { () async throws -> String in
+            quickText = try await AIGenerationGate.shared.run(provider: service.provider) { () async throws -> String in
                 var quickText = ""
-                let stream = service.streamChat(
+                let stream = service.streamSummaryCompletion(
                     systemPrompt: quickPrompt,
                     userMessage: quickUserMsg,
-                    model: model
+                    model: model, detailLevel: detailLevel
                 )
                 for try await token in stream {
                     quickText += token
@@ -244,6 +262,7 @@ final class SummaryGenerator {
                 return quickText
             }
             quickResult = SummaryPrompt.parseQuickResponse(quickText)
+            quickResult.generationMetadata = .init(detailLevel: detailLevel.rawValue, stage: .draft)
 
             let overviewOK = !quickResult.overview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let keyPointsOK = !quickResult.keyPoints.isEmpty
@@ -252,14 +271,18 @@ final class SummaryGenerator {
                 return (quickText, quickResult, AIServiceError.invalidResponse.localizedDescription)
             }
         } catch {
-            return (quickText, nil, error.localizedDescription)
+            return (quickText, nil, Task.isCancelled || error is CancellationError ? nil : error.localizedDescription)
         }
 
+        guard !Task.isCancelled else { return ("", nil, nil) }
         await onQuickDone(quickResult)
         await onEnrichStart()
 
         // --- Enrich phase ---
-        let enrichPrompt = SummaryPrompt.enrichSystem(language: language)
+        let enrichPrompt = SummaryPrompt.enrichSystem(
+            language: language, jobTitle: jobTitle, meetingType: meetingType,
+            meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel
+        )
         let enrichUserMsg = SummaryPrompt.enrichUser(
             transcript: transcript,
             quickSummaryText: quickText
@@ -267,12 +290,12 @@ final class SummaryGenerator {
 
         var enrichText = ""
         do {
-            enrichText = try await AIGenerationGate.shared.run { () async throws -> String in
+            enrichText = try await AIGenerationGate.shared.run(provider: service.provider) { () async throws -> String in
                 var enrichText = ""
-                let stream = service.streamChat(
+                let stream = service.streamSummaryCompletion(
                     systemPrompt: enrichPrompt,
                     userMessage: enrichUserMsg,
-                    model: model
+                    model: model, detailLevel: detailLevel
                 )
                 for try await token in stream {
                     enrichText += token
@@ -280,13 +303,40 @@ final class SummaryGenerator {
                 }
                 return enrichText
             }
-            let (decisions, followUps) = SummaryPrompt.parseEnrichResponse(enrichText)
-            let merged = SummaryPrompt.mergeQuickAndEnrich(
-                quick: quickResult, decisions: decisions,
-                followUps: followUps, enrichRawText: enrichText
-            )
-            return (merged.rawText, merged, nil)
+            guard var reviewed = SummaryPrompt.parseReviewedResponse(enrichText) else {
+                NSLog("[SummaryGenerator] review returned an incomplete result, keeping quick summary")
+                return (quickText, quickResult, nil)
+            }
+            let issues = SummaryPrompt.reviewIssues(enrichText)
+            reviewed.generationMetadata = .init(detailLevel: detailLevel.rawValue, stage: .reviewed, issues: issues)
+            let remaining = issues.filter { !$0.resolved }
+            guard !remaining.isEmpty else { return (reviewed.rawText, reviewed, nil) }
+            reviewed.generationMetadata?.stage = .repairIncomplete
+            // Initially restricted to the evaluated cloud family. Local and map/reduce
+            // retain their existing bounded flows. At most one repair request.
+            guard service.provider == .openai,
+                  ["gpt-5.6-sol", "gpt-5.6-terra"].contains(model),
+                  remaining.allSatisfy({ $0.canRepair(from: transcript, summary: reviewed) }), !Task.isCancelled
+            else { return (reviewed.rawText, reviewed, nil) }
+            let repairMessage = SummaryPrompt.enrichUser(transcript: transcript, quickSummaryText: enrichText)
+            do {
+                let repairedText = try await AIGenerationGate.shared.run(provider: service.provider) {
+                    var text = ""
+                    for try await token in service.streamSummaryCompletion(
+                        systemPrompt: enrichPrompt + "\nRepair the remaining review_issues once. Preserve all supported content. Return the complete corrected JSON and updated issue resolutions.",
+                        userMessage: repairMessage, model: model, detailLevel: detailLevel) { text += token }
+                    return text
+                }
+                if var repaired = SummaryPrompt.parseReviewedResponse(repairedText) {
+                    let finalIssues = SummaryPrompt.reviewIssues(repairedText)
+                    repaired.generationMetadata = .init(detailLevel: detailLevel.rawValue,
+                        stage: finalIssues.contains(where: { !$0.resolved }) ? .repairIncomplete : .repaired, issues: finalIssues)
+                    return (repaired.rawText, repaired, nil)
+                }
+            } catch { /* Keep the complete review and its unresolved status. */ }
+            return (reviewed.rawText, reviewed, nil)
         } catch {
+            guard !Task.isCancelled, !(error is CancellationError) else { return ("", nil, nil) }
             NSLog("[SummaryGenerator] enrich phase failed: %@, using quick result only", error.localizedDescription)
             return (quickText, quickResult, nil)
         }
@@ -297,73 +347,33 @@ final class SummaryGenerator {
         provider: AIProvider, apiKey: String,
         chunks: [String], language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
-        meetingTitle: String?, knownTags: [String],
+        meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel,
         onChunk: @Sendable (String) async -> Void
     ) async -> (String, SummaryResult?, String?) {
         guard let service = makeService(provider: provider, apiKey: apiKey) else {
             return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
         }
-        let mapPrompt = SummaryPrompt.mapSystem(language: language)
+        let mapPrompt = SummaryPrompt.mapSystem(language: language, detailLevel: detailLevel)
 
-        // Map phase: parallel chunk summaries
-        let chunkSummaries: [String]
+        // One permit per provider domain: submit only the next chunk, releasing
+        // the gate between chunks so other foreground work can make progress.
+        var chunkSummaries: [String] = []
         do {
-            chunkSummaries = try await withThrowingTaskGroup(of: (Int, String).self) { group in
-                let maxConcurrent = 3
-                var nextIndex = 0
-
-                // Seed initial batch
-                while nextIndex < min(maxConcurrent, chunks.count) {
-                    let index = nextIndex
-                    let chunk = chunks[index]
-                    group.addTask {
-                        let text = try await AIGenerationGate.shared.run { () async throws -> String in
-                            var text = ""
-                            let stream = service.streamChat(
-                                systemPrompt: mapPrompt,
-                                userMessage: "Summarize this meeting segment:\n\n\(chunk)",
-                                model: model
-                            )
-                            for try await token in stream {
-                                text += token
-                            }
-                            return text
-                        }
-                        return (index, text)
-                    }
-                    nextIndex += 1
+            for chunk in chunks {
+                try Task.checkCancellation()
+                let text = try await AIGenerationGate.shared.run(provider: service.provider) {
+                    var text = ""
+                    for try await token in service.streamSummaryCompletion(
+                        systemPrompt: mapPrompt, userMessage: "Summarize this meeting segment:\n\n\(chunk)",
+                        model: model, detailLevel: detailLevel) { text += token }
+                    return text
                 }
-
-                // As each completes, add next
-                var results = [(Int, String)]()
-                for try await result in group {
-                    results.append(result)
-                    if nextIndex < chunks.count {
-                        let index = nextIndex
-                        let chunk = chunks[index]
-                        group.addTask {
-                            let text = try await AIGenerationGate.shared.run { () async throws -> String in
-                                var text = ""
-                                let stream = service.streamChat(
-                                    systemPrompt: mapPrompt,
-                                    userMessage: "Summarize this meeting segment:\n\n\(chunk)",
-                                    model: model
-                                )
-                                for try await token in stream {
-                                    text += token
-                                }
-                                return text
-                            }
-                            return (index, text)
-                        }
-                        nextIndex += 1
-                    }
-                }
-                return results.sorted(by: { $0.0 < $1.0 }).map(\.1)
+                chunkSummaries.append(text)
             }
         } catch {
+            guard !Task.isCancelled, !(error is CancellationError) else { return ("", nil, nil) }
             NSLog("[SummaryGenerator] map phase failed: %@, falling back to single prompt", error.localizedDescription)
-            return ("", nil, nil) // signal fallback
+            return ("", nil, nil)
         }
 
         NSLog("[SummaryGenerator] map-reduce: %d chunks summarized, starting reduce", chunkSummaries.count)
@@ -375,17 +385,17 @@ final class SummaryGenerator {
 
         let reducePrompt = SummaryPrompt.reduceSystem(
             language: language, jobTitle: jobTitle,
-            meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags
+            meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel
         )
 
         var finalText = ""
         do {
-            finalText = try await AIGenerationGate.shared.run { () async throws -> String in
+            finalText = try await AIGenerationGate.shared.run(provider: service.provider) { () async throws -> String in
                 var finalText = ""
-                let stream = service.streamChat(
+                let stream = service.streamSummaryCompletion(
                     systemPrompt: reducePrompt,
                     userMessage: combinedInput,
-                    model: model
+                    model: model, detailLevel: detailLevel
                 )
                 for try await token in stream {
                     finalText += token
@@ -393,23 +403,25 @@ final class SummaryGenerator {
                 }
                 return finalText
             }
-            let parsed = SummaryPrompt.parseResponse(finalText)
+            var parsed = SummaryPrompt.parseResponse(finalText)
+            parsed.generationMetadata = .init(detailLevel: detailLevel.rawValue, stage: .mapReduced)
             return (finalText, parsed, nil)
         } catch {
-            return (finalText, nil, error.localizedDescription)
+            return (finalText, nil, Task.isCancelled || error is CancellationError ? nil : error.localizedDescription)
         }
     }
 
     /// Streaming summary — prompt assembly, network I/O, and response parsing run off MainActor.
-    private nonisolated static func runStreamGenerate(
+    nonisolated static func runStreamGenerate(
         provider: AIProvider, apiKey: String,
         transcript: String, language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
-        meetingTitle: String?, knownTags: [String],
+        meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel,
         onChunk: @Sendable (String) async -> Void,
         onQuickDone: @MainActor @Sendable (SummaryResult) -> Void,
         onEnrichStart: @MainActor @Sendable () async -> Void
     ) async -> (String, SummaryResult?, String?) {
+        guard !Task.isCancelled else { return ("", nil, nil) }
         // Local providers (Apple FM) have tiny context windows — use their own
         // summarize() which has compact prompts and built-in chunking.
         if !provider.requiresAPIKey {
@@ -417,16 +429,19 @@ final class SummaryGenerator {
                 return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
             }
             do {
-                let result = try await service.summarize(
+                var result = try await AIGenerationGate.shared.run(provider: provider) {
+                    try await service.summarize(
                     transcript: transcript, language: language,
                     model: model, jobTitle: jobTitle,
                     meetingType: meetingType, meetingTitle: meetingTitle,
-                    knownTags: knownTags
+                    knownTags: knownTags, detailLevel: detailLevel
                 )
+                }
+                result.generationMetadata = .init(detailLevel: detailLevel.rawValue, stage: .local)
                 await onChunk(result.rawText)
                 return (result.rawText, result, nil)
             } catch {
-                return ("", nil, error.localizedDescription)
+                return ("", nil, Task.isCancelled || error is CancellationError ? nil : error.localizedDescription)
             }
         }
 
@@ -439,22 +454,26 @@ final class SummaryGenerator {
                 chunks: chunks, language: language,
                 model: model, jobTitle: jobTitle,
                 meetingType: meetingType, meetingTitle: meetingTitle,
-                knownTags: knownTags,
+                knownTags: knownTags, detailLevel: detailLevel,
                 onChunk: onChunk
             )
+            guard !Task.isCancelled else { return ("", nil, nil) }
             if result != nil || error != nil {
                 return (text, result, error)
             }
             NSLog("[SummaryGenerator] map-reduce fallback to single prompt")
         }
 
-        // Standard path: two-stage (quick + enrich)
+        // Standard path: quick draft followed by a full review.
+        guard let service = makeService(provider: provider, apiKey: apiKey) else {
+            return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
+        }
         return await runTwoStageStreamGenerate(
-            provider: provider, apiKey: apiKey,
+            service: service,
             transcript: transcript, language: language,
             model: model, jobTitle: jobTitle,
             meetingType: meetingType, meetingTitle: meetingTitle,
-            knownTags: knownTags,
+            knownTags: knownTags, detailLevel: detailLevel,
             onQuickChunk: onChunk,
             onQuickDone: onQuickDone,
             onEnrichStart: onEnrichStart,
@@ -471,6 +490,7 @@ final class SummaryGenerator {
 
 enum AIServiceError: Error, LocalizedError {
     case invalidResponse
+    case incompleteResponse
     case httpError(Int, String)
     case noAPIKey
     case noProvider(String)
@@ -483,6 +503,11 @@ enum AIServiceError: Error, LocalizedError {
 
     func localizedMessage(locale: Locale? = nil) -> String {
         switch self {
+        case .incompleteResponse:
+            return LocalizedBundle.string(
+                "The AI response was incomplete. Try again or choose another model in Settings.",
+                locale: locale
+            )
         case .invalidResponse:
             return LocalizedBundle.string(
                 "The AI provider returned an invalid response. Try again or choose another provider in Settings.",

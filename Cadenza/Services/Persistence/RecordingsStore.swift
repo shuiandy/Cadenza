@@ -64,6 +64,11 @@ actor RecordingsStore {
     // Detail DTO cache — avoids rebuilding full DTO on every loadDetail() call.
     // Invalidated on any save() to keep data fresh.
     var detailCache: [UUID: RecordingDetailDTO] = [:]
+    // Compact versions only; no transcript strings or segment arrays are retained.
+    private var summarySourceCache: [UUID: (mappingKey: String, version: SummarySourceVersion)] = [:]
+#if DEBUG
+    private(set) var summarySourceCaptureCount = 0
+#endif
 
     /// In-memory generation for speaker-derived data. Retranscription advances
     /// the generation so an older embedding task cannot write stale samples or
@@ -389,7 +394,7 @@ actor RecordingsStore {
     // MARK: - Schema
 
     static let schema = Schema([
-        Recording.self, Transcript.self, MeetingSummary.self, ExternalRecordingImport.self,
+        Recording.self, Transcript.self, MeetingSummary.self, SummaryContextRecord.self, ExternalRecordingImport.self,
         Folder.self, SpeakerProfile.self, SpeakerVoiceSample.self,
         Recap.self, AgentArtifact.self, WebSyncRecord.self
     ])
@@ -464,11 +469,12 @@ actor RecordingsStore {
     }
 
     func fetchRecordingDTOs(sortKey: String, folderID: UUID?, tagFilter: String?) -> [RecordingDTO] {
-        filteredAndSortedRecordings(
+        let speakerNames = speakerDisplayNamesByID()
+        return filteredAndSortedRecordings(
             fetchScopedRecordings(folderID: folderID),
             sortKey: sortKey,
             tagFilter: tagFilter
-        ).map { recordingToDTO($0) }
+        ).map { recordingToDTO($0, speakerNames: speakerNames) }
     }
 
     func searchRecordingDTOs(
@@ -508,9 +514,10 @@ actor RecordingsStore {
         guard !executionControl.isCancelled() else { return [] }
         var results: [RecordingDTO] = []
         results.reserveCapacity(matches.count)
+        let speakerNames = speakerDisplayNamesByID()
         for recording in matches {
             guard !executionControl.isCancelled() else { return [] }
-            results.append(recordingToDTO(recording))
+            results.append(recordingToDTO(recording, speakerNames: speakerNames))
         }
         return results
     }
@@ -657,7 +664,8 @@ actor RecordingsStore {
         )
         descriptor.predicate = #Predicate { $0.trashedDate != nil }
         let recordings = (try? modelContext.fetch(descriptor)) ?? []
-        return recordings.map { recordingToDTO($0) }
+        let speakerNames = speakerDisplayNamesByID()
+        return recordings.map { recordingToDTO($0, speakerNames: speakerNames) }
     }
 
     // MARK: - Recording CRUD
@@ -787,6 +795,10 @@ actor RecordingsStore {
 
         if duration < autoDiscardThreshold {
             NSLog("[RecordingsStore] auto-discarding short recording %@: duration=%.1f < %.0fs", id.uuidString, duration, autoDiscardThreshold)
+            do {
+                let contexts = try modelContext.fetch(FetchDescriptor<SummaryContextRecord>(predicate: #Predicate { $0.recordingID == id }))
+                for context in contexts { modelContext.delete(context) }
+            } catch { return .failed }
             modelContext.delete(recording)
             return saveFinalizationTransaction() ? .discarded : .failed
         }
@@ -1301,6 +1313,16 @@ actor RecordingsStore {
             }
         }
 
+        for record in try context.fetch(FetchDescriptor<SummaryContextRecord>()) {
+            if ids.contains(record.recordingID) { context.delete(record); continue }
+            var input = SummaryContextInput.decode(record.inputJSON)
+            if !ids.isDisjoint(with: input.historyIDs) {
+                input.historyIDs.removeAll { ids.contains($0) }
+                record.inputJSON = input.json
+                record.resultJSON = nil
+            }
+        }
+
         // Built-in meeting-prep artifacts may contain summaries, action
         // items, and decisions from any historical recording but have no
         // source-recording lineage. Delete all built-in artifacts so the
@@ -1809,14 +1831,33 @@ actor RecordingsStore {
         return counts.compactMapValues { Self.pickCanonicalSurface($0) }
     }
 
+    struct CalendarEventSnapshot: Sendable {
+        var title: String
+        var startAt: Date
+        var endAt: Date
+    }
+
     @discardableResult
-    func linkCalendarEvent(recordingID: UUID, calendarEventID: String?) -> Bool {
+    func linkCalendarEvent(
+        recordingID: UUID,
+        calendarEventID: String?,
+        snapshot: CalendarEventSnapshot? = nil
+    ) -> Bool {
         guard let recording = recording(byID: recordingID) else { return false }
         recording.linkedCalendarEventID = calendarEventID
         recording.calendarAutoLinkState = calendarEventID == nil
             ? CalendarAutoLinkState.userCleared.rawValue
             : CalendarAutoLinkState.linked.rawValue
         recording.calendarAutoLinkAttemptedAt = Date()
+        if calendarEventID == nil {
+            recording.calendarEventTitle = nil
+            recording.calendarEventStartAt = nil
+            recording.calendarEventEndAt = nil
+        } else if let snapshot {
+            recording.calendarEventTitle = snapshot.title
+            recording.calendarEventStartAt = snapshot.startAt
+            recording.calendarEventEndAt = snapshot.endAt
+        }
         touch(recording)
         return save()
     }
@@ -1996,9 +2037,10 @@ actor RecordingsStore {
 
     func fetchFolderDetail(folderID: UUID) -> FolderDetailDTO? {
         guard let folder = folder(byID: folderID) else { return nil }
+        let speakerNames = speakerDisplayNamesByID()
         let recordings = folder.recordings
             .sorted { $0.startDate > $1.startDate }
-            .map { recordingToDTO($0) }
+            .map { recordingToDTO($0, speakerNames: speakerNames) }
 
         let actionItems: [FolderActionItemDTO] = folder.recordings.flatMap { rec in
             guard let summary = rec.summary else { return [FolderActionItemDTO]() }
@@ -2197,7 +2239,16 @@ actor RecordingsStore {
 
         let transcript = Transcript(fullText: fullText, segments: segments)
         transcript.detectedLanguage = language
+        transcript.captureSummarySource()
         recording.transcript = transcript
+        if let summary = recording.summary {
+            summary.chaptersJSON = nil
+            var metadata = SummaryGenerationMetadata.decode(summary.generationMetadataJSON)
+                ?? .init(detailLevel: "unrecorded", stage: .unrecorded)
+            metadata.sourceChanged = true
+            summary.generationMetadataJSON = metadata.json
+        }
+        recording.transcriptPreview = Self.listPreview(of: fullText)
         let normalizedTags = tagNormalizer.canonicalize(tags, vocab: tagVocab())
         if !normalizedTags.isEmpty {
             recording.tags = normalizedTags
@@ -2237,15 +2288,26 @@ actor RecordingsStore {
         return speakerIdentityRevisions[recordingID] ?? 0
     }
 
+    enum SummarySaveOutcome: Equatable, Sendable {
+        case saved, cancelled, recordingUnavailable, sourceSuperseded, keptReviewedSummary, failed
+    }
+
     @discardableResult
-    func saveSummary(recordingID: UUID, summary: SummaryResult, chaptersJSON: String?, provider: AIProvider = .openai, model: String = "", language: String = "en", meetingType: String? = nil) -> Bool {
-        guard let recording = recording(byID: recordingID) else { return false }
+    func saveSummary(recordingID: UUID, summary: SummaryResult, chaptersJSON: String?, provider: AIProvider = .openai, model: String = "", language: String = "en", meetingType: String? = nil, expectedSource: SummarySourceVersion? = nil) -> SummarySaveOutcome {
+        guard !Task.isCancelled else { return .cancelled }
+        guard let recording = recording(byID: recordingID), recording.trashedDate == nil else { return .recordingUnavailable }
+        let currentSource = expectedSource == nil ? nil : sourceVersion(recording)
+        if let expectedSource, !expectedSource.matchesTranscript(currentSource) { return .sourceSuperseded }
+        // A degraded retry may remain readable, but must not replace a completed review.
+        if summary.generationMetadata?.stage == .draft,
+           let old = SummaryGenerationMetadata.decode(recording.summary?.generationMetadataJSON),
+           [.reviewed, .repaired, .mapReduced].contains(old.stage), !old.sourceChanged { return .keptReviewedSummary }
+        let oldItems = recording.summary?.actionItems ?? []
+        let items = Self.mergeGeneratedActions(summary.actionItems, preserving: oldItems)
         let meetingSummary = MeetingSummary(
             overview: summary.overview,
             keyPoints: summary.keyPoints,
-            actionItems: summary.actionItems.map {
-                ActionItem(assignee: $0.assignee, task: $0.task, deadline: $0.deadline)
-            },
+            actionItems: items,
             decisions: summary.decisions,
             followUps: summary.followUps,
             yourTasks: summary.yourTasks,
@@ -2254,7 +2316,14 @@ actor RecordingsStore {
             language: language
         )
         meetingSummary.chaptersJSON = chaptersJSON
+        var metadata = summary.generationMetadata
+        metadata?.source = expectedSource
+        if let expectedSource, let currentSource {
+            metadata?.speakerMappingsChanged = expectedSource.mappingsDiffer(from: currentSource) ? true : nil
+        }
+        meetingSummary.generationMetadataJSON = metadata?.json
         recording.summary = meetingSummary
+        recording.summaryPreview = Self.listPreview(of: summary.overview)
         // Merge: keep existing/manual tags, fold in AI tags, dedup by canonical formatKey.
         recording.tags = tagNormalizer.canonicalize(recording.tags + summary.tags, vocab: tagVocab())
         if !summary.title.isEmpty {
@@ -2264,7 +2333,9 @@ actor RecordingsStore {
             recording.meetingType = meetingType
         }
         touch(recording)
-        return save()
+        invalidateDetailCache(recordingID)
+        guard save() else { modelContext.rollback(); invalidateDetailCache(recordingID); return .failed }
+        return .saved
     }
 
     @discardableResult
@@ -2309,19 +2380,83 @@ actor RecordingsStore {
         return save()
     }
 
+    private func sourceVersion(_ recording: Recording) -> SummarySourceVersion? {
+        guard let t = recording.transcript else { return nil }
+        let mappings = speakerMappings(forRecordingID: recording.id)
+        let mappingKey = SummaryContextSnapshot.digest(mappings.sorted { $0.rawLabel < $1.rawLabel })
+        if let cached = summarySourceCache[t.id], cached.mappingKey == mappingKey { return cached.version }
+        let version: SummarySourceVersion
+        if mappings.isEmpty, let json = t.summarySourceVersionJSON,
+           let persisted = try? JSONDecoder().decode(SummarySourceVersion.self, from: Data(json.utf8)), persisted.transcriptID == t.id {
+            version = persisted
+        } else {
+            // Legacy records and changed speaker mappings pay this cost once per
+            // bounded cache entry. No writes or migration are triggered by reads.
+            let dto = TranscriptDTO(id: t.id, fullText: t.fullText,
+                segments: t.segments.map { TranscriptEntryDTO(id: $0.id, startTime: $0.startTime,
+                    endTime: $0.endTime, text: $0.text, speaker: $0.speaker) },
+                detectedLanguage: t.detectedLanguage, createdAt: t.createdAt)
+            version = SummarySourceVersion.capture(dto, mappings: mappings)
+#if DEBUG
+            summarySourceCaptureCount += 1
+#endif
+        }
+        if summarySourceCache.count >= 64 { summarySourceCache.removeAll(keepingCapacity: true) }
+        summarySourceCache[t.id] = (mappingKey, version)
+        return version
+    }
+
+    /// Private context consumers need summary provenance, never transcript DTOs.
+    func fetchSummaryContextDetail(recordingID: UUID) -> RecordingDetailDTO? {
+        guard let recording = recording(byID: recordingID), recording.trashedDate == nil else { return nil }
+        return recordingToDetailDTO(recording, includeTranscript: false)
+    }
+
+    func fetchSummaryHistoryCandidates(currentID: UUID, before: Date) -> [RecordingDTO] {
+        let earliest = before.addingTimeInterval(-90 * 86400)
+        let descriptor = FetchDescriptor<Recording>(predicate: #Predicate {
+            $0.id != currentID && $0.trashedDate == nil && $0.startDate < before && $0.startDate >= earliest && $0.summary != nil
+        }, sortBy: [SortDescriptor(\.startDate, order: .reverse)])
+        // Titles/date and existing list projection only; no summary content faults.
+        return ((try? modelContext.fetch(descriptor)) ?? []).map { recordingToDTO($0, speakerNames: [:]) }
+    }
+
+    static func mergeGeneratedActions(_ generated: [ActionItemResult], preserving old: [ActionItem]) -> [ActionItem] {
+        func key(_ task: String, _ assignee: String?) -> String {
+            (task.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) + "\u{0}" + (assignee ?? "").lowercased()
+        }
+        var remaining = old
+        var result = generated.map { item -> ActionItem in
+            if let index = remaining.firstIndex(where: { key($0.task, $0.assignee) == key(item.task, item.assignee) }) {
+                var retained = remaining.remove(at: index)
+                if retained.userModified != true && !retained.isCompleted { retained.deadline = item.deadline }
+                return retained
+            }
+            return ActionItem(assignee: item.assignee, task: item.task, deadline: item.deadline)
+        }
+        result += remaining.filter { $0.userModified == true || $0.isCompleted }
+        return result
+    }
+
     func currentSummaryID(for recordingID: UUID) -> UUID? {
         recording(byID: recordingID)?.summary?.id
     }
 
     @discardableResult
-    func updateChapters(recordingID: UUID, chaptersJSON: String, expectedSummaryID: UUID? = nil) -> Bool {
+    func updateChapters(recordingID: UUID, chaptersJSON: String, expectedSummaryID: UUID? = nil, expectedSource: SummarySourceVersion? = nil) -> Bool {
         guard let recording = recording(byID: recordingID),
               let summary = recording.summary else { return false }
         // Guard against stale chapters overwriting a newer summary
         if let expected = expectedSummaryID, summary.id != expected { return false }
+        let currentSource = sourceVersion(recording)
+        if let expectedSource, !expectedSource.matchesTranscript(currentSource) { return false }
+        if let metadata = SummaryGenerationMetadata.decode(summary.generationMetadataJSON),
+           metadata.sourceChanged || metadata.source.map({ !$0.matchesTranscript(currentSource) }) == true { return false }
         summary.chaptersJSON = chaptersJSON
         touch(recording)
-        return save()
+        invalidateDetailCache(recordingID)
+        guard save() else { modelContext.rollback(); invalidateDetailCache(recordingID); return false }
+        return true
     }
 
     @discardableResult
@@ -2332,6 +2467,7 @@ actor RecordingsStore {
         let original = summary.actionItems[idx]
         let originalRecordingUpdatedAt = recording.updatedAt
         summary.actionItems[idx].isCompleted.toggle()
+        summary.actionItems[idx].userModified = true
         let now = Date()
         summary.actionItems[idx].createdAt = summary.actionItems[idx].createdAt ?? recording.createdAt ?? recording.startDate
         summary.actionItems[idx].updatedAt = now
@@ -2362,7 +2498,9 @@ actor RecordingsStore {
               let summary = recording.summary else { return false }
         let originalItems = summary.actionItems
         let originalRecordingUpdatedAt = recording.updatedAt
-        summary.actionItems.append(ActionItem(task: task))
+        var item = ActionItem(task: task)
+        item.userModified = true
+        summary.actionItems.append(item)
         touch(recording)
         guard save() else {
             summary.actionItems = originalItems
@@ -3001,6 +3139,7 @@ actor RecordingsStore {
         for f in folders { modelContext.delete(f) }
         let transcripts = (try? modelContext.fetch(FetchDescriptor<Transcript>())) ?? []
         for t in transcripts { modelContext.delete(t) }
+        for record in (try? modelContext.fetch(FetchDescriptor<SummaryContextRecord>())) ?? [] { modelContext.delete(record) }
         let summaries = (try? modelContext.fetch(FetchDescriptor<MeetingSummary>())) ?? []
         for s in summaries { modelContext.delete(s) }
         let speakers = (try? modelContext.fetch(FetchDescriptor<SpeakerProfile>())) ?? []
@@ -3078,7 +3217,9 @@ actor RecordingsStore {
                 folderPath: webSyncFolderPath(recording.folder),
                 trashedDate: recording.trashedDate,
                 audioFileURL: resolveURL(recording.audioFileReference),
-                awaitingHistoricalConsentBindingID: recording.awaitingHistoricalConsentBindingID
+                awaitingHistoricalConsentBindingID: recording.awaitingHistoricalConsentBindingID,
+                calendarEvent: Self.webSyncCalendarEvent(from: recording),
+                calendarEventCleared: recording.calendarAutoLinkState == CalendarAutoLinkState.userCleared.rawValue
             )
         }
     }
@@ -3104,7 +3245,22 @@ actor RecordingsStore {
             folderPath: webSyncFolderPath(recording.folder),
             trashedDate: recording.trashedDate,
             audioFileURL: resolveURL(recording.audioFileReference),
-            awaitingHistoricalConsentBindingID: recording.awaitingHistoricalConsentBindingID
+            awaitingHistoricalConsentBindingID: recording.awaitingHistoricalConsentBindingID,
+            calendarEvent: Self.webSyncCalendarEvent(from: recording),
+            calendarEventCleared: recording.calendarAutoLinkState == CalendarAutoLinkState.userCleared.rawValue
+        )
+    }
+
+    private static func webSyncCalendarEvent(from recording: Recording) -> WebSyncCalendarEvent? {
+        guard recording.calendarAutoLinkState != CalendarAutoLinkState.userCleared.rawValue,
+              let title = recording.calendarEventTitle, !title.isEmpty,
+              let start = recording.calendarEventStartAt,
+              let end = recording.calendarEventEndAt
+        else { return nil }
+        return WebSyncCalendarEvent(
+            title: title,
+            startAt: Int64(start.timeIntervalSince1970.rounded()),
+            endAt: Int64(end.timeIntervalSince1970.rounded())
         )
     }
 
@@ -3222,6 +3378,49 @@ actor RecordingsStore {
     @discardableResult
     func requeueInitialWebSyncServerFailures(userID: String) throws -> Int {
         try requeueInitialWebSyncFailures(userID: userID, statusCode: 500)
+    }
+
+    /// One-shot recovery after a server schema rollout. A client that shipped
+    /// payload fields before the backend accepted them had every affected
+    /// upsert rejected with 400 and parked permanent — updates included, which
+    /// the initial-only helpers above deliberately never touch. Rows keep
+    /// their remote identity and simply become eligible again; a payload the
+    /// rolled-out backend still refuses re-parks itself on its next attempt.
+    @discardableResult
+    func requeueWebSyncSchemaRejectionFailures(userID: String) throws -> Int {
+        let descriptor = FetchDescriptor<WebSyncRecord>(
+            predicate: #Predicate { $0.userID == userID }
+        )
+        let records = try modelContext.fetch(descriptor)
+            .filter { AccountIdentity.matches($0.userID, userID) }
+        let affected = records.filter { record in
+            guard record.structuredState == WebStructuredSyncState.failed.rawValue
+                    || record.audioState == WebAudioSyncState.failed.rawValue,
+                  let lastErrorCode = record.lastErrorCode else {
+                return false
+            }
+            return lastErrorCode
+                .replacingOccurrences(of: " ", with: "")
+                .contains("status:400")
+        }
+        guard !affected.isEmpty else { return 0 }
+
+        for record in affected {
+            if record.structuredState == WebStructuredSyncState.failed.rawValue {
+                record.structuredState = WebStructuredSyncState.pending.rawValue
+            }
+            if record.audioState == WebAudioSyncState.failed.rawValue {
+                record.audioState = WebAudioSyncState.pending.rawValue
+                record.audioFingerprint = nil
+                record.uploadSessionID = nil
+            }
+            record.attemptCount = 0
+            record.nextAttemptAt = nil
+            record.lastErrorCode = nil
+            record.lastAttemptAt = nil
+        }
+        try modelContext.save()
+        return affected.count
     }
 
     /// Makes rows parked by a stated entitlement refusal eligible again.
@@ -3386,6 +3585,16 @@ actor RecordingsStore {
         return try? modelContext.fetch(descriptor).first
     }
 
+    /// Trash state of one recording, nil when it does not exist. MCP used to
+    /// answer this by materializing every trashed recording's DTO (and with it
+    /// every trashed transcript) on each tool call.
+    func isRecordingTrashed(recordingID id: UUID) -> Bool? {
+        var descriptor = FetchDescriptor<Recording>(predicate: #Predicate { $0.id == id })
+        descriptor.fetchLimit = 1
+        descriptor.propertiesToFetch = [\.trashedDate]
+        return (try? modelContext.fetch(descriptor))?.first.map { $0.trashedDate != nil }
+    }
+
     private func folder(byID id: UUID) -> Folder? {
         var descriptor = FetchDescriptor<Folder>(
             predicate: #Predicate { $0.id == id }
@@ -3416,11 +3625,9 @@ actor RecordingsStore {
         }
 #endif
         do {
+            let mirrorIDs = mirrorRecordingIDsIfEnabled()
             try modelContext.save()
-            if !AppState.isRunningTests,
-               UserDefaults.standard.bool(forKey: MarkdownMirrorLocationManager.enabledDefaultsKey) {
-                NotificationCenter.default.post(name: .cadenzaRecordingsChanged, object: nil)
-            }
+            postRecordingsChangedIfNeeded(mirrorIDs)
             return true
         } catch {
             NSLog("[RecordingsStore] save failed: %@", error.localizedDescription)
@@ -3456,11 +3663,9 @@ actor RecordingsStore {
         }
 #endif
         do {
+            let mirrorIDs = mirrorRecordingIDsIfEnabled()
             try modelContext.save()
-            if !AppState.isRunningTests,
-               UserDefaults.standard.bool(forKey: MarkdownMirrorLocationManager.enabledDefaultsKey) {
-                NotificationCenter.default.post(name: .cadenzaRecordingsChanged, object: nil)
-            }
+            postRecordingsChangedIfNeeded(mirrorIDs)
             return true
         } catch {
             NSLog(
@@ -3522,6 +3727,50 @@ actor RecordingsStore {
         }
     }
 
+    /// userInfo key of `.cadenzaRecordingsChanged`: the `Set<UUID>` of
+    /// recordings the saved transaction touched.
+    nonisolated static let changedRecordingIDsUserInfoKey = "recordingIDs"
+
+    /// Recording ids touched by the pending transaction, read before `save()`
+    /// empties the change sets. Bookkeeping rows (web sync state, voice
+    /// samples) map to nothing, so their saves post no notification at all:
+    /// the markdown mirror used to rebuild the whole library after each one.
+    private func mirrorRecordingIDsIfEnabled() -> Set<UUID>? {
+        guard !AppState.isRunningTests,
+              UserDefaults.standard.bool(forKey: MarkdownMirrorLocationManager.enabledDefaultsKey)
+        else { return nil }
+        return pendingRecordingIDs()
+    }
+
+    func pendingRecordingIDs() -> Set<UUID> {
+        var ids = Set<UUID>()
+        let pending = modelContext.insertedModelsArray
+            + modelContext.changedModelsArray
+            + modelContext.deletedModelsArray
+        for model in pending {
+            switch model {
+            case let recording as Recording:
+                ids.insert(recording.id)
+            case let transcript as Transcript:
+                if let id = transcript.recording?.id { ids.insert(id) }
+            case let summary as MeetingSummary:
+                if let id = summary.recording?.id { ids.insert(id) }
+            default:
+                break
+            }
+        }
+        return ids
+    }
+
+    private func postRecordingsChangedIfNeeded(_ ids: Set<UUID>?) {
+        guard let ids, !ids.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .cadenzaRecordingsChanged,
+            object: nil,
+            userInfo: [Self.changedRecordingIDsUserInfoKey: ids]
+        )
+    }
+
     /// Tracks changes visible through recording/search/MCP APIs. Internal
     /// bookkeeping such as last-access time and retry counters deliberately
     /// does not advance this timestamp.
@@ -3531,7 +3780,75 @@ actor RecordingsStore {
 
     // MARK: - DTO Conversions
 
-    private func recordingToDTO(_ recording: Recording) -> RecordingDTO {
+    /// Display names for every speaker profile, fetched once per list
+    /// conversion. `recordingToDTO` used to run one unbounded SpeakerProfile
+    /// fetch per mapping per recording.
+    private func speakerDisplayNamesByID() -> [UUID: String] {
+        let descriptor = FetchDescriptor<SpeakerProfile>()
+        let profiles = (try? modelContext.fetch(descriptor)) ?? []
+        var names: [UUID: String] = [:]
+        names.reserveCapacity(profiles.count)
+        for profile in profiles { names[profile.id] = profile.displayName }
+        return names
+    }
+
+    /// Short list preview persisted next to the recording (see
+    /// `Recording.transcriptPreview`).
+    nonisolated static func listPreview(of text: String) -> String {
+        String(text.prefix(200))
+    }
+
+    struct ListPreviewBackfillStep: Sendable, Equatable {
+        /// Rows updated in this batch.
+        var updated: Int
+        /// Whether another batch may be waiting; the caller loops with an await.
+        var remaining: Bool
+    }
+
+    /// Fills `transcriptPreview` / `summaryPreview` for ONE batch of rows that
+    /// predate the columns and returns. A nil column means "not projected
+    /// yet"; rows without content are stamped with an empty string so they
+    /// leave the candidate set (the DTO maps empty back to nil). After the
+    /// first run a launch costs one small query. The caller loops with an
+    /// `await` between batches; this actor has no suspension point inside one.
+    func backfillListPreviews(batchSize: Int = 50) -> ListPreviewBackfillStep {
+        var descriptor = FetchDescriptor<Recording>(
+            predicate: #Predicate { $0.transcriptPreview == nil || $0.summaryPreview == nil },
+            sortBy: [SortDescriptor(\.startDate, order: .reverse)]
+        )
+        descriptor.fetchLimit = max(1, batchSize)
+        let candidates = (try? modelContext.fetch(descriptor)) ?? []
+        var updated = 0
+        for recording in candidates {
+            if recording.transcriptPreview == nil {
+                recording.transcriptPreview = recording.transcript.map { Self.listPreview(of: $0.fullText) } ?? ""
+            }
+            if recording.summaryPreview == nil {
+                recording.summaryPreview = recording.summary.map { Self.listPreview(of: $0.overview) } ?? ""
+            }
+            updated += 1
+        }
+        guard updated > 0 else { return ListPreviewBackfillStep(updated: 0, remaining: false) }
+        guard save() else {
+            modelContext.rollback()
+            return ListPreviewBackfillStep(updated: 0, remaining: false)
+        }
+        return ListPreviewBackfillStep(updated: updated, remaining: candidates.count == descriptor.fetchLimit)
+    }
+
+#if DEBUG
+    /// Test hook: simulates rows written before the projection columns existed.
+    func clearListPreviewsForTesting() {
+        let recordings = (try? modelContext.fetch(FetchDescriptor<Recording>())) ?? []
+        for recording in recordings {
+            recording.transcriptPreview = nil
+            recording.summaryPreview = nil
+        }
+        _ = save()
+    }
+#endif
+
+    private func recordingToDTO(_ recording: Recording, speakerNames: [UUID: String]) -> RecordingDTO {
         RecordingDTO(
             id: recording.id,
             title: recording.title,
@@ -3550,17 +3867,23 @@ actor RecordingsStore {
             createdAt: recording.createdAt,
             updatedAt: recording.updatedAt,
             source: recording.source,
+            // A nil check on a to-one relationship reads the row's foreign
+            // key; it does not fault the Transcript or MeetingSummary row.
             hasTranscript: recording.transcript != nil,
             hasSummary: recording.summary != nil,
-            transcriptPreview: recording.transcript.map { String($0.fullText.prefix(200)) },
-            summaryPreview: recording.summary.map { String($0.overview.prefix(200)) },
+            // Empty is the "projected, no content" stamp; callers see nil.
+            transcriptPreview: recording.transcriptPreview.flatMap { $0.isEmpty ? nil : $0 },
+            summaryPreview: recording.summaryPreview.flatMap { $0.isEmpty ? nil : $0 },
+            speakerNames: (recording.speakerMappings ?? []).compactMap { mapping in
+                speakerNames[mapping.profileID]
+            },
             audioFile: recording.audioFileReference
         )
     }
 
-    private func recordingToDetailDTO(_ recording: Recording) -> RecordingDetailDTO {
+    private func recordingToDetailDTO(_ recording: Recording, includeTranscript: Bool = true) -> RecordingDetailDTO {
         var transcriptDTO: TranscriptDTO?
-        if let t = recording.transcript {
+        if includeTranscript, let t = recording.transcript {
             transcriptDTO = TranscriptDTO(
                 id: t.id,
                 fullText: t.fullText,
@@ -3580,8 +3903,14 @@ actor RecordingsStore {
 
         var summaryDTO: SummaryDTO?
         if let s = recording.summary {
+            var metadata = SummaryGenerationMetadata.decode(s.generationMetadataJSON)
+            if let source = metadata?.source {
+                let current = sourceVersion(recording)
+                if !source.matchesTranscript(current) { metadata?.sourceChanged = true }
+                else if let current { metadata?.speakerMappingsChanged = source.mappingsDiffer(from: current) ? true : nil }
+            }
             var chapters: [ChapterDTO] = []
-            if let json = s.chaptersJSON,
+            if metadata?.sourceChanged != true, let json = s.chaptersJSON,
                let data = json.data(using: .utf8),
                let decoded = try? JSONDecoder().decode([ChapterDTO].self, from: data) {
                 chapters = decoded
@@ -3609,7 +3938,8 @@ actor RecordingsStore {
                 model: s.model,
                 language: s.language,
                 createdAt: s.createdAt,
-                chapters: chapters
+                chapters: chapters,
+                generationMetadata: metadata
             )
         }
 
@@ -3673,7 +4003,8 @@ actor RecordingsStore {
     // MARK: - Speaker Profiles
 
     func speakerProfile(byID id: UUID) -> SpeakerProfile? {
-        let descriptor = FetchDescriptor<SpeakerProfile>(predicate: #Predicate { $0.id == id })
+        var descriptor = FetchDescriptor<SpeakerProfile>(predicate: #Predicate { $0.id == id })
+        descriptor.fetchLimit = 1
         return try? modelContext.fetch(descriptor).first
     }
 
@@ -4783,14 +5114,18 @@ actor RecordingsStore {
                         }
                     }
 
-                    transcriptExcerpts.append(AIContextData.TranscriptExcerpt(
-                        recordingID: rec.id,
-                        recordingTitle: title,
-                        startTime: segment.startTime,
-                        rawSpeaker: segment.speaker,
-                        resolvedSpeakerName: resolved,
-                        text: segment.text
-                    ))
+                    // A zero budget still needs the speaker roster below; only
+                    // the excerpts themselves would be built and then discarded.
+                    if includesCompleteTranscript || maxTranscriptEntries > 0 {
+                        transcriptExcerpts.append(AIContextData.TranscriptExcerpt(
+                            recordingID: rec.id,
+                            recordingTitle: title,
+                            startTime: segment.startTime,
+                            rawSpeaker: segment.speaker,
+                            resolvedSpeakerName: resolved,
+                            text: segment.text
+                        ))
+                    }
 
                     // Track speaker for SpeakerInfo
                     let speakerKey = resolved ?? segment.speaker ?? ""

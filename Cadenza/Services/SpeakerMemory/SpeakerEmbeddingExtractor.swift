@@ -37,7 +37,16 @@ final class SpeakerKitEmbeddingExtractor: SpeakerEmbeddingExtractorProtocol, @un
         let diarizationResult = try await MainActor.run {
             SpeakerDiarizer.shared
         }.diarize(audioURL: audioURL)
+        return Self.makeResult(from: diarizationResult, modelVersion: modelVersion)
+    }
 
+    /// Maps a SpeakerKit result into the app-owned embedding result. Shared by
+    /// the live extractor and the precomputed path so both produce identical
+    /// spans and embeddings for the same diarization.
+    nonisolated static func makeResult(
+        from diarizationResult: DiarizationResult,
+        modelVersion: String = currentModelVersion
+    ) -> SpeakerEmbeddingResult {
         let speakerActivitySpans = diarizationResult.segments.compactMap { segment -> SpeakerAssignmentSpan? in
             let speakerID: Int
             switch segment.speaker {
@@ -87,5 +96,19 @@ final class SpeakerKitEmbeddingExtractor: SpeakerEmbeddingExtractorProtocol, @un
             embeddingDimension: dimension,
             modelVersion: modelVersion
         )
+    }
+}
+
+/// Reuses the diarization the transcription pass already ran on this audio
+/// revision. Speaker memory used to call `diarize` a second time on the same
+/// file: one more full decode into a Float array and one more complete
+/// segmenter plus embedder inference, serialized behind the app-wide gate, to
+/// obtain window embeddings the first run had computed and discarded.
+struct PrecomputedSpeakerEmbeddingExtractor: SpeakerEmbeddingExtractorProtocol {
+    let result: SpeakerEmbeddingResult
+    var modelVersion: String { result.modelVersion }
+
+    func extractEmbeddings(from audioURL: URL) async throws -> SpeakerEmbeddingResult {
+        result
     }
 }

@@ -62,6 +62,7 @@ extension RecordingsStore {
         let now = Date()
         updated.createdAt = original.createdAt ?? recording.createdAt ?? recording.startDate
         updated.updatedAt = now
+        updated.userModified = true
         summary.actionItems[index] = updated
         recording.updatedAt = now
 

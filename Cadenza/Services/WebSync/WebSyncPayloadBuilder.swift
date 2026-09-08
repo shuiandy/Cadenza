@@ -31,7 +31,7 @@ enum WebSyncPayloadBuilder {
             WebSyncSummary(
                 format: "markdown",
                 markdown: summaryMarkdown($0),
-                structured: structuredSummary($0)
+                structured: structuredSummary($0, fallbackDate: detail.createdAt ?? detail.startDate)
             )
         }
         let tags = Array(Set(detail.tags.map {
@@ -51,7 +51,10 @@ enum WebSyncPayloadBuilder {
                 audioSourceState: audioSourceState,
                 transcript: transcript,
                 summary: summary,
-                calendarEvent: snapshot.calendarEvent
+                calendarEvent: snapshot.calendarEventCleared
+                    ? .cleared
+                    : snapshot.calendarEvent.map { .value($0) } ?? .omitted,
+                speakerMappings: snapshot.speakerMappings
             )
         }
 
@@ -74,19 +77,21 @@ enum WebSyncPayloadBuilder {
     /// `provider` and `model` are left behind: they describe how the summary was
     /// produced, which the markdown already records under "Generated With" for
     /// anyone who wants it, and which no reader displays as structure.
-    private static func structuredSummary(_ summary: SummaryDTO) -> WebSyncStructuredSummary {
+    private static func structuredSummary(_ summary: SummaryDTO, fallbackDate: Date) -> WebSyncStructuredSummary {
         WebSyncStructuredSummary(
             overview: summary.overview,
             keyPoints: summary.keyPoints,
             decisions: summary.decisions,
             actionItems: summary.actionItems.map { item in
-                WebSyncActionItem(
+                return WebSyncActionItem(
                     id: item.id.uuidString.lowercased(),
                     task: item.task,
                     assignee: item.assignee ?? "",
                     deadline: item.deadline ?? "",
                     completed: item.isCompleted,
-                    priority: item.priority
+                    priority: item.priority,
+                    createdAt: Int64((item.createdAt ?? fallbackDate).timeIntervalSince1970.rounded()),
+                    updatedAt: Int64((item.updatedAt ?? fallbackDate).timeIntervalSince1970.rounded())
                 )
             },
             yourTasks: summary.yourTasks,
