@@ -169,13 +169,13 @@ struct OpenAIRequestCompatibilityTests {
     @Test func openAIRequestOmitsUnsupportedCustomTemperature() throws {
         let body = OpenAIService.makeRequestBody(
             provider: .openai,
-            modelID: "gpt-5.6-terra",
+            modelID: "gpt-6-sol",
             messages: messages,
             purpose: .chat,
             stream: true
         )
 
-        #expect(body["model"] as? String == "gpt-5.6-terra")
+        #expect(body["model"] as? String == "gpt-6-sol")
         #expect(body["temperature"] == nil)
         #expect(body["stream"] as? Bool == true)
         let encoded = try JSONSerialization.data(withJSONObject: body)
@@ -199,7 +199,7 @@ struct OpenAIRequestCompatibilityTests {
     @Test func miniMaxRequestKeepsTunedTemperature() {
         let body = OpenAIService.makeRequestBody(
             provider: .minimax,
-            modelID: "MiniMax-M2.7",
+            modelID: "MiniMax-M3",
             messages: messages,
             purpose: .chat,
             stream: true

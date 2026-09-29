@@ -386,7 +386,7 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 
 | 功能 | Provider | Model ID |
 | --- | --- | --- |
-| 录后转录 | OpenAI（默认） | `gpt-4o-transcribe-diarize` |
+| 录后转录 | OpenAI（默认） | `gpt-4o-transcribe-diarize`（OpenAI 2027-02-26 停用，尚无带说话人标签的继任） |
 | 录后转录 | Gemini | `gemini-3.5-transcribe`（Interactions API，非 generateContent） |
 | 录后转录 | Whisper Local | `tiny` / `base` / `small` / `medium` (CoreML) |
 | 录后转录 | Apple | 系统 SpeechTranscriber |
@@ -394,15 +394,15 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 | 实时转录 | Gemini | `gemini-3.5-transcribe-live` |
 | 实时转录 | Apple | 系统 SpeechAnalyzer |
 | 说话人识别 | SpeakerKit (Local) | PyannoteModels (on-device) |
-| Summary | OpenAI | `gpt-5.6-sol` |
-| Summary | Claude | `claude-sonnet-4-6` |
-| Summary | Gemini | `gemini-3.7-flash` |
-| Summary | MiniMax | `MiniMax-M2.7` |
+| Summary | OpenAI | `gpt-6-sol` |
+| Summary | Claude | `claude-sonnet-5-5`（adaptive thinking，`effort: medium`） |
+| Summary | Gemini | `gemini-3.8-flash` |
+| Summary | MiniMax | `MiniMax-M3` |
 | Summary | Apple (Local) | FoundationModels (~4K token context) |
-| Chat | OpenAI | `gpt-5.6-terra`（latency-first tier） |
-| Chat | Claude | `claude-haiku-4-5`（fast tier，~5x 便宜，~3-5x 快） |
-| Chat | Gemini | `gemini-3.7-flash`（与 summary 同） |
-| Chat | MiniMax | `MiniMax-M2.7`（本身较快，与 summary 同） |
+| Chat | OpenAI | `gpt-6-sol`（与 summary 同，`reasoning_effort: none`） |
+| Chat | Claude | `claude-haiku-4-5`（fast tier，价格为 Sonnet 5 的一半，默认不思考） |
+| Chat | Gemini | `gemini-3.8-flash`（与 summary 同） |
+| Chat | MiniMax | `MiniMax-M3`（无 highspeed 版本，与 summary 同） |
 | Chat | Apple (Local) | FoundationModels |
 | AI Context Budget | Claude/OpenAI | ~30k tokens |
 | AI Context Budget | Gemini | ~20k tokens |
@@ -506,16 +506,17 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 
 - Summary/Chat only（不支持转录）
 - Base URL: `https://api.anthropic.com/v1/messages`
-- 默认模型: `claude-sonnet-4-6`
+- 默认模型: `claude-sonnet-5-5`
+- **Adaptive thinking**：`ClaudeService.adaptiveThinkingModels`（Sonnet 5/5.5、Opus 5/5.5、Fable 5/5.1，按精确 ID 匹配）显式发送 `thinking: {type: "adaptive"}` 与 `output_config.effort`（摘要 `medium`，chat `low`）。Sonnet 5.5 重新校准了 effort 档位，2026-09-28 用约一小时的虚构会议稿复测：`high` 多思考约 70%、贵 27%、慢 64%，事实覆盖没有提升，所以摘要保持 `medium`。`max_tokens` 同时约束思考和正文，且新 tokenizer 同文本约多 30% token，所以摘要预算放宽到 16K/24K/32K、chat 16K。其它模型（Sonnet 4.6、Haiku 4.5）保持原来的不思考请求。流式只转发 `text` delta，思考块不进入输出
 - 认证: `x-api-key` + `anthropic-version: 2023-06-01`
-- **Prompt caching**：`summarize` / `streamSummarize` / `streamChat` 的 `system` 字段统一通过 `cacheableSystem(_:)` 包成 `[{type:"text", text:..., cache_control:{type:"ephemeral"}}]` 单 block 数组。Anthropic 缓存按 prefix 匹配，命中时该部分 token 仅按 ~0.1× 收费且跳过首 token 延迟（5 分钟 TTL）。Sonnet 4.6 最低可缓存 prefix = 2048 tokens，更短的 prompt 静默不缓存（不会报错）。`message_start` 事件中读取 `usage.cache_read_input_tokens` / `cache_creation_input_tokens` 通过 `print` 输出便于验证。AI chat 的 system prompt 在同一 session scope 不变时可命中
+- **Prompt caching**：`summarize` / `streamSummarize` / `streamChat` 的 `system` 字段统一通过 `cacheableSystem(_:)` 包成 `[{type:"text", text:..., cache_control:{type:"ephemeral"}}]` 单 block 数组。Anthropic 缓存按 prefix 匹配，命中时该部分 token 仅按 ~0.1× 收费且跳过首 token 延迟（5 分钟 TTL）。Sonnet 5.5 最低可缓存 prefix = 512 tokens（Sonnet 5 为 1024，Haiku 4.5 为 4096），更短的 prompt 静默不缓存（不会报错）。`message_start` 事件中读取 `usage.cache_read_input_tokens` / `cache_creation_input_tokens` 通过 `print` 输出便于验证。AI chat 的 system prompt 在同一 session scope 不变时可命中
 
 #### MiniMax (via OpenAI-compatible endpoint)
 
 - Summary/Chat only（不支持转录）
 - Base URL: `https://api.minimax.io/v1/chat/completions`
 - 复用 `OpenAIService`，通过 `baseURL` 参数切换
-- 默认模型: `MiniMax-M2.7`
+- 默认模型: `MiniMax-M3`
 - 认证: Bearer token
 
 #### Apple Foundation Models `AppleFoundationModelService`
@@ -589,12 +590,14 @@ OpenAI `gpt-4o-transcribe-diarize` 使用 `diarized_json` response format（不�
 
 | 参数 | 值 |
 | --- | --- |
-| 会话就绪等待 | 10s |
-| VAD 阈值 | 0.5 |
-| 静音窗口 | 1200ms |
+| 会话就绪等待 | 10s，等待 `session.updated` 确认配置 |
+| `gpt-live-transcribe` | `turn_detection: null`，客户端按下列阈值 commit |
+| 旧模型 server VAD | 阈值 0.5，静音窗口 500ms |
 | commit 间隔 | 2.8s |
 | commit 字节阈值 | 144,000 bytes |
 | 最小 commit | 20,000 bytes |
+
+OpenAI 实时配置按明确模型能力分流：`gpt-live-transcribe` 用 `languages` 数组，不请求 logprobs；旧模型保留 `language` 和 server VAD。`session.created` 只代表连接建立，不能作为配置成功；配置错误或断连直接结束 startup 并关闭该 attempt 的 socket。transcriber 是单次会话 actor，音频发送后检查 commit 阈值，停止时仅提交达到最小长度的尾部。协议回归测试注入虚构 WebSocket 事件，不访问 API 或真实音频。
 
 #### Gemini `GeminiRealtimeTranscriber`
 
@@ -1379,13 +1382,16 @@ Liquid Glass：
 | 入口 | 语义 | 对返回栈 |
 |------|------|---------|
 | `navigate(to:)` | sidebar 式换位置 | 清空（旧返回链作废），并清 `searchQuery`；**目标若 `requiresExplicitExit` 则转 `present`** |
-| `present(_:)` | 覆盖式进入，记住来路 | push 当前页；**不碰 `searchQuery`** |
+| `present(_:)` | 覆盖式进入，记住来路 | push 当前页；连续打开录音详情时替换当前详情，不压入旧录音；**不碰 `searchQuery`** |
 | `closeDetail()` | 关闭当前页 | pop 回上一层 |
 
 `openRecordingDetail` / `openSettings` 都走 `present`。栈深上限 8（异常路径兜底，正常最多
 回顾 → 回顾详情 → 录音详情三层）。栈空时按 `fallbackReturnTarget` 兜底：recapDetail → `.recaps`，
 其余 → `.allRecordings`。toolbar 的 `showDetailCloseButton` =
 `requiresExplicitExit || !navigationReturnStack.isEmpty`。
+
+连续会议共用一层录音详情，从首页打开多场会议后关闭一次即回首页；从文件夹、标签或回顾
+详情打开时仍回到原入口。自动打开详情发生在 `onRecordingStarted`，后处理完成仅更新提示。
 
 **sidebar 双向同步的回声**：`selectedDestination` 与 `activeDestination` 互相同步，`present` 之后
 activeDestination 会把选中值推给 sidebar，那次变化回到 `onChange(of: selectedDestination)` 时
@@ -1398,7 +1404,7 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 既没有关闭按钮、`sidebarDestination` 又是 nil（sidebar 无高亮），进去就是死胡同；`closeDetail`
 的前身 `closeRecordingDetail()` 硬编码 `activeDestination = .allRecordings`，从回顾 / 文件夹 /
 标签点进的录音，关掉一律掉到「全部录音」。回归测试 `CadenzaTests/UI/NavigationReturnTests.swift`
-（14 个），其中 `everyPageOffTheSidebarHasAnExit` 是不变量门禁：**新增的 destination 只要
+中 `everyPageOffTheSidebarHasAnExit` 是不变量门禁：**新增的 destination 只要
 `sidebarDestination == nil` 就必须 `requiresExplicitExit`**，漏了会被拦下。
 
 ### 8.14 录音集合、玻璃与全库刷新
@@ -1407,7 +1413,14 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
   grid/list 另有日期分组及 pinned headers。waterfall 当前是自适应网格，不是真正的 masonry。
 - 卡片使用值类型 DTO，processing phase 由集合传入；没有每张卡片独立的数据库 task。
   `CardFrameRegistry` 在框选事件读取已 materialize 的 AppKit frame，不在普通滚动时写回 SwiftUI geometry 状态。
-- `dayGroups` 仍在计算属性中调用 `RecordingDayGrouper.group`，全量分组/排序尚无 revision cache。
+- 集合顶部的 `In progress` 紧凑行承载正在录音、停止收尾、排队、转录和摘要的入口，三种视图共用。
+  状态来自当前录音 ID、coordinator job phase 与手动重试/摘要状态，不以缺少 transcript 判断忙碌。
+  进行中项目暂不重复进入普通卡片或日期统计；完成/失败离开活动状态后回到正常集合。
+  行保留选择、框选、键盘、右键菜单和详情入口；状态使用中性文字与静态符号，无重复闪烁动画。
+  `onRecordingStarted` 在录音已持久化后立即刷新首页集合与派生缓存，不等停止事件才提供入口。
+  进行中行使用原生按钮，单击、Return 或 Space 直接打开详情；普通卡片仍是单击选择、双击打开。
+  录音/收尾期间不展示尚未持久化的时长，后处理仅展示有效正时长，不将未知时长显示成 `<1m`。
+- `dayGroups(for:)` 使用按完整输入数组匹配的 `dayGroupCache`；活动项目变化后按新的普通集合刷新分组。
   Lazy 只约束视图 materialization，不约束此前的全库 DTO、日期分组及选择集合计算。
 - `ColorHex.swift` 的 `AppCollectionCardModifier` 当前为 fill + stroke，**不含 glassEffect**；
   `AppGlassPanelModifier` 和玻璃按钮仍经 `PlatformCompatibility` 使用系统 glass。
@@ -1640,7 +1653,7 @@ if activeMeetingApp != next {
 
 ### 12.1.5 AI 模型配置（2026-06-11）
 
-所有 model ID 统一经 `AIProvider` 的四个 resolver（`summaryModel` / `chatModel` / `transcriptionModel` / `realtimeModel`）解析：UserDefaults 覆盖（`model.*` / `transcriptionModel.*` / `realtimeModel.*`）?? 代码默认（`default*Model`，注释含选型理由）。空/空白/换行覆盖视为未设置。设置 UI 的 `ModelOverrideRow`（SettingsView，三处：批量转录 / Live Transcription / Summary & AI）可编辑；`CadenzaApp.migrateLegacyGeminiModelDefaults` 启动时清理已废弃默认值的用户残留（pattern：废弃旧默认时把旧值加进 legacy 集合）。**禁止在 transcriber/service init 给 model 默认参数**——历史上 realtime 模型四处硬编码，升级要改代码重发版；2026-06-11 已全部收口（含 chat 切 provider 菜单、RecapGenerator、generateChapters 等旁路）。回归测试 `AIProviderModelConfigTests`。
+所有 model ID 统一经 `AIProvider` 的四个 resolver（`summaryModel` / `chatModel` / `transcriptionModel` / `realtimeModel`）解析：UserDefaults 覆盖（`model.*` / `transcriptionModel.*` / `realtimeModel.*`）?? 代码默认（`default*Model`，注释含选型理由）。空/空白/换行覆盖视为未设置。`model.<provider>` 在设置里叫 "Summary model"，**只作用于摘要**：`chatModel` 直接是 `defaultChatModel`，聊天自己的选择存在 `chatModel.<provider>`，由 `AIChatModelCatalog` 叠加（2026-09-28 起，此前聊天会沿用摘要覆盖）。设置 UI 的 `ModelOverrideRow`（SettingsView，三处：批量转录 / Live Transcription / Summary & AI）可编辑；`CadenzaApp.migrateLegacyGeminiModelDefaults` 启动时清理已废弃默认值的用户残留（pattern：废弃旧默认时把旧值加进 legacy 集合）。**禁止在 transcriber/service init 给 model 默认参数**——历史上 realtime 模型四处硬编码，升级要改代码重发版；2026-06-11 已全部收口（含 chat 切 provider 菜单、RecapGenerator、generateChapters 等旁路）。回归测试 `AIProviderModelConfigTests`。
 
 ### 12.2 AI Assistant
 

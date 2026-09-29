@@ -72,8 +72,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.shuiandy.Cadenza
         APP_BUNDLE_NAME: Cadenza
         APP_BUNDLE_DISPLAY_NAME: Cadenza
-        MARKETING_VERSION: "1.2.1"
-        CURRENT_PROJECT_VERSION: 4
+        MARKETING_VERSION: "1.3.0"
+        CURRENT_PROJECT_VERSION: 5
         SWIFT_VERSION: "6.0"
         SWIFT_EMIT_LOC_STRINGS: YES
         SWIFT_OBJC_BRIDGING_HEADER: Cadenza/BridgingHeader.h
@@ -94,8 +94,8 @@ targets:
       properties:
         CFBundleName: $(APP_BUNDLE_NAME)
         CFBundleDisplayName: $(APP_BUNDLE_DISPLAY_NAME)
-        CFBundleShortVersionString: "1.2.1"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "1.3.0"
+        CFBundleVersion: "5"
         LSMinimumSystemVersion: "26.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSAudioCaptureUsageDescription: "Cadenza captures system audio from meeting apps to create recordings, transcripts, and summaries."

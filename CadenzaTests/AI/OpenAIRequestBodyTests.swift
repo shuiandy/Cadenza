@@ -33,6 +33,45 @@ struct OpenAIRequestBodyTests {
         #expect(body["stream"] as? Bool == true)
     }
 
+    @Test func gpt6SolKeepsDefaultReasoningForSummaryAndDropsItForChat() {
+        let summary = OpenAIService.makeRequestBody(
+            provider: .openai,
+            modelID: "gpt-6-sol",
+            messages: messages,
+            purpose: .summary
+        )
+        #expect(summary["reasoning_effort"] == nil)
+        #expect(summary["temperature"] == nil)
+
+        let chat = OpenAIService.makeRequestBody(
+            provider: .openai,
+            modelID: "gpt-6-sol",
+            messages: messages,
+            purpose: .chat,
+            stream: true
+        )
+        #expect(chat["reasoning_effort"] as? String == "none")
+        #expect(chat["temperature"] == nil)
+    }
+
+    @Test func gpt6AstraChatUsesLowBecauseItRejectsNone() {
+        let body = OpenAIService.makeRequestBody(
+            provider: .openai,
+            modelID: "gpt-6-astra",
+            messages: messages,
+            purpose: .chat
+        )
+
+        #expect(body["reasoning_effort"] as? String == "low")
+        #expect(body["temperature"] == nil)
+    }
+
+    @Test func unverifiedOpenAIModelGetsNoReasoningField() {
+        #expect(OpenAIService.lowestReasoningEffort(modelID: "gpt-6-terra") == nil)
+        #expect(OpenAIService.lowestReasoningEffort(modelID: "gpt-6-sol-preview") == nil)
+        #expect(OpenAIService.lowestReasoningEffort(modelID: "gpt-5.6-sol") == "none")
+    }
+
     @Test func legacyOpenAIModelOmitsOptionalSampling() {
         let body = OpenAIService.makeRequestBody(
             provider: .openai,
@@ -48,7 +87,7 @@ struct OpenAIRequestBodyTests {
     @Test func minimaxCompatibleEndpointIsNotGivenOpenAIReasoningFields() {
         let body = OpenAIService.makeRequestBody(
             provider: .minimax,
-            modelID: "MiniMax-M2.7-highspeed",
+            modelID: "MiniMax-M3",
             messages: messages,
             purpose: .chat,
             stream: true

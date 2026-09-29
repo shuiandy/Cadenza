@@ -16,7 +16,7 @@ final class ClaudeService: AIServiceProtocol {
         let modelID = model ?? provider.summaryModel
         let systemPrompt = SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel)
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": modelID,
             "max_tokens": Self.summaryOutputBudget(model: modelID, detailLevel: detailLevel),
             "system": Self.cacheableSystem(systemPrompt),
@@ -24,6 +24,7 @@ final class ClaudeService: AIServiceProtocol {
                 ["role": "user", "content": SummaryPrompt.user(transcript: transcript)]
             ]
         ]
+        body.merge(Self.thinkingFields(model: modelID, effort: Self.summaryEffort)) { _, new in new }
 
         let data = try await postJSON(body)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -47,24 +48,73 @@ final class ClaudeService: AIServiceProtocol {
     func streamSummaryCompletion(systemPrompt: String, userMessage: String, model: String?, detailLevel: SummaryDetailLevel) -> AsyncThrowingStream<String, Error> {
         let modelID = model ?? provider.summaryModel
         return streamMessages(systemPrompt: systemPrompt, messages: [["role": "user", "content": userMessage]], model: modelID,
-                              maxTokens: Self.summaryOutputBudget(model: modelID, detailLevel: detailLevel), requireCompleteSummary: true)
+                              maxTokens: Self.summaryOutputBudget(model: modelID, detailLevel: detailLevel),
+                              effort: Self.summaryEffort, requireCompleteSummary: true)
     }
 
     func streamChat(systemPrompt: String, userMessage: String, model: String?) -> AsyncThrowingStream<String, Error> {
-        streamMessages(systemPrompt: systemPrompt, messages: [["role": "user", "content": userMessage]],
-                       model: model ?? provider.summaryModel, maxTokens: 4096)
+        let modelID = model ?? provider.summaryModel
+        return streamMessages(systemPrompt: systemPrompt, messages: [["role": "user", "content": userMessage]],
+                              model: modelID, maxTokens: Self.chatOutputBudget(model: modelID), effort: Self.chatEffort)
     }
 
     func streamChat(systemPrompt: String, history: [ChatMessage], model: String?) -> AsyncThrowingStream<String, Error> {
         guard !history.isEmpty else { return AsyncThrowingStream { $0.finish() } }
+        let modelID = model ?? provider.summaryModel
         return streamMessages(systemPrompt: systemPrompt, messages: Self.encodeMessages(history),
-                              model: model ?? provider.summaryModel, maxTokens: 4096)
+                              model: modelID, maxTokens: Self.chatOutputBudget(model: modelID), effort: Self.chatEffort)
+    }
+
+    // MARK: - Model request shape
+
+    /// Generations verified to share one request surface: omitting `thinking`
+    /// runs adaptive thinking, `output_config.effort` is accepted, sampling
+    /// parameters are rejected and output reaches 128K. Exact IDs only, so a
+    /// new model has to be checked before it inherits this shape.
+    /// https://platform.claude.com/docs/en/about-claude/models/overview
+    static let adaptiveThinkingModels: Set<String> = [
+        "claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5", "claude-opus-5-5",
+        "claude-fable-5", "claude-fable-5-1",
+    ]
+
+    /// Sonnet 5 at medium effort matched Sonnet 4.6 at its default high effort,
+    /// which is what summaries were tuned on. Sonnet 5.5 recalibrates effort, so
+    /// it was re-measured on hour-long fictional meetings (2026-09-28): high
+    /// thought about 70% more and cost 27% more with no gain in rubric coverage,
+    /// so medium stays.
+    static let summaryEffort = "medium"
+    /// Chat is latency-first; low effort still thinks on hard questions.
+    static let chatEffort = "low"
+
+    static func usesAdaptiveThinking(_ model: String) -> Bool {
+        adaptiveThinkingModels.contains(model)
+    }
+
+    /// Makes the thinking and effort choice explicit for adaptive models; other
+    /// models keep the thinking-off request they were tuned with.
+    static func thinkingFields(model: String, effort: String) -> [String: Any] {
+        guard usesAdaptiveThinking(model) else { return [:] }
+        return ["thinking": ["type": "adaptive"], "output_config": ["effort": effort]]
+    }
+
+    /// `max_tokens` bounds thinking and answer together on adaptive models.
+    static func chatOutputBudget(model: String) -> Int {
+        usesAdaptiveThinking(model) ? 16384 : 4096
     }
 
     /// Explicitly verified model families; unknown/older models keep the conservative limit.
+    /// Adaptive models get headroom for thinking, and their tokenizer counts
+    /// about 30% more tokens for the same summary text.
     /// https://platform.claude.com/docs/en/models/sonnet-4-6/overview
     /// https://platform.claude.com/docs/en/models/haiku-4-5/overview
     static func summaryOutputBudget(model: String, detailLevel: SummaryDetailLevel) -> Int {
+        if usesAdaptiveThinking(model) {
+            switch detailLevel {
+            case .highlights: return 16384
+            case .detailed: return 24576
+            case .fullBreakdown: return 32768
+            }
+        }
         let supported = ["claude-sonnet-4-6", "claude-haiku-4-5"]
             .contains { model == $0 || model.hasPrefix($0 + "-") }
         guard supported else { return 4096 }
@@ -82,14 +132,16 @@ final class ClaudeService: AIServiceProtocol {
         }
     }
 
-    private func streamMessages(systemPrompt: String, messages: [[String: Any]], model: String, maxTokens: Int, requireCompleteSummary: Bool = false) -> AsyncThrowingStream<String, Error> {
+    private func streamMessages(systemPrompt: String, messages: [[String: Any]], model: String, maxTokens: Int, effort: String, requireCompleteSummary: Bool = false) -> AsyncThrowingStream<String, Error> {
         // Serialize before crossing into the task: [String: Any] is not Sendable.
         let events: AsyncThrowingStream<String, Error>
         do {
-            events = try postStreamJSON([
+            var body: [String: Any] = [
                 "model": model, "max_tokens": maxTokens,
                 "system": Self.cacheableSystem(systemPrompt), "messages": messages, "stream": true
-            ])
+            ]
+            body.merge(Self.thinkingFields(model: model, effort: effort)) { _, new in new }
+            events = try postStreamJSON(body)
         } catch {
             return AsyncThrowingStream { $0.finish(throwing: error) }
         }
@@ -133,7 +185,8 @@ final class ClaudeService: AIServiceProtocol {
     /// Anthropic prompt-caching is a prefix match — repeated requests with an identical
     /// system prefix served from cache cost ~0.1× and skip first-token latency.
     /// Minimum cacheable prefix differs by model:
-    ///   Sonnet 4.6 (summary default):     ≥2048 tokens
+    ///   Sonnet 5.5 (summary default):     ≥512 tokens
+    ///   Sonnet 5:                         ≥1024 tokens
     ///   Haiku 4.5  (chat default):        ≥4096 tokens
     /// Shorter prefixes silently don't cache (no error). Chat system prompts typically
     /// run 2-5K tokens including RECORDING SUMMARIES, so on Haiku we may miss cache for

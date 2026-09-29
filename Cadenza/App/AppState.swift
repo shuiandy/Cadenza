@@ -925,6 +925,9 @@ final class AppState {
         // Wire RecordingEngine lifecycle callbacks
         recordingEngine.onRecordingStarted = { [weak self] in
             guard let self else { return }
+            // The engine has persisted the new row before publishing this event.
+            // Refresh now so returning home during capture keeps its entry visible.
+            refreshRecordings()
             showRecordingOverlay = true
             overlayController.show(appState: self)
             if let recID = recordingEngine.currentRecordingID {
@@ -3511,6 +3514,13 @@ final class AppState {
     /// 不清 `searchQuery`——从搜索结果点进详情再返回，搜索词得还在。
     func present(_ destination: NavigationDestination) {
         guard activeDestination != destination else { return }
+        // Consecutive meetings share one detail slot. Keep the original library,
+        // folder or recap underneath instead of building a history of recordings.
+        if case .recordingDetail = activeDestination,
+           case .recordingDetail = destination {
+            setActiveDestination(destination)
+            return
+        }
         navigationReturnStack.append(activeDestination)
         if navigationReturnStack.count > Self.maxReturnStackDepth {
             navigationReturnStack.removeFirst()

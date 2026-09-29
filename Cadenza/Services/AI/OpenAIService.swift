@@ -209,16 +209,13 @@ final class OpenAIService: AIServiceProtocol {
             }
         }
 
-        let isOpenAIGPT56 = provider == .openai
-            && (modelID == "gpt-5.6" || modelID.hasPrefix("gpt-5.6-"))
-        if isOpenAIGPT56 {
-            // GPT-5.6 defaults to medium reasoning. Preserve that quality-first
-            // default for summaries, while keeping chat at the prior mini
-            // model's latency baseline. Sampling parameters are deliberately
-            // omitted for the new reasoning family.
-            if purpose == .chat {
-                body["reasoning_effort"] = "none"
-            }
+        // GPT-5.6 and GPT-6 default to medium reasoning. Preserve that
+        // quality-first default for summaries, while keeping chat at the prior
+        // mini model's latency baseline. Sampling parameters are deliberately
+        // omitted for these reasoning families.
+        if provider == .openai, purpose == .chat,
+           let effort = Self.lowestReasoningEffort(modelID: modelID) {
+            body["reasoning_effort"] = effort
         }
 
         // OpenAI's remotely discovered model list can include models that only
@@ -230,6 +227,18 @@ final class OpenAIService: AIServiceProtocol {
         }
 
         return body
+    }
+
+    /// Lowest `reasoning_effort` each verified reasoning model accepts. GPT-6
+    /// Astra rejects `none`; unlisted models get no reasoning field at all.
+    /// https://developers.openai.com/api/docs/guides/latest-model
+    static func lowestReasoningEffort(modelID: String) -> String? {
+        if modelID == "gpt-5.6" || modelID.hasPrefix("gpt-5.6-") { return "none" }
+        switch modelID {
+        case "gpt-6-sol", "gpt-6-luna": return "none"
+        case "gpt-6-astra": return "low"
+        default: return nil
+        }
     }
 
     private func postJSON(_ body: [String: Any]) async throws -> Data {

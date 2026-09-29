@@ -240,4 +240,37 @@ import Testing
         }
         #expect(state.navigationReturnStack.count <= 8)
     }
+
+    @Test func consecutiveMeetingsCloseToHomeInOneStep() {
+        let state = AppState(startupPolicy: .testHost)
+        state.navigate(to: .allRecordings)
+        for index in 0..<12 {
+            state.openRecordingDetail(recordingID: UUID(), title: "Meeting \(index)")
+        }
+
+        #expect(state.navigationReturnStack == [.allRecordings])
+        state.closeDetail()
+        #expect(state.activeDestination == .allRecordings)
+        #expect(state.navigationReturnStack.isEmpty)
+        #expect(state.recordingDetailTitle == nil)
+    }
+
+    @Test func replacingRecordingDetailKeepsItsOriginalContext() {
+        let origins: [NavigationDestination] = [.folder(UUID()), .tag("Planning"), .recapDetail(UUID())]
+        for origin in origins {
+            let state = AppState(startupPolicy: .testHost)
+            state.navigate(to: origin)
+            state.searchQuery = "Planning"
+            state.openRecordingDetail(recordingID: UUID(), title: "First meeting")
+            let latest = UUID()
+            state.openRecordingDetail(recordingID: latest, title: "Latest meeting")
+
+            #expect(state.activeDestination == .recordingDetail(latest))
+            #expect(state.recordingDetailTitle == "Latest meeting")
+            #expect(ContentView.rootDestination(for: state.activeDestination, returnStack: state.navigationReturnStack) == origin)
+            state.closeDetail()
+            #expect(state.activeDestination == origin)
+            #expect(state.searchQuery == "Planning")
+        }
+    }
 }

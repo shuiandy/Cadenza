@@ -773,9 +773,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "gemini-3.1-flash-lite-preview"
         ]
 
+        // Remove rather than rewrite: writing today's default here would pin
+        // it as an override, so the next default upgrade would skip the user.
         if let savedModel = defaults.string(forKey: "model.gemini"),
            legacyDefaultModels.contains(savedModel) {
-            defaults.set(AIProvider.gemini.defaultModel, forKey: "model.gemini")
+            defaults.removeObject(forKey: "model.gemini")
         }
 
         // transcriptionModel.<provider> was a dead key for several releases

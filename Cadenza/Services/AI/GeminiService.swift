@@ -16,15 +16,14 @@ final class GeminiService: AIServiceProtocol {
         let modelID = model ?? provider.summaryModel
         let url = try endpointURL(modelID: modelID, streaming: false)
 
+        // No generationConfig: Gemini deprecated temperature/top_p/top_k on
+        // 2026-07-21 and the 3.8 Flash migration guide says to strip them.
         let body: [String: Any] = [
             "system_instruction": [
                 "parts": [["text": SummaryPrompt.system(language: language, jobTitle: jobTitle, meetingType: meetingType, meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel)]]
             ],
             "contents": [
                 ["role": "user", "parts": [["text": SummaryPrompt.user(transcript: transcript)]]]
-            ],
-            "generationConfig": [
-                "temperature": 0.3
             ]
         ]
 
@@ -53,8 +52,7 @@ final class GeminiService: AIServiceProtocol {
                     let url = try endpointURL(modelID: model ?? provider.summaryModel, streaming: true)
                     let body: [String: Any] = [
                         "system_instruction": ["parts": [["text": systemPrompt]]],
-                        "contents": [["role": "user", "parts": [["text": userMessage]]]],
-                        "generationConfig": ["temperature": 0.3]
+                        "contents": [["role": "user", "parts": [["text": userMessage]]]]
                     ]
                     var reason: String?
                     for try await payload in try postStreamJSON(url: url, body: body) {
@@ -93,9 +91,6 @@ final class GeminiService: AIServiceProtocol {
                         ],
                         "contents": [
                             ["role": "user", "parts": [["text": userMessage]]]
-                        ],
-                        "generationConfig": [
-                            "temperature": 0.3
                         ]
                     ]
 
