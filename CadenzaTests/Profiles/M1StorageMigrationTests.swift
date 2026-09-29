@@ -61,26 +61,29 @@ struct M1StorageMigrationTests {
     /// (retained), and an already-relative row. Plus one chat session file.
     @MainActor
     private func populateSource(_ fixture: Fixture) throws {
-        let container = try ModelContainer(
-            for: RecordingsStore.schema,
-            configurations: ModelConfiguration(url: fixture.paths.legacyStoreURL)
-        )
-        let context = ModelContext(container)
+        try autoreleasepool {
+            let container = try ModelContainer(
+                for: RecordingsStore.schema,
+                configurations: ModelConfiguration(url: fixture.paths.legacyStoreURL)
+            )
+            let context = ModelContext(container)
 
-        let inRoot = Recording(id: UUID(), title: "in-root")
-        inRoot.audioFilePath = fixture.audioRoot.appendingPathComponent("a/one.m4a").path
-        inRoot.audioSegmentsDirectory = fixture.audioRoot.appendingPathComponent("a/segments").path
-        context.insert(inRoot)
+            let inRoot = Recording(id: UUID(), title: "in-root")
+            inRoot.audioFilePath = fixture.audioRoot.appendingPathComponent("a/one.m4a").path
+            inRoot.audioSegmentsDirectory = fixture.audioRoot.appendingPathComponent("a/segments").path
+            context.insert(inRoot)
 
-        let outOfRoot = Recording(id: UUID(), title: "out-of-root")
-        outOfRoot.audioFilePath = "/elsewhere/two.m4a"
-        context.insert(outOfRoot)
+            let outOfRoot = Recording(id: UUID(), title: "out-of-root")
+            outOfRoot.audioFilePath = "/elsewhere/two.m4a"
+            context.insert(outOfRoot)
 
-        let alreadyRelative = Recording(id: UUID(), title: "relative")
-        alreadyRelative.audioFilePath = "rel/three.m4a"
-        context.insert(alreadyRelative)
+            let alreadyRelative = Recording(id: UUID(), title: "relative")
+            alreadyRelative.audioFilePath = "rel/three.m4a"
+            context.insert(alreadyRelative)
 
-        try context.save()
+            try context.save()
+        }
+        try waitForSQLiteWriteLockRelease(at: fixture.paths.legacyStoreURL)
 
         try FileManager.default.createDirectory(
             at: fixture.paths.legacyChatHistoryDirectory, withIntermediateDirectories: true

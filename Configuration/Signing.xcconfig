@@ -9,7 +9,8 @@
 //
 // The team ID is personal and this repository is being prepared for public
 // release, so it lives in an untracked file instead. Copy
-// Signing.local.xcconfig.example to Signing.local.xcconfig and fill in your
-// own DEVELOPMENT_TEAM. The optional include below keeps a fresh clone
+// Signing.local.xcconfig.example to Signing.local.xcconfig in the repository
+// root and fill in your own DEVELOPMENT_TEAM. Xcode resolves the path below
+// relative to this file. The include is optional so a fresh clone keeps
 // building (ad-hoc, with the caveats above) when that file is absent.
-#include? "Signing.local.xcconfig"
+#include? "../Signing.local.xcconfig"

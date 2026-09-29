@@ -605,12 +605,18 @@ OpenAI `gpt-4o-transcribe-diarize` 使用 `diarized_json` response format（不�
 | TCP keepalive | 30s |
 | 单次 raw send deadline | 10s |
 | audio-stream-end deadline | 2s |
-| 音频格式 | `audio/pcm;rate=16000` |
+| 音频格式 | `audio/pcm;rate=24000`（跟随 `AudioConverter.transcriptionFormat`） |
 | responseModalities | `["TEXT"]`（专用 ASR；旧对话模型走 `["AUDIO"]`） |
 | 转录配置 | `inputAudioTranscription: { languageCodes: [...] }` |
-| 会话上限 | 10 分钟（到点断开，走 RecordingEngine 重连轮转） |
+| 会话上限 | 约 10 分钟；约 540s 时服务端发 `goAway`（`timeLeft` 约 50s），transcriber 内部轮换连接 |
+| goAway 轮换 | 替换连接每次尝试共用 startup deadline，最多 3 次、间隔 1s；无 `timeLeft` 时按 30s 计 |
+| 旧连接排空窗口 | 3s（flush 后收到定稿即提前结束；2026-09-28 实测句中切换约 0.4s 回定稿，静音处切换等满窗口） |
 
 转录文本提取优先级：`inputTranscription` → `interimInputTranscription` → `outputTranscription`。不使用 `modelTurn`（那是模型的语音回复，不是转录结果）。两代模型对 `inputTranscription` 的语义不同：专用 ASR 把它当作**整句定稿**（interim 走单独字段，且每条 delta 是整句重写，故打 `replacesHypothesis`），旧对话模型把它当作**增量**、靠 `turnComplete` 判定终态。`GeminiRealtimeTranscriber.usesDedicatedTranscription` 按 model ID 里是否含 `transcribe` 分流。实现为 actor，不再依赖 legacy `@unchecked Sendable`；raw send/receive 的 callback、deadline、caller cancellation 共享 resume-once 状态，timeout/cancel 只撤销本 session 的 exact transport。stop 先 finish stream、取消 retained receive task 和 transport，绝不等待 WebSocket close frame。startup catch 还会同时校验 generation 与 transport identity，A 的迟到失败不能撤销复用同一 service 实例后的 B。
+
+`goAway` 是计划内轮换，不是故障：收到后 transcriber 在同一条 transcript stream 背后另开一条连接（经 `GeminiEphemeralTokenProvider` 复用或新签 token，重放同一份 setup，等 `setupComplete`），此前音频仍发往旧连接。新连接就绪后音频立即切过去，旧连接收 `audioStreamEnd` 进入排空：它的文本照常先送出，新连接的 delta 暂存到旧连接落定（flush 后收到定稿、服务端关闭或排空窗口到期）再按序放出；旧连接没来得及定稿的专用 ASR 假设会补发成 final，避免被新连接的 interim 原地覆盖。随后旧连接发 1000 close frame 再断开。整个过程 stream 不结束，`onRealtimeFailure` 不触发，RecordingEngine 的重连额度与中断提示都不受影响。替换连接在 `timeLeft` 内没就绪时，stream 以错误结束，交回 RecordingEngine 现有的失败重连路径。轮换期间两条 socket 同时读帧，所以接收缓冲与分片缓冲按 transport identity 分开存放。
+
+服务端的 JSON 消息用**二进制帧**（opcode 0x02）发送，`setupComplete` 也是。文本帧与二进制帧同样按 UTF-8 解码，解码失败才算非法帧；2026-07-12 的传输加固曾把二进制帧一律拒掉，导致建连必败，直到 2026-09-28 实测才发现。
 
 注意：`gemini-3.5-transcribe-live` 之前用的是对话模型，转录只是 `inputAudioTranscription` 的附带产物，质量与延迟都明显吃亏；换成专用 ASR 后这条不再成立。代价是 live 会话不支持 diarization 与词级时间戳，且单次上限 10 分钟。
 

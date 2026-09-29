@@ -22,12 +22,18 @@ configs:
   Release: release
 
 # Signing identity comes from an untracked local file so no personal team ID
-# is committed. See Signing.xcconfig for why an unsigned Debug build breaks
-# TCC grants and keychain ACLs.
+# is committed. See Configuration/Signing.xcconfig for why an unsigned Debug
+# build breaks TCC grants and keychain ACLs.
+#
+# Keep config files out of the repository root. XcodeGen files each one under
+# a group named after its parent directory, so a root-level file lands in a
+# group named after the checkout folder and the generated project differs
+# between clones (CI checks out into Cadenza-internal, worktrees use their own
+# names).
 configFiles:
-  Debug: Signing.xcconfig
-  Test Debug: Signing.xcconfig
-  Release: Signing.xcconfig
+  Debug: Configuration/Signing.xcconfig
+  Test Debug: Configuration/Signing.xcconfig
+  Release: Configuration/Signing.xcconfig
 
 packages:
   KeychainAccess:
@@ -66,8 +72,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.shuiandy.Cadenza
         APP_BUNDLE_NAME: Cadenza
         APP_BUNDLE_DISPLAY_NAME: Cadenza
-        MARKETING_VERSION: "1.2.0"
-        CURRENT_PROJECT_VERSION: 3
+        MARKETING_VERSION: "1.2.1"
+        CURRENT_PROJECT_VERSION: 4
         SWIFT_VERSION: "6.0"
         SWIFT_EMIT_LOC_STRINGS: YES
         SWIFT_OBJC_BRIDGING_HEADER: Cadenza/BridgingHeader.h
@@ -88,8 +94,8 @@ targets:
       properties:
         CFBundleName: $(APP_BUNDLE_NAME)
         CFBundleDisplayName: $(APP_BUNDLE_DISPLAY_NAME)
-        CFBundleShortVersionString: "1.2.0"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "1.2.1"
+        CFBundleVersion: "4"
         LSMinimumSystemVersion: "26.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSAudioCaptureUsageDescription: "Cadenza captures system audio from meeting apps to create recordings, transcripts, and summaries."
