@@ -207,9 +207,59 @@ struct HardenedAITransportTests {
         let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let expected: Int = level == .highlights ? 4096 : level == .detailed ? 8192 : 16384
         #expect(body["max_tokens"] as? Int == expected)
+        // Sonnet 4.6 was tuned thinking-off; it must not inherit the adaptive shape.
+        #expect(body["thinking"] == nil)
+        #expect(body["output_config"] == nil)
         for try await _ in service.streamChat(systemPrompt: "fixture", userMessage: "hello", model: "claude-sonnet-4-6") {}
         let chat = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "api.anthropic.com")?.body)
         #expect((try JSONSerialization.jsonObject(with: chat) as? [String: Any])?["max_tokens"] as? Int == 4096)
+    }
+
+    @Test(arguments: SummaryDetailLevel.allCases)
+    func claudeAdaptiveModelPinsEffortAndLeavesThinkingHeadroom(level: SummaryDetailLevel) async throws {
+        AITransportTestURLProtocol.reset()
+        let service: any AIServiceProtocol = ClaudeService(apiKey: "fixture-key", transport: makeTransport())
+        var summary = ""
+        for try await chunk in service.streamSummaryCompletion(systemPrompt: "fixture", userMessage: "fictional meeting", model: "claude-sonnet-5-5", detailLevel: level) {
+            summary += chunk
+        }
+        #expect(summary == "claude")
+        let data = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "api.anthropic.com")?.body)
+        let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let expected: Int = level == .highlights ? 16384 : level == .detailed ? 24576 : 32768
+        #expect(body["max_tokens"] as? Int == expected)
+        #expect((body["thinking"] as? [String: Any])?["type"] as? String == "adaptive")
+        #expect((body["output_config"] as? [String: Any])?["effort"] as? String == "medium")
+        #expect(body["temperature"] == nil)
+
+        for try await _ in service.streamChat(systemPrompt: "fixture", userMessage: "hello", model: "claude-sonnet-5-5") {}
+        let chatData = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "api.anthropic.com")?.body)
+        let chat = try #require(JSONSerialization.jsonObject(with: chatData) as? [String: Any])
+        #expect(chat["max_tokens"] as? Int == 16384)
+        #expect((chat["output_config"] as? [String: Any])?["effort"] as? String == "low")
+    }
+
+    @Test func claudeAdaptiveShapeIsLimitedToVerifiedModelIDs() {
+        #expect(AIProvider.claude.defaultModel == "claude-sonnet-5-5")
+        #expect(ClaudeService.usesAdaptiveThinking(AIProvider.claude.defaultModel))
+        // A Sonnet 5 pinned in Settings keeps the request shape it shipped with.
+        #expect(ClaudeService.usesAdaptiveThinking("claude-sonnet-5"))
+        #expect(ClaudeService.usesAdaptiveThinking("claude-opus-5-5"))
+        #expect(!ClaudeService.usesAdaptiveThinking(AIProvider.claude.defaultChatModel))
+        #expect(!ClaudeService.usesAdaptiveThinking("claude-sonnet-5-1"))
+        #expect(ClaudeService.thinkingFields(model: "claude-haiku-4-5", effort: "low").isEmpty)
+        #expect(ClaudeService.chatOutputBudget(model: "claude-haiku-4-5") == 4096)
+    }
+
+    @Test func geminiRequestsLeaveDeprecatedSamplingToTheModel() async throws {
+        AITransportTestURLProtocol.reset()
+        let service = GeminiService(apiKey: "fixture-key", transport: makeTransport())
+        _ = try await service.summarize(transcript: "fictional", language: "en", model: nil, knownTags: [])
+        let buffered = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "generativelanguage.googleapis.com")?.body)
+        #expect((try JSONSerialization.jsonObject(with: buffered) as? [String: Any])?["generationConfig"] == nil)
+        for try await _ in service.streamChat(systemPrompt: "fixture", userMessage: "hello", model: nil) {}
+        let chat = try #require(AITransportTestURLProtocol.capturedRequest(forHost: "generativelanguage.googleapis.com")?.body)
+        #expect((try JSONSerialization.jsonObject(with: chat) as? [String: Any])?["generationConfig"] == nil)
     }
 
     @Test(arguments: ["max_tokens", "model_context_window_exceeded", "refusal", "missing_reason", "missing_stop"])
@@ -653,7 +703,13 @@ private final class AITransportTestURLProtocol: URLProtocol {
             switch provider {
             case "claude":
                 let reason = Self.state.withLock { $0.claudeTermination }
-                var frames = ["data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"claude\"}}"]
+                // Adaptive models stream a thinking block ahead of the text;
+                // only text deltas may reach the caller.
+                var frames = [
+                    #"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"fictional reasoning"}}"#,
+                    #"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+                    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"claude\"}}",
+                ]
                 if reason != "missing_reason" {
                     let stop = ["missing_stop", "usage_after_stop"].contains(reason) ? "end_turn" : reason
                     frames.append("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\(stop)\"}}")
@@ -678,7 +734,13 @@ private final class AITransportTestURLProtocol: URLProtocol {
         let object: [String: Any]
         switch provider {
         case "claude":
-            object = ["content": [["type": "text", "text": summary]], "stop_reason": Self.state.withLock { $0.claudeTermination }]
+            object = [
+                "content": [
+                    ["type": "thinking", "thinking": "fictional reasoning", "signature": "sig"],
+                    ["type": "text", "text": summary],
+                ],
+                "stop_reason": Self.state.withLock { $0.claudeTermination },
+            ]
         case "gemini":
             let reason = Self.state.withLock { $0.summaryTermination }
             object = ["candidates": [["content": ["parts": [["text": summary]]], "finishReason": reason == "stop" ? "STOP" : reason]]]

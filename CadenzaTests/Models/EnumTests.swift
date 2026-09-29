@@ -33,8 +33,8 @@ struct EnumTests {
     }
 
     @Test func aiProviderDefaultModel() {
-        #expect(AIProvider.openai.defaultModel == "gpt-5.6-sol")
-        #expect(AIProvider.openai.defaultChatModel == "gpt-5.6-terra")
+        #expect(AIProvider.openai.defaultModel == "gpt-6-sol")
+        #expect(AIProvider.openai.defaultChatModel == "gpt-6-sol")
         #expect(!AIProvider.claude.defaultModel.isEmpty)
         #expect(!AIProvider.gemini.defaultModel.isEmpty)
     }
@@ -46,8 +46,8 @@ struct EnumTests {
     }
 
     @Test func geminiDefaultsUseCurrentStableModel() {
-        #expect(AIProvider.gemini.defaultModel == "gemini-3.7-flash")
-        #expect(AIProvider.gemini.defaultChatModel == "gemini-3.7-flash")
+        #expect(AIProvider.gemini.defaultModel == "gemini-3.8-flash")
+        #expect(AIProvider.gemini.defaultChatModel == "gemini-3.8-flash")
         // Transcription no longer borrows the flash model: it runs on the
         // dedicated ASR, which also decides that the batch path speaks the
         // Interactions API rather than generateContent.

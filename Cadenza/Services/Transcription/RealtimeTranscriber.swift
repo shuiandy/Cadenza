@@ -1,212 +1,196 @@
 import Foundation
 
-/// Real-time transcription using OpenAI Realtime API over WebSocket.
-/// Streams 24kHz mono PCM16 audio and receives incremental transcript deltas.
-final class RealtimeTranscriber: TranscriptionService, @unchecked Sendable {
-    private actor SessionState {
-        private var sessionReady = false
-        private var didLogWaitingForSession = false
+/// One connection boundary, injectable without credentials or live audio.
+struct OpenAIRealtimeTransport: Sendable {
+    let send: @Sendable (String) async throws -> Void
+    let receive: @Sendable () async throws -> String
+    let cancel: @Sendable () -> Void
 
-        func reset() {
-            sessionReady = false
-            didLogWaitingForSession = false
-        }
-
-        func markReady() {
-            sessionReady = true
-            didLogWaitingForSession = false
-        }
-
-        func snapshot() -> (sessionReady: Bool, didLogWaitingForSession: Bool) {
-            (sessionReady, didLogWaitingForSession)
-        }
-
-        func markWaitingLogged() {
-            didLogWaitingForSession = true
-        }
+    static func connect(apiKey: String) -> Self {
+        let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let session = URLSession(configuration: .default)
+        let task = session.webSocketTask(with: request)
+        task.resume()
+        return Self(
+            send: { try await task.send(.string($0)) },
+            receive: {
+                switch try await task.receive() {
+                case .string(let text): return text
+                case .data(let data): return String(decoding: data, as: UTF8.self)
+                @unknown default: return ""
+                }
+            },
+            cancel: {
+                task.cancel(with: .normalClosure, reason: nil)
+                session.invalidateAndCancel()
+            }
+        )
     }
+}
 
+/// Real-time transcription using OpenAI Realtime API over WebSocket.
+/// Each manager attempt owns a fresh, single-use instance.
+actor RealtimeTranscriber: TranscriptionService {
     private let apiKey: String
     private let model: String
-    private var webSocketTask: URLSessionWebSocketTask?
+    private let transportForTesting: OpenAIRealtimeTransport?
+    private let startupTimeout: Duration
+    private var transport: OpenAIRealtimeTransport?
     private var continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
-    private let session: URLSession
-    private let sessionState = SessionState()
+    private var receiveTask: Task<Void, Never>?
+    private var hasStarted = false
+    private var isStopping = false
+    private var sessionReady = false
+    private var sessionFailure: Error?
     private var lastCommitAt = Date.distantPast
     private var bytesSinceCommit = 0
     private var loggedEventTypes: Set<String> = []
     private var didLogCommitTooSmall = false
 
-    init(apiKey: String, model: String) {
+    init(
+        apiKey: String,
+        model: String,
+        transportForTesting: OpenAIRealtimeTransport? = nil,
+        startupTimeout: Duration = .seconds(10)
+    ) {
         self.apiKey = apiKey
         self.model = model
-        self.session = URLSession(configuration: .default)
+        self.transportForTesting = transportForTesting
+        self.startupTimeout = startupTimeout
     }
 
-    // MARK: - Real-time Session
+    /// Explicit supported profile; an arbitrary model name isn't a capability.
+    private var usesLiveTranscription: Bool { model == "gpt-live-transcribe" }
 
-    func startRealtimeSession(language: String?) async throws -> AsyncThrowingStream<TranscriptDelta, Error> {
-        let url = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-
-        let task = session.webSocketTask(with: request)
-        self.webSocketTask = task
-        task.resume()
-        RealtimeDebugLog.shared.append("OpenAI: WS connecting to \(url.absoluteString)")
-        await sessionState.reset()
-        lastCommitAt = Date()
-        bytesSinceCommit = 0
-        didLogCommitTooSmall = false
-
-        // Realtime transcription sessions use the nested audio.input schema.
-        var transcriptionConfig: [String: Any] = [
-            "model": model
-        ]
-        if let language, !language.isEmpty {
-            transcriptionConfig["language"] = language
-        }
-
-        let sessionConfig: [String: Any] = [
-            "type": "session.update",
-            "session": [
-                "type": "transcription",
-                "audio": [
-                    "input": [
-                        "format": [
-                            "type": "audio/pcm",
-                            "rate": 24000
-                        ],
-                        "noise_reduction": [
-                            "type": "near_field"
-                        ],
-                        "transcription": transcriptionConfig,
-                        "turn_detection": [
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500
-                        ] as [String: Any]
-                    ] as [String: Any]
-                ] as [String: Any],
-                "include": ["item.input_audio_transcription.logprobs"]
-            ] as [String: Any]
-        ]
-
-        let configData = try JSONSerialization.data(withJSONObject: sessionConfig)
-        let configString = String(data: configData, encoding: .utf8)!
-        try await task.send(.string(configString))
-        RealtimeDebugLog.shared.append("OpenAI: sent session config")
-
-        // Create stream and start receive loop
-        let stream = AsyncThrowingStream<TranscriptDelta, Error> { continuation in
-            self.continuation = continuation
-            Task { [weak self] in
-                await self?.receiveMessages()
+    private func sessionConfiguration(language: String?) -> [String: Any] {
+        var transcription: [String: Any] = ["model": model]
+        if let language, !language.isEmpty, language != "auto" {
+            if usesLiveTranscription {
+                transcription["languages"] = [language]
+            } else {
+                transcription["language"] = language
             }
         }
-
-        // Wait for session to be ready before returning (so sendAudio won't silently drop chunks)
-        for _ in 0..<100 {  // up to 10 seconds
-            let state = await sessionState.snapshot()
-            if state.sessionReady { break }
-            try await Task.sleep(for: .milliseconds(100))
+        var input: [String: Any] = [
+            "format": ["type": "audio/pcm", "rate": 24000],
+            "noise_reduction": ["type": "near_field"],
+            "transcription": transcription
+        ]
+        var session: [String: Any] = ["type": "transcription"]
+        if usesLiveTranscription {
+            input["turn_detection"] = NSNull()
+        } else {
+            input["turn_detection"] = [
+                "type": "server_vad", "threshold": 0.5,
+                "prefix_padding_ms": 300, "silence_duration_ms": 500
+            ] as [String: Any]
+            session["include"] = ["item.input_audio_transcription.logprobs"]
         }
+        session["audio"] = ["input": input]
+        return ["type": "session.update", "session": session]
+    }
 
-        let finalState = await sessionState.snapshot()
-        if !finalState.sessionReady {
-            RealtimeDebugLog.shared.append("OpenAI: TIMEOUT waiting for session.created (got \(RealtimeDebugLog.shared.entries.count) events)")
-            try await stopRealtimeSession()
-            throw TranscriptionError.apiError("OpenAI transcription session timed out waiting for session.created")
+    func startRealtimeSession(language: String?) async throws -> AsyncThrowingStream<TranscriptDelta, Error> {
+        guard !hasStarted, !isStopping else { throw CancellationError() }
+        hasStarted = true
+        try Task.checkCancellation()
+        let connection = transportForTesting ?? OpenAIRealtimeTransport.connect(apiKey: apiKey)
+        transport = connection
+        lastCommitAt = Date()
+        let pair = AsyncThrowingStream<TranscriptDelta, Error>.makeStream()
+        continuation = pair.continuation
+        do {
+            let config = try JSONSerialization.data(withJSONObject: sessionConfiguration(language: language))
+            try await connection.send(String(decoding: config, as: UTF8.self))
+            try Task.checkCancellation()
+            guard transport != nil else { throw CancellationError() }
+            RealtimeDebugLog.shared.append("OpenAI: sent session config")
+            receiveTask = Task { [weak self] in
+                await self?.receiveMessages(connection)
+            }
+            let deadline = ContinuousClock.now.advanced(by: startupTimeout)
+            while !sessionReady {
+                if let sessionFailure { throw sessionFailure }
+                guard transport != nil else { throw CancellationError() }
+                guard ContinuousClock.now < deadline else {
+                    throw TranscriptionError.apiError("OpenAI transcription session timed out waiting for session.updated")
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            if let sessionFailure { throw sessionFailure }
+            RealtimeDebugLog.shared.append("OpenAI: session configuration accepted")
+            return pair.stream
+        } catch {
+            closeTransport()
+            throw error
         }
-        RealtimeDebugLog.shared.append("OpenAI: session ready")
-
-        return stream
     }
 
     func sendAudio(_ data: Data) async throws {
-        guard let task = webSocketTask else { return }
-
-        let base64Audio = data.base64EncodedString()
+        guard let connection = transport, sessionReady, !isStopping else { return }
+        if let sessionFailure { throw sessionFailure }
         let message: [String: Any] = [
-            "type": "input_audio_buffer.append",
-            "audio": base64Audio
+            "type": "input_audio_buffer.append", "audio": data.base64EncodedString()
         ]
-
-        let jsonData = try JSONSerialization.data(withJSONObject: message)
-        let jsonString = String(data: jsonData, encoding: .utf8)!
-        try await task.send(.string(jsonString))
+        let json = try JSONSerialization.data(withJSONObject: message)
+        try await connection.send(String(decoding: json, as: UTF8.self))
+        guard transport != nil, !isStopping else { return }
         bytesSinceCommit += data.count
+        // The live model emits deltas before commit, but needs explicit commits
+        // for final transcripts and bounded turns. Legacy models use server VAD.
+        if usesLiveTranscription {
+            try await maybeCommitAudioBuffer()
+        }
     }
 
     func stopRealtimeSession() async throws {
-        if bytesSinceCommit > 0 {
+        guard !isStopping else { return }
+        isStopping = true
+        if sessionReady, sessionFailure == nil, bytesSinceCommit >= minCommitBytes {
             try? await sendCommitMessage()
-            // Give the server a brief chance to emit final transcription deltas for
-            // the buffered tail before we close the socket.
+            // Keep final deltas available to the manager's bounded quality drain.
             try? await Task.sleep(for: .milliseconds(900))
         }
+        closeTransport()
+    }
+
+    private func closeTransport() {
         continuation?.finish()
         continuation = nil
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
-        webSocketTask = nil
-        session.invalidateAndCancel()  // Release URLSession connection pool and caches
+        receiveTask?.cancel()
+        receiveTask = nil
+        let connection = transport
+        transport = nil
+        connection?.cancel()
+        sessionReady = false
         bytesSinceCommit = 0
     }
 
-    // MARK: - Receive Messages
-
-    private func receiveMessages() async {
-        guard let task = webSocketTask else { return }
-
+    private func receiveMessages(_ connection: OpenAIRealtimeTransport) async {
         do {
-            while task.closeCode == .invalid {
-                let message = try await task.receive()
-
-                switch message {
-                case .string(let text):
-                    await handleMessage(text)
-                case .data(let data):
-                    if let text = String(data: data, encoding: .utf8) {
-                        await handleMessage(text)
-                    }
-                @unknown default:
-                    break
-                }
+            while !Task.isCancelled, transport != nil {
+                let text = try await connection.receive()
+                guard !Task.isCancelled, transport != nil else { return }
+                handleMessage(text)
+                if sessionFailure != nil { return }
             }
         } catch {
-            if isExpectedShutdownError(error) {
-                return
-            }
-            NSLog("[Cadenza] WS receive error: %@", "\(error)")
-            RealtimeDebugLog.shared.append("OpenAI WS ERROR: \(error)")
+            // Only our own close is expected. A remote ENOTCONN/cancel is still
+            // a failure while the connection belongs to the active session.
+            guard transport != nil, !Task.isCancelled else { return }
+            sessionFailure = error
+            RealtimeDebugLog.shared.append("OpenAI: WebSocket receive failed")
             continuation?.finish(throwing: error)
         }
     }
 
-    private func isExpectedShutdownError(_ error: Error) -> Bool {
-        if error is CancellationError {
-            return true
-        }
-
-        let nsError = error as NSError
-        if nsError.domain == NSPOSIXErrorDomain, nsError.code == 57 {
-            return true
-        }
-
-        if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
-            return true
-        }
-
-        return webSocketTask == nil
-    }
-
-    private func maybeCommitAudioBuffer(force: Bool) async throws {
+    private func maybeCommitAudioBuffer() async throws {
         let now = Date()
         let elapsed = now.timeIntervalSince(lastCommitAt)
         let hasEnoughAudio = bytesSinceCommit >= minCommitBytes
-        let shouldCommit = (force && hasEnoughAudio)
-            || bytesSinceCommit >= commitChunkBytes
+        let shouldCommit = bytesSinceCommit >= commitChunkBytes
             || (elapsed >= commitInterval && hasEnoughAudio)
         guard shouldCommit else { return }
 
@@ -214,16 +198,16 @@ final class RealtimeTranscriber: TranscriptionService, @unchecked Sendable {
     }
 
     private func sendCommitMessage() async throws {
-        guard let task = webSocketTask else { return }
+        guard let connection = transport else { return }
         let commitMessage: [String: Any] = ["type": "input_audio_buffer.commit"]
         let commitData = try JSONSerialization.data(withJSONObject: commitMessage)
         let commitString = String(data: commitData, encoding: .utf8)!
-        try await task.send(.string(commitString))
+        try await connection.send(commitString)
         lastCommitAt = Date()
         bytesSinceCommit = 0
     }
 
-    private func handleMessage(_ text: String) async {
+    private func handleMessage(_ text: String) {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = json["type"] as? String else {
@@ -235,7 +219,11 @@ final class RealtimeTranscriber: TranscriptionService, @unchecked Sendable {
 
         switch type {
         case "transcription_session.created", "session.created":
-            await sessionState.markReady()
+            // Creation precedes validation of our session.update payload.
+            break
+
+        case "transcription_session.updated", "session.updated":
+            sessionReady = true
 
         case "conversation.item.input_audio_transcription.delta",
              "response.audio_transcript.delta":
@@ -268,7 +256,9 @@ final class RealtimeTranscriber: TranscriptionService, @unchecked Sendable {
             let message = (errorPayload?["message"] as? String)
                 ?? (errorPayload?["type"] as? String)
                 ?? "Realtime transcription session failed"
-            continuation?.finish(throwing: TranscriptionError.apiError(message))
+            let error = TranscriptionError.apiError(message)
+            sessionFailure = error
+            continuation?.finish(throwing: error)
 
         default:
             if type.lowercased().contains("transcript"),

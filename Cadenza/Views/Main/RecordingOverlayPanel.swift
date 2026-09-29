@@ -85,6 +85,13 @@ enum RecordingOverlayLayoutMetrics {
         return ceil(min(240, max(120, expandedWidth * 0.38)))
     }
 
+    /// Bounds the expanded notch's meeting title. It scales with text size so
+    /// the same number of characters stays visible before truncation.
+    static func notchTitleMaximumWidth(scale: CGFloat) -> CGFloat {
+        let safeScale = scale.isFinite && scale > 0 ? scale : 1
+        return ceil(240 * min(max(safeScale, 1), 1.75))
+    }
+
     static func regularPanelSize(scale: CGFloat, availableSize: NSSize?) -> NSSize {
         let safeScale = scale.isFinite && scale > 0 ? scale : 1
         var size = NSSize(
@@ -1539,6 +1546,124 @@ struct NotchBelowHardwareLayout<Content: View>: View {
     }
 }
 
+/// Sizes the notch surface to its content's ideal width and only narrows it to
+/// the width the half-screen panel offers when that ideal would overflow.
+/// `fixedSize()` alone lets long localized labels escape the panel, while
+/// accepting the offered width lets the expanded row's spacer stretch the
+/// surface across half the screen. Height always stays intrinsic.
+struct NotchIdealWidthLayout: Layout {
+    /// An additional hard cap, such as the meeting title's, applied on top of
+    /// the offered width.
+    var maximumWidth: CGFloat? = nil
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let subview = subviews.first else { return .zero }
+        return subview.sizeThatFits(contentProposal(offeredWidth: proposal.width, subview: subview))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let subview = subviews.first else { return }
+        subview.place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: contentProposal(offeredWidth: proposal.width, subview: subview)
+        )
+    }
+
+    private func contentProposal(offeredWidth: CGFloat?, subview: LayoutSubview) -> ProposedViewSize {
+        // Rounding up keeps sub-point slack out of the truncatable title; any
+        // spare point lands in the row's spacer.
+        var width = ceil(subview.sizeThatFits(.unspecified).width)
+        if let maximumWidth {
+            width = min(width, maximumWidth)
+        }
+        if let offeredWidth, offeredWidth.isFinite {
+            width = min(width, offeredWidth)
+        }
+        return ProposedViewSize(width: width, height: nil)
+    }
+}
+
+/// The expanded notch's recording identity. The title hugs its text up to
+/// `notchTitleMaximumWidth`, so a long calendar title truncates instead of
+/// stretching the surface. Unlike `frame(maxWidth:)`, a short title never
+/// grows into slack that belongs to the row's spacer.
+struct NotchRecordingTitle: View {
+    @Environment(\.uiScale) private var uiScale: CGFloat
+    let meetingName: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(.blue)
+                .frame(width: 8, height: 8)
+
+            NotchIdealWidthLayout(
+                maximumWidth: RecordingOverlayLayoutMetrics.notchTitleMaximumWidth(scale: uiScale)
+            ) {
+                Group {
+                    if let meetingName {
+                        Text(meetingName)
+                    } else {
+                        Text("Recording")
+                    }
+                }
+                .font(.cadenza(13, weight: .medium, scale: uiScale))
+                .lineLimit(1)
+            }
+        }
+    }
+}
+
+/// Arranges the expanded notch row so hugging its ideal width never squeezes
+/// the controls. A stack offered exactly its ideal width still hands every
+/// equal-priority child an even share, so the spacer claims one while the
+/// countdown and stop labels wrap into slivers. Actions resolve first, then
+/// the recording identity and duration; the spacer only receives what's left.
+struct NotchExpandedRowLayout<Identity: View, Duration: View, Actions: View>: View {
+    let stacksActions: Bool
+    private let identity: Identity
+    private let duration: Duration
+    private let actions: Actions
+
+    init(
+        stacksActions: Bool,
+        @ViewBuilder identity: () -> Identity,
+        @ViewBuilder duration: () -> Duration,
+        @ViewBuilder actions: () -> Actions
+    ) {
+        self.stacksActions = stacksActions
+        self.identity = identity()
+        self.duration = duration()
+        self.actions = actions()
+    }
+
+    var body: some View {
+        if stacksActions {
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    identity
+                        .layoutPriority(1)
+                    Spacer(minLength: 8)
+                    duration
+                        .layoutPriority(1)
+                }
+                actions
+            }
+        } else {
+            HStack(spacing: 10) {
+                identity
+                    .layoutPriority(1)
+                duration
+                    .layoutPriority(1)
+                Spacer(minLength: 4)
+                actions
+                    .layoutPriority(2)
+            }
+        }
+    }
+}
+
 /// Keeps the auto-stop message from competing with every transport action in
 /// one unbounded row. The regular layout preserves the compact ordering; at
 /// accessibility sizes the message and transport targets receive separate rows.
@@ -1605,21 +1730,22 @@ struct NotchRecordingView: View {
     private var minWidth: CGFloat { notchWidth + topCornerRadius * 2 }
 
     var body: some View {
-        ZStack(alignment: .top) {
-            // Compact: content on both sides of the notch
-            compactContent
-                .opacity(isExpanded ? 0 : 1)
+        // Hug the controls instead of letting the expanded row's spacer fill
+        // the half-screen panel, but never grow past what that panel offers.
+        NotchIdealWidthLayout {
+            ZStack(alignment: .top) {
+                // Compact: content on both sides of the notch
+                compactContent
+                    .opacity(isExpanded ? 0 : 1)
 
-            // Expanded: notch extends downward with full controls
-            expandedContent
-                .opacity(isExpanded ? 1 : 0)
-                .frame(maxWidth: isExpanded ? nil : 0, maxHeight: isExpanded ? nil : 0)
-                .clipped()
+                // Expanded: notch extends downward with full controls
+                expandedContent
+                    .opacity(isExpanded ? 1 : 0)
+                    .frame(maxWidth: isExpanded ? nil : 0, maxHeight: isExpanded ? nil : 0)
+                    .clipped()
+            }
+            .padding(.horizontal, topCornerRadius)
         }
-        .padding(.horizontal, topCornerRadius)
-        // Preserve intrinsic height without allowing localized content to
-        // exceed the half-screen notch panel horizontally.
-        .fixedSize(horizontal: false, vertical: true)
         .frame(minWidth: minWidth, minHeight: notchHeight)
         .onHover { hovering in
             if hovering {
@@ -1696,47 +1822,22 @@ struct NotchRecordingView: View {
         }
     }
 
-    @ViewBuilder
     private var expandedControlContent: some View {
-        if uiScale >= CadenzaTextScale.factor(.accessibility1) {
-            VStack(spacing: 8) {
-                HStack(spacing: 10) {
-                    recordingIdentity
-                    Spacer(minLength: 8)
-                    notchDurationText
-                        .font(.cadenza(13, weight: .medium, design: .monospaced, scale: uiScale))
-                        .opacity(0.7)
-                }
-                notchActionControls
-            }
-        } else {
-            HStack(spacing: 10) {
-                recordingIdentity
-                notchDurationText
-                    .font(.cadenza(13, weight: .medium, design: .monospaced, scale: uiScale))
-                    .opacity(0.7)
-                Spacer(minLength: 4)
-                notchActionControls
-            }
+        NotchExpandedRowLayout(
+            stacksActions: uiScale >= CadenzaTextScale.factor(.accessibility1)
+        ) {
+            recordingIdentity
+        } duration: {
+            notchDurationText
+                .font(.cadenza(13, weight: .medium, design: .monospaced, scale: uiScale))
+                .opacity(0.7)
+        } actions: {
+            notchActionControls
         }
     }
 
     private var recordingIdentity: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(.blue)
-                .frame(width: 8, height: 8)
-
-            Group {
-                if let name = appState.currentMeetingName {
-                    Text(name)
-                } else {
-                    Text("Recording")
-                }
-            }
-            .font(.cadenza(13, weight: .medium, scale: uiScale))
-            .lineLimit(1)
-        }
+        NotchRecordingTitle(meetingName: appState.currentMeetingName)
     }
 
     private var notchActionControls: some View {

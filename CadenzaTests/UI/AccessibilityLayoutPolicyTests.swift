@@ -408,6 +408,183 @@ struct OverlayPanelLayoutTests {
         #expect(size.height >= physicalNotchHeight + controlSize)
     }
 
+    @MainActor @Test func expandedNotchHugsItsControlsInsteadOfFillingHalfScreenPanel() throws {
+        let panelWidth: CGFloat = 640
+        let minimumWidth: CGFloat = 385
+
+        func surfaceWidth(title: String) throws -> CGFloat {
+            let probe = OverlayActionFrameProbe()
+            let host = NSHostingView(rootView: AnyView(
+                NotchIdealWidthLayout {
+                    HStack(spacing: 10) {
+                        Text(title)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Color.clear.frame(width: 24, height: 24)
+                    }
+                    .frame(minWidth: minimumWidth)
+                }
+                .background(OverlayActionProbeView(probe: probe))
+                .frame(width: panelWidth, height: 200, alignment: .top)
+            ))
+            host.frame = NSRect(x: 0, y: 0, width: panelWidth, height: 200)
+            host.layoutSubtreeIfNeeded()
+            let view = try #require(probe.view)
+            return view.convert(view.bounds, to: host).width
+        }
+
+        // A spacer-backed row must not stretch the surface to the panel width.
+        #expect(try surfaceWidth(title: "Recording") == minimumWidth)
+        // An oversized title is capped by the panel so the controls stay on screen.
+        #expect(try surfaceWidth(title: String(repeating: "Recording ", count: 40)) == panelWidth)
+    }
+
+    @MainActor @Test func notchTitleHugsShortNamesAndTruncatesLongOnesAtItsCap() throws {
+        let cap = RecordingOverlayLayoutMetrics.notchTitleMaximumWidth(scale: 1)
+        let dotAndSpacing: CGFloat = 8 + 10
+
+        func titleWidth(_ name: String) throws -> CGFloat {
+            let probe = OverlayActionFrameProbe()
+            let host = NSHostingView(rootView: AnyView(
+                NotchRecordingTitle(meetingName: name)
+                    .background { OverlayActionProbeView(probe: probe) }
+                    .frame(width: 640, height: 60, alignment: .leading)
+            ))
+            host.frame = NSRect(x: 0, y: 0, width: 640, height: 60)
+            host.layoutSubtreeIfNeeded()
+            let view = try #require(probe.view)
+            return view.convert(view.bounds, to: host).width
+        }
+
+        func textIdealWidth(_ name: String) -> CGFloat {
+            let host = NSHostingView(rootView: Text(name)
+                .font(.cadenza(13, weight: .medium, scale: 1))
+                .fixedSize())
+            host.sizingOptions = [.intrinsicContentSize]
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.width
+        }
+
+        let shortName = "Microsoft Teams"
+        let longName = "Quarterly product security review: tooling migration and key rotation"
+        #expect(textIdealWidth(longName) > cap, "The long fixture must exceed the cap")
+
+        // A wide slot must not stretch a short title toward the cap.
+        #expect(abs(try titleWidth(shortName) - (ceil(textIdealWidth(shortName)) + dotAndSpacing)) < 1)
+        #expect(abs(try titleWidth(longName) - (cap + dotAndSpacing)) < 1)
+    }
+
+    @MainActor @Test func huggingNotchRowGivesCountdownControlsTheirIdealWidthInEveryLanguage() throws {
+        let scale: CGFloat = 1
+        let panelWidth: CGFloat = 640
+        let controlSize = RecordingOverlayLayoutMetrics.controlDimension(
+            base: 24,
+            fontSize: 11,
+            scale: scale
+        )
+        let keepLabels = try localizedValues(for: "Keep Recording")
+        let stopLabels = try localizedValues(for: "Stop")
+
+        func idealProbeWidth(_ content: (OverlayActionFrameProbe) -> some View) throws -> CGFloat {
+            let probe = OverlayActionFrameProbe()
+            let host = NSHostingView(rootView: AnyView(content(probe).fixedSize()))
+            host.sizingOptions = [.intrinsicContentSize]
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            host.layoutSubtreeIfNeeded()
+            return try #require(probe.view).frame.width
+        }
+
+        func layOut(
+            prioritized: Bool,
+            keepLabel: String,
+            stopLabel: String
+        ) throws -> (keep: CGFloat, stop: CGFloat, gap: CGFloat) {
+            let keepProbe = OverlayActionFrameProbe()
+            let stopProbe = OverlayActionFrameProbe()
+            let durationProbe = OverlayActionFrameProbe()
+            let actionsProbe = OverlayActionFrameProbe()
+            let identity = NotchRecordingTitle(meetingName: "Microsoft Teams")
+            let duration = Text("12:55").background { OverlayActionProbeView(probe: durationProbe) }
+            let actions = NotchActionControlsLayout(showsCountdown: true, scale: scale) {
+                simulatedNotchMicrophone(scale: scale, probe: OverlayActionFrameProbe())
+            } countdown: {
+                simulatedCountdown(
+                    keepLabel: keepLabel, scale: scale, controlSize: controlSize, probe: keepProbe
+                )
+            } transport: {
+                HStack(spacing: 10) {
+                    overlayActionButton(probe: OverlayActionFrameProbe(), size: controlSize, icon: "pause.fill")
+                    simulatedNotchStop(label: stopLabel, scale: scale, probe: stopProbe)
+                }
+            }
+            .background { OverlayActionProbeView(probe: actionsProbe) }
+
+            let row: AnyView
+            if prioritized {
+                row = AnyView(NotchExpandedRowLayout(stacksActions: false) {
+                    identity
+                } duration: {
+                    duration
+                } actions: {
+                    actions
+                })
+            } else {
+                row = AnyView(HStack(spacing: 10) {
+                    identity
+                    duration
+                    Spacer(minLength: 4)
+                    actions
+                })
+            }
+            let host = NSHostingView(rootView: AnyView(
+                NotchIdealWidthLayout { row.padding(.horizontal, 16) }
+                    .frame(width: panelWidth, height: 200, alignment: .top)
+            ))
+            host.frame = NSRect(x: 0, y: 0, width: panelWidth, height: 200)
+            host.layoutSubtreeIfNeeded()
+
+            func frame(_ probe: OverlayActionFrameProbe) throws -> NSRect {
+                let view = try #require(probe.view)
+                return view.convert(view.bounds, to: host)
+            }
+            return (
+                try frame(keepProbe).width,
+                try frame(stopProbe).width,
+                try frame(actionsProbe).minX - frame(durationProbe).maxX
+            )
+        }
+
+        // CJK labels can wrap between any two characters, so an unprioritized
+        // row squeezes them to a sliver while its spacer takes an even share.
+        let chineseKeep = try #require(keepLabels["zh-Hans"])
+        let chineseStop = try #require(stopLabels["zh-Hans"])
+        let legacy = try layOut(prioritized: false, keepLabel: chineseKeep, stopLabel: chineseStop)
+        let chineseKeepIdeal = try idealProbeWidth {
+            simulatedCountdown(keepLabel: chineseKeep, scale: scale, controlSize: controlSize, probe: $0)
+        }
+        #expect(
+            legacy.keep < chineseKeepIdeal - 1,
+            "The probe must reproduce the countdown wrapping beside an oversized spacer"
+        )
+
+        for language in keepLabels.keys.sorted() {
+            let keepLabel = try #require(keepLabels[language])
+            let stopLabel = try #require(stopLabels[language])
+            let keepIdeal = try idealProbeWidth {
+                simulatedCountdown(keepLabel: keepLabel, scale: scale, controlSize: controlSize, probe: $0)
+            }
+            let stopIdeal = try idealProbeWidth {
+                simulatedNotchStop(label: stopLabel, scale: scale, probe: $0)
+            }
+
+            let row = try layOut(prioritized: true, keepLabel: keepLabel, stopLabel: stopLabel)
+            #expect(abs(row.keep - keepIdeal) < 1, "\(language) keep label")
+            #expect(abs(row.stop - stopIdeal) < 1, "\(language) stop button")
+            // Only the spacer's minimum sits between the duration and the controls.
+            #expect(row.gap <= 10 + 4 + 10 + 1, "\(language) spacer")
+        }
+    }
+
     @MainActor @Test func notchAutoStopFitsLongestLocalizedLabelInsideHalfScreenPanel() throws {
         let productScale = UIScalePreset.large.scaleFactor
         let dynamicTypeSize = DynamicTypeSize.accessibility5
@@ -612,6 +789,29 @@ struct OverlayPanelLayoutTests {
         }
         .buttonStyle(.plain)
         .background { OverlayActionProbeView(probe: probe) }
+    }
+
+    /// Every catalog value for `key` by language, plus the English source.
+    private func localizedValues(for key: String) throws -> [String: String] {
+        let catalogURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Cadenza/Resources/Localizable.xcstrings")
+        let data = try Data(contentsOf: catalogURL)
+        let root = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let strings = try #require(root["strings"] as? [String: Any])
+        let entry = try #require(strings[key] as? [String: Any])
+        let localizations = try #require(entry["localizations"] as? [String: Any])
+        var values = ["en": key]
+        for (language, localization) in localizations {
+            guard let localization = localization as? [String: Any],
+                  let unit = localization["stringUnit"] as? [String: Any],
+                  let value = unit["value"] as? String
+            else { continue }
+            values[language] = value
+        }
+        return values
     }
 
     @MainActor

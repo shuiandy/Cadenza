@@ -1,5 +1,152 @@
 import SwiftUI
 
+/// A transient library presentation, derived from active work rather than an
+/// empty transcript. Failed or idle recordings must remain in the normal list.
+enum RecordingLibraryActivity: Equatable {
+    case recording, paused, finalizing, waitingForTranscription, transcribing, waitingForSummary, summarizing
+
+    static func resolve(
+        isCurrentRecording: Bool,
+        isRecording: Bool,
+        isPaused: Bool,
+        isFinalizing: Bool,
+        phase: JobPhase?,
+        isRetryingTranscription: Bool = false,
+        isGeneratingSummary: Bool = false
+    ) -> Self? {
+        if isCurrentRecording {
+            if isFinalizing { return .finalizing }
+            if isPaused { return .paused }
+            if isRecording { return .recording }
+        }
+        if isRetryingTranscription { return .transcribing }
+        if isGeneratingSummary { return .summarizing }
+        switch phase {
+        case .pendingTranscription: return .waitingForTranscription
+        case .transcribing: return .transcribing
+        case .pendingSummary: return .waitingForSummary
+        case .summarizing: return .summarizing
+        case nil: return nil
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .recording: String(localized: "Recording")
+        case .paused: String(localized: "Paused")
+        case .finalizing: String(localized: "Finishing recording...")
+        case .waitingForTranscription: String(localized: "Waiting to transcribe...")
+        case .transcribing: String(localized: "Transcribing...")
+        case .waitingForSummary: String(localized: "Waiting for summary...")
+        case .summarizing: String(localized: "Generating summary...")
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .recording: "waveform"
+        case .paused: "pause.circle"
+        case .finalizing: "tray.and.arrow.down"
+        case .waitingForTranscription, .waitingForSummary: "clock"
+        case .transcribing: "waveform"
+        case .summarizing: "sparkles"
+        }
+    }
+
+    func durationLabel(_ duration: TimeInterval) -> String? {
+        switch self {
+        case .recording, .paused, .finalizing: return nil
+        default:
+            guard duration.isFinite, duration > 0 else { return nil }
+            return Duration.seconds(duration).formatted(
+                .units(allowed: [.hours, .minutes, .seconds], width: .abbreviated, maximumUnitCount: 2)
+            )
+        }
+    }
+}
+
+/// Activity entries are direct destinations, with native single-click and
+/// keyboard activation rather than the library cards' selection gesture.
+struct RecordingActivityButton: View {
+    let recording: RecordingDTO
+    let activity: RecordingLibraryActivity
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            RecordingActivityRow(recording: recording, activity: activity)
+        }
+        .buttonStyle(.cadenzaPlain)
+        .accessibilityLabel(Text(recording.title))
+        .accessibilityValue(Text(activity.title))
+        .accessibilityHint("Open recording")
+    }
+}
+
+/// Compact, neutral activity row shared by all library view modes.
+struct RecordingActivityRow: View {
+    @Environment(\.uiScale) private var uiScale: CGFloat
+    let recording: RecordingDTO
+    let activity: RecordingLibraryActivity
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: activity.symbol)
+                .font(.cadenza(16, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .frame(width: 24)
+                .accessibilityHidden(true)
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 16) {
+                    identity
+                    Spacer(minLength: 8)
+                    status.fixedSize(horizontal: true, vertical: false)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    identity
+                    status
+                }
+            }
+
+            Image(systemName: "chevron.right")
+                .font(.cadenza(10, weight: .medium, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .background(RoundedRectangle(cornerRadius: 10).fill(AppStyle.ColorToken.softFill))
+    }
+
+    private var identity: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(recording.title)
+                .font(.cadenza(13, weight: .medium, scale: uiScale))
+                .lineLimit(1)
+            Text(metadata)
+                .font(.cadenza(11, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var status: some View {
+        Text(activity.title)
+            .font(.cadenza(12, scale: uiScale))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var metadata: String {
+        let start = recording.startDate.formatted(date: .abbreviated, time: .shortened)
+        guard let duration = activity.durationLabel(recording.duration) else { return start }
+        return "\(start) · \(duration)"
+    }
+}
+
 struct RecordingListRow: View {
     @Environment(\.uiScale) private var uiScale: CGFloat
 

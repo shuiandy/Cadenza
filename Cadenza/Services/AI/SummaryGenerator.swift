@@ -315,7 +315,7 @@ final class SummaryGenerator {
             // Initially restricted to the evaluated cloud family. Local and map/reduce
             // retain their existing bounded flows. At most one repair request.
             guard service.provider == .openai,
-                  ["gpt-5.6-sol", "gpt-5.6-terra"].contains(model),
+                  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol"].contains(model),
                   remaining.allSatisfy({ $0.canRepair(from: transcript, summary: reviewed) }), !Task.isCancelled
             else { return (reviewed.rawText, reviewed, nil) }
             let repairMessage = SummaryPrompt.enrichUser(transcript: transcript, quickSummaryText: enrichText)

@@ -320,27 +320,57 @@ struct RecordingsContentView: View {
 
     @ViewBuilder
     private var recordingsLayout: some View {
-        Group {
-            if viewMode == .waterfall {
-                contentForSection(recordings)
-                    .padding()
-            } else {
-                LazyVStack(alignment: .leading, spacing: 18, pinnedViews: .sectionHeaders) {
-                    ForEach(dayGroups, id: \.day) { group in
-                        Section {
-                            contentForSection(group.recordings)
-                        } header: {
-                            dayHeader(group)
+        let activities = Dictionary(uniqueKeysWithValues: recordings.compactMap { recording in
+            activity(for: recording.id).map { (recording.id, $0) }
+        })
+        let settledRecordings = recordings.filter { activities[$0.id] == nil }
+        LazyVStack(alignment: .leading, spacing: 18, pinnedViews: .sectionHeaders) {
+            if !activities.isEmpty {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    Text("In progress")
+                        .font(.cadenza(12, weight: .semibold, scale: uiScale))
+                        .foregroundStyle(.secondary)
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(recordings.filter { activities[$0.id] != nil }) { recording in
+                        if let activity = activities[recording.id] {
+                            recordingCard(recording, activity: activity) {
+                                RecordingActivityButton(recording: recording, activity: activity) {
+                                    appState.openRecordingDetail(recordingID: recording.id, title: recording.title)
+                                }
+                            }
                         }
                     }
                 }
-                .padding()
-                .onChange(of: recordings, initial: true) { _, updated in
-                    dayGroupCache = DayGroupCache(input: updated, groups: RecordingDayGrouper.group(updated))
+            }
+            if viewMode == .waterfall {
+                contentForSection(settledRecordings)
+            } else {
+                ForEach(dayGroups(for: settledRecordings), id: \.day) { group in
+                    Section {
+                        contentForSection(group.recordings)
+                    } header: {
+                        dayHeader(group)
+                    }
                 }
             }
         }
+        .padding()
+        .onChange(of: settledRecordings, initial: true) { _, updated in
+            dayGroupCache = DayGroupCache(input: updated, groups: RecordingDayGrouper.group(updated))
+        }
         .animation(reduceMotion ? nil : .spring(duration: 0.3, bounce: 0.15), value: viewModeRaw)
+    }
+
+    private func activity(for recordingID: UUID) -> RecordingLibraryActivity? {
+        RecordingLibraryActivity.resolve(
+            isCurrentRecording: appState.currentRecordingID == recordingID,
+            isRecording: appState.isRecording,
+            isPaused: appState.recordingState == .paused,
+            isFinalizing: appState.isFinalizingRecording,
+            phase: appState.coordinator?.jobPhase(for: recordingID),
+            isRetryingTranscription: appState.coordinator?.isRetryingTranscription(for: recordingID) == true,
+            isGeneratingSummary: appState.coordinator?.isGeneratingSummary(for: recordingID) == true
+        )
     }
 
     /// Date-first section header: the day carries the scan, with the
@@ -646,10 +676,23 @@ struct RecordingsContentView: View {
     // MARK: - Recording Card (single-click select, double-click open)
 
     @ViewBuilder
-    private func recordingCard<Content: View>(_ recording: RecordingDTO, @ViewBuilder content: () -> Content) -> some View {
+    private func recordingCard<Content: View>(_ recording: RecordingDTO, activity: RecordingLibraryActivity? = nil, @ViewBuilder content: () -> Content) -> some View {
         let isSelected = selectedIDs.contains(recording.id)
 
-        content()
+        Group {
+            if activity != nil {
+                content()
+            } else {
+                content()
+                    // Normal cards keep single-click selection and double-click opening.
+                    .onTapGesture(count: 2) {
+                        appState.openRecordingDetail(recordingID: recording.id, title: recording.title)
+                    }
+                    .onTapGesture {
+                        handleCardClick(recording.id)
+                    }
+            }
+        }
             .background {
                 CardFrameReporter(recordingID: recording.id, registry: cardFrameRegistry)
             }
@@ -660,28 +703,27 @@ struct RecordingsContentView: View {
                         .strokeBorder(Color.primary.opacity(0.28), lineWidth: 1.5)
                 }
             }
-            // Double-click → open detail (must be before single-click)
-            .onTapGesture(count: 2) {
-                appState.openRecordingDetail(recordingID: recording.id, title: recording.title)
-            }
-            // Single-click → select
-            .onTapGesture {
-                handleCardClick(recording.id)
-            }
             .focusable()
             .onKeyPress(.return) {
                 appState.openRecordingDetail(recordingID: recording.id, title: recording.title)
                 return .handled
             }
             .onKeyPress(.space) {
-                handleCardClick(recording.id)
+                if activity != nil {
+                    appState.openRecordingDetail(recordingID: recording.id, title: recording.title)
+                } else {
+                    handleCardClick(recording.id)
+                }
                 return .handled
             }
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(.isButton)
             .accessibilityLabel(Text(recording.title))
-            .accessibilityValue(isSelected ? Text("Selected") : Text("Not selected"))
-            .accessibilityHint("Press Return to open. Press Space to select.")
+            .accessibilityValue(Text([
+                activity?.title,
+                isSelected ? String(localized: "Selected") : String(localized: "Not selected")
+            ].compactMap { $0 }.joined(separator: ", ")))
+            .accessibilityHint(activity != nil ? Text("Open recording") : Text("Press Return to open. Press Space to select."))
             .accessibilityAction {
                 appState.openRecordingDetail(recordingID: recording.id, title: recording.title)
             }
@@ -927,7 +969,7 @@ struct RecordingsContentView: View {
     }
     @State private var dayGroupCache: DayGroupCache?
 
-    private var dayGroups: [RecordingDayGrouper.Group] {
+    private func dayGroups(for recordings: [RecordingDTO]) -> [RecordingDayGrouper.Group] {
         if let dayGroupCache, dayGroupCache.input == recordings {
             return dayGroupCache.groups
         }

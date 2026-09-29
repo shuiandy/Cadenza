@@ -308,6 +308,7 @@
 		8ECC9EA168ADED3D21220530 /* ExportFileNaming.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6264ED4809710EA75D1697E8 /* ExportFileNaming.swift */; };
 		8EE1169A4FBCFE6CB42F9C9E /* OnboardingFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B39DA46D899D1F52971657A /* OnboardingFlowTests.swift */; };
 		8F4DD5ECE07AC26F46EB6BA7 /* RequiresSignInConnectionRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDDEF75D275863BA3F1FF622 /* RequiresSignInConnectionRow.swift */; };
+		90902EB8C60272C92AD3B4AD /* OpenAIRealtimeTranscriberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0CBB4096CFAEF6763D9CA6C /* OpenAIRealtimeTranscriberTests.swift */; };
 		9146C73F8756907CE90F7F7C /* CancellableCallbackOperation.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAD4A1F69D4F8A36B6C2F164 /* CancellableCallbackOperation.swift */; };
 		9175F869145FFE801BA11B53 /* ExternalRecordingFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = B32071B5A94F97786C912DA4 /* ExternalRecordingFingerprint.swift */; };
 		93405366F10835C6A42E49CC /* CalendarDayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C715F4078EF0B4A5D2EB34 /* CalendarDayView.swift */; };
@@ -1036,6 +1037,7 @@
 		CFFE8CF5566D2DCC1AB4643D /* RecordingListRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingListRow.swift; sourceTree = "<group>"; };
 		D093EC6F1180A7D3ABBCF29B /* PortableArchiveWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortableArchiveWriter.swift; sourceTree = "<group>"; };
 		D0BC1487B570377A6D72B379 /* AudioProcessMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioProcessMonitor.swift; sourceTree = "<group>"; };
+		D0CBB4096CFAEF6763D9CA6C /* OpenAIRealtimeTranscriberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenAIRealtimeTranscriberTests.swift; sourceTree = "<group>"; };
 		D2E0E4058C77DC09D3569B0E /* WebSyncRetryPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSyncRetryPolicy.swift; sourceTree = "<group>"; };
 		D2EA577601EDA4A11E9DC65C /* HardenedAITransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HardenedAITransport.swift; sourceTree = "<group>"; };
 		D2EE7DC6D6EE97BF4761FF1E /* ProfileEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileEnvironment.swift; sourceTree = "<group>"; };
@@ -1272,6 +1274,7 @@
 				56F8F9DE38B13F36B4E4AB55 /* GeminiTranscriptionAPIClientTests.swift */,
 				75F767F861D1D7296C11D148 /* LocalWhisperTranscriberTests.swift */,
 				974AA0E1DCD62538783FCF32 /* ModelDownloadBoundaryTests.swift */,
+				D0CBB4096CFAEF6763D9CA6C /* OpenAIRealtimeTranscriberTests.swift */,
 				DA9C3DAF2BD8000E174ABAE9 /* OpenAITranscriptionAPIClientTests.swift */,
 				3E97785919ECC070669F8038 /* SpeakerAssignmentSweepTests.swift */,
 				85DDD6FB74D3B8694C6898A3 /* TranscriptionManagerRealtimeOwnershipTests.swift */,
@@ -2902,6 +2905,7 @@
 				67D38D6F15506A6B978B40D4 /* NotionExportedIDsTests.swift in Sources */,
 				D6A4B09FB6843EA9C8A9B8C3 /* OAuthCoordinatorTests.swift in Sources */,
 				8EE1169A4FBCFE6CB42F9C9E /* OnboardingFlowTests.swift in Sources */,
+				90902EB8C60272C92AD3B4AD /* OpenAIRealtimeTranscriberTests.swift in Sources */,
 				FFED0EA301DE98696EC52F3C /* OpenAIRequestBodyTests.swift in Sources */,
 				41C6914A5624A40DCA2FDB52 /* OpenAITranscriptionAPIClientTests.swift in Sources */,
 				45660F2C8126973997E1F037 /* PKCETests.swift in Sources */,
@@ -3036,7 +3040,7 @@
 				CODE_SIGN_ENTITLEMENTS = Cadenza/Cadenza.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = Cadenza/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -3044,7 +3048,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shuiandy.CadenzaTestHost;
 				PRODUCT_MODULE_NAME = Cadenza;
 				PRODUCT_NAME = CadenzaTestHost;
@@ -3121,7 +3125,7 @@
 				CODE_SIGN_ENTITLEMENTS = Cadenza/Cadenza.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = Cadenza/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -3129,7 +3133,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shuiandy.Cadenza;
 				PRODUCT_MODULE_NAME = Cadenza;
 				PRODUCT_NAME = Cadenza;
@@ -3149,7 +3153,7 @@
 				CODE_SIGN_ENTITLEMENTS = Cadenza/Cadenza.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = Cadenza/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -3157,7 +3161,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shuiandy.Cadenza;
 				PRODUCT_MODULE_NAME = Cadenza;
 				PRODUCT_NAME = Cadenza;

@@ -996,7 +996,7 @@ struct RecordingsChromeLayoutTests {
 
         let library = try recordingsSource("RecordingsContentView.swift")
         #expect(library.contains("dayGroupCache.input == recordings"))
-        #expect(library.contains(".onChange(of: recordings, initial: true)"))
+        #expect(library.contains(".onChange(of: settledRecordings, initial: true)"))
     }
 
     @Test func recordingsCollectionAvoidsEagerWaterfallLayoutAtEveryCount() throws {
@@ -1694,5 +1694,156 @@ private final class RubberBandHitTestFixture {
 
     func hitView(at locationInWindow: NSPoint) -> NSView? {
         rootView.hitTest(rootView.convert(locationInWindow, from: nil))
+    }
+}
+
+@Suite("Recording Library Activity")
+struct RecordingLibraryActivityTests {
+    @MainActor @Test func recordingStartPublishesPersistedEntryBeforeStop() async throws {
+        let state = AppState(startupPolicy: .testHost)
+        let store = RecordingsStore(modelContainer: try TestPersistence.makeContainer())
+        state.store = store
+        let id = UUID()
+        // Warm the same cached collection the home screen reads before capture.
+        #expect(state.sortedLibraryRecordings(sortKey: "dateNewest").isEmpty)
+        let saved = await store.createRecording(
+            id: id, title: "Fictional live meeting", startDate: Date(),
+            language: "en", segmentsDirURL: nil
+        )
+        #expect(saved)
+        // The engine fires this real lifecycle callback after durable creation.
+        // No microphone, provider, stop event or manual library refresh is used.
+        state.recordingEngine.onRecordingStarted?()
+        defer { state.overlayController.dismiss() }
+        for _ in 0..<200 where !state.recordings.contains(where: { $0.id == id }) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(state.recordings.contains(where: { $0.id == id }))
+        #expect(state.sortedLibraryRecordings(sortKey: "dateNewest").contains(where: { $0.id == id }))
+        #expect(state.recordingsChangedToken > 0)
+        _ = await store.permanentlyDelete(recordingID: id)
+    }
+
+    @MainActor @Test func activityEntryOpensDetailWithOneClick() async throws {
+        let state = AppState(startupPolicy: .testHost)
+        let recording = TestDTOFactory.makeRecordingDTO(id: UUID(), title: "Fictional active meeting")
+        let view = RecordingActivityButton(recording: recording, activity: .transcribing) {
+            state.openRecordingDetail(recordingID: recording.id, title: recording.title)
+        }.frame(width: 600)
+        let host = NSHostingView(rootView: view)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 100),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = host
+        host.frame = NSRect(x: 0, y: 0, width: 600, height: 100)
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        // Send one real AppKit click through the hosting window. This exercises
+        // hit testing and the button action rather than invoking the closure.
+        let location = NSPoint(x: 300, y: 50)
+        let down = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown, location: location, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+        ))
+        let up = try #require(NSEvent.mouseEvent(
+            with: .leftMouseUp, location: location, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime + 0.05, windowNumber: window.windowNumber,
+            context: nil, eventNumber: 2, clickCount: 1, pressure: 0
+        ))
+        window.sendEvent(down)
+        window.sendEvent(up)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(state.activeDestination == .recordingDetail(recording.id))
+        state.closeDetail()
+        #expect(state.activeDestination == .allRecordings)
+    }
+
+    @Test func completionAndFailureLeaveTheActivitySection() {
+        #expect(resolve(phase: nil) == nil)
+        #expect(resolve(phase: .pendingTranscription) == .waitingForTranscription)
+        #expect(resolve(phase: .transcribing) == .transcribing)
+        #expect(resolve(phase: .pendingSummary) == .waitingForSummary)
+        #expect(resolve(phase: .summarizing) == .summarizing)
+        #expect(resolve(phase: nil, retry: true) == .transcribing)
+        #expect(resolve(phase: nil, summary: true) == .summarizing)
+    }
+
+    @Test func capturingAnotherMeetingDoesNotMislabelBackgroundWork() {
+        #expect(RecordingLibraryActivity.resolve(
+            isCurrentRecording: false, isRecording: true, isPaused: true,
+            isFinalizing: false, phase: .transcribing
+        ) == .transcribing)
+        #expect(RecordingLibraryActivity.resolve(
+            isCurrentRecording: true, isRecording: true, isPaused: true,
+            isFinalizing: false, phase: nil
+        ) == .paused)
+        #expect(RecordingLibraryActivity.resolve(
+            isCurrentRecording: true, isRecording: true, isPaused: false,
+            isFinalizing: false, phase: nil
+        ) == .recording)
+        #expect(RecordingLibraryActivity.resolve(
+            isCurrentRecording: true, isRecording: false, isPaused: false,
+            isFinalizing: true, phase: nil
+        ) == .finalizing)
+    }
+
+    @Test func unknownDurationIsOmittedButRealShortRecordingsKeepTheirDuration() {
+        for duration in [0.0, -1, .infinity, .nan] {
+            #expect(RecordingLibraryActivity.transcribing.durationLabel(duration) == nil)
+        }
+        let captureActivities: [RecordingLibraryActivity] = [.recording, .paused, .finalizing]
+        for activity in captureActivities {
+            #expect(activity.durationLabel(120) == nil)
+        }
+        #expect(RecordingLibraryActivity.transcribing.durationLabel(35) != nil)
+        #expect(RecordingLibraryActivity.summarizing.durationLabel(1800) != nil)
+    }
+
+    /// Render fictional fixtures to inspect the actual SwiftUI row in both
+    /// appearances, including a narrow layout with enlarged text.
+    @MainActor @Test func activityRowsRenderInBothAppearancesAndAtLargeText() throws {
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("cadenza-activity-preview")
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        for dark in [false, true] {
+            for scale in [CGFloat(1), CGFloat(2)] {
+                let fixture = VStack(alignment: .leading, spacing: 8) {
+                    Text("In progress").font(.headline)
+                    RecordingActivityRow(
+                        recording: TestDTOFactory.makeRecordingDTO(title: "Product planning", duration: 0),
+                        activity: .recording
+                    )
+                    RecordingActivityRow(
+                        recording: TestDTOFactory.makeRecordingDTO(title: "Design review", duration: 1800),
+                        activity: .transcribing
+                    )
+                    RecordingActivityRow(
+                        recording: TestDTOFactory.makeRecordingDTO(title: "Weekly sync", duration: 2700),
+                        activity: .waitingForSummary
+                    )
+                }
+                .padding(16)
+                .frame(width: scale == 1 ? 640 : 360)
+                .background(dark ? Color.black : Color.white)
+                .environment(\.colorScheme, dark ? .dark : .light)
+                .environment(\.uiScale, scale)
+                let renderer = ImageRenderer(content: fixture)
+                renderer.scale = 2
+                let image = try #require(renderer.cgImage)
+                let data = try #require(NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]))
+                try data.write(to: output.appendingPathComponent("activity-\(dark ? "dark" : "light")-\(Int(scale)).png"))
+                #expect(image.width == (scale == 1 ? 1280 : 720))
+            }
+        }
+        print("Activity row previews: \(output.path)")
+    }
+
+    private func resolve(phase: JobPhase?, retry: Bool = false, summary: Bool = false) -> RecordingLibraryActivity? {
+        RecordingLibraryActivity.resolve(
+            isCurrentRecording: false, isRecording: false, isPaused: false,
+            isFinalizing: false, phase: phase,
+            isRetryingTranscription: retry, isGeneratingSummary: summary
+        )
     }
 }

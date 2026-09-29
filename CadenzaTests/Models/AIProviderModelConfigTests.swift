@@ -41,15 +41,16 @@ struct AIProviderModelConfigTests {
         withCleanDefaults {
             UserDefaults.standard.set("gpt-6-preview", forKey: "model.openai")
             #expect(AIProvider.openai.summaryModel == "gpt-6-preview")
-            // Chat shares the same override key…
-            #expect(AIProvider.openai.chatModel == "gpt-6-preview")
+            // Settings calls this key "Summary model"; chat must not inherit it.
+            #expect(AIProvider.openai.chatModel == AIProvider.openai.defaultChatModel)
         }
     }
 
     @Test func chatModelFallsBackToChatDefaultNotSummaryDefault() {
+        // Claude is the provider whose chat tier differs from its summary model.
         withCleanDefaults {
-            #expect(AIProvider.openai.chatModel == AIProvider.openai.defaultChatModel)
-            #expect(AIProvider.openai.chatModel != AIProvider.openai.defaultModel)
+            #expect(AIProvider.claude.chatModel == AIProvider.claude.defaultChatModel)
+            #expect(AIProvider.claude.chatModel != AIProvider.claude.defaultModel)
         }
     }
 
@@ -94,7 +95,8 @@ struct AIProviderModelConfigTests {
     @Test func fallbackChatPresetsUseConfiguredAndDefaultModelsOnly() {
         withCleanDefaults {
             let presets = AIChatModelCatalog.fallbackPresets(for: .openai)
-            #expect(presets.map(\.modelID) == ["gpt-5.6-terra", "gpt-5.6-sol"])
+            // Chat and summary share one OpenAI default, so the list dedups to one.
+            #expect(presets.map(\.modelID) == ["gpt-6-sol"])
             #expect(presets.map(\.title) == presets.map(\.modelID))
             #expect(AIChatModelCatalog.displayTitle(for: .openai, modelID: "gpt-5.4") == "gpt-5.4")
         }
@@ -104,15 +106,14 @@ struct AIProviderModelConfigTests {
         withCleanDefaults {
             #expect(AIChatModelCatalog.fallbackPresets(for: .claude).map(\.modelID) == [
                 "claude-haiku-4-5",
-                "claude-sonnet-4-6",
+                "claude-sonnet-5-5",
             ])
             // Chat and summary share one Gemini default, so the list dedups to one.
             #expect(AIChatModelCatalog.fallbackPresets(for: .gemini).map(\.modelID) == [
-                "gemini-3.7-flash",
+                "gemini-3.8-flash",
             ])
             #expect(AIChatModelCatalog.fallbackPresets(for: .minimax).map(\.modelID) == [
-                "MiniMax-M2.7-highspeed",
-                "MiniMax-M2.7",
+                "MiniMax-M3",
             ])
         }
     }
@@ -127,10 +128,12 @@ struct AIProviderModelConfigTests {
         }
     }
 
-    @Test func chatModelFallsBackToExistingProviderChatModel() {
+    @Test func chatCatalogIgnoresSummaryOverride() {
         withCleanDefaults {
-            UserDefaults.standard.set("gpt-existing-chat", forKey: "model.openai")
-            #expect(AIChatModelCatalog.configuredModel(for: .openai) == "gpt-existing-chat")
+            UserDefaults.standard.set("gpt-summary-custom", forKey: "model.openai")
+            UserDefaults.standard.set("claude-summary-custom", forKey: "model.claude")
+            #expect(AIChatModelCatalog.configuredModel(for: .openai) == AIProvider.openai.defaultChatModel)
+            #expect(AIChatModelCatalog.configuredModel(for: .claude) == "claude-haiku-4-5")
         }
     }
 

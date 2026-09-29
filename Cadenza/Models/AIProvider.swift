@@ -71,23 +71,25 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
 
     /// Default model for summary (intelligence-heavy, accuracy-first).
     ///
-    /// Rationale (2026-08):
-    /// - OpenAI: GPT-5.6 Sol is the current accuracy-first flagship.
-    /// - Claude: Sonnet 4.6 keeps the best speed/intelligence/price
-    ///   trade-off for meeting summaries. Opus 4.7 is the most capable
-    ///   model but ~5x more expensive and aimed at complex agentic work,
+    /// Rationale (2026-09):
+    /// - OpenAI: GPT-6 Sol (2026-09-22) is the GPT-6 tier for demanding
+    ///   work at half of GPT-5.6 Sol's price ($2/$10 per 1M vs $4/$20).
+    ///   GPT-6 Astra is the most capable model but costs 5x as much ($10/$50).
+    /// - Claude: Sonnet 5.5 (2026-09-28) supersedes Sonnet 5 at the same
+    ///   price ($2/$10 per 1M) and tokenizer. It thinks adaptively by
+    ///   default, so ClaudeService pins the effort and widens the output
+    ///   budget. Opus 5.5 ($4/$20) and Fable 5.1 target long agentic work,
     ///   not chunked summary generation.
-    /// - Gemini: 3.7 Flash is stable and supersedes 3.5 Flash as the
-    ///   recommended Flash-tier default — more capable on multi-step work
-    ///   and roughly half the price ($0.75/$3.75 per 1M vs $1.50/$9.00,
-    ///   promotional through 2026-12-31).
-    /// - MiniMax: M2.7 (April 2026) is the latest.
+    /// - Gemini: 3.8 Flash (GA 2026-09-02) supersedes 3.7 Flash at the same
+    ///   price: $0.75/$3.75 per 1M through 2026-12-31, then $1.50/$7.50.
+    /// - MiniMax: M3 supersedes M2.7 at the same price ($0.30/$1.20 per 1M)
+    ///   with a 1M context window.
     var defaultModel: String {
         switch self {
-        case .openai: "gpt-5.6-sol"
-        case .claude: "claude-sonnet-4-6"
-        case .gemini: "gemini-3.7-flash"
-        case .minimax: "MiniMax-M2.7"
+        case .openai: "gpt-6-sol"
+        case .claude: "claude-sonnet-5-5"
+        case .gemini: "gemini-3.8-flash"
+        case .minimax: "MiniMax-M3"
         case .apple: "default"
         case .whisperLocal: "base"
         }
@@ -96,17 +98,21 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
     /// Default model for chat (latency-first, lower-tier when available).
     /// Chat is high-frequency low-complexity — every provider with a
     /// cheaper/faster small-model tier maps to it here. Currently:
-    /// - OpenAI: gpt-5.6-terra balances capability, latency, and cost.
-    /// - Claude: Haiku 4.5 (~5x cheaper, ~3-5x faster than Sonnet 4.6)
-    /// - Gemini: 3.7 Flash (stable, current Flash-tier default)
-    /// - MiniMax: M2.7-highspeed (identical results, faster latency variant)
+    /// - OpenAI: gpt-6-sol with reasoning off costs no more than the
+    ///   gpt-5.6-terra it replaces; GPT-6 has no terra tier, and Luna trades
+    ///   too much capability for multi-recording questions.
+    /// - Claude: Haiku 4.5 is still the fastest current tier ($1/$5 per 1M,
+    ///   no thinking unless asked, so chat latency stays flat)
+    /// - Gemini: 3.8 Flash (stable, current Flash-tier default)
+    /// - MiniMax: M3 has no highspeed variant; it costs half of what
+    ///   M2.7-highspeed did, so chat shares the summary model.
     /// - Apple / Whisper Local: fall through to defaultModel.
     var defaultChatModel: String {
         switch self {
-        case .openai: "gpt-5.6-terra"
+        case .openai: "gpt-6-sol"
         case .claude: "claude-haiku-4-5"
-        case .gemini: "gemini-3.7-flash"
-        case .minimax: "MiniMax-M2.7-highspeed"
+        case .gemini: "gemini-3.8-flash"
+        case .minimax: "MiniMax-M3"
         default: defaultModel
         }
     }
@@ -116,7 +122,8 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
         // gpt-4o-transcribe-diarize remains OpenAI's only diarizing
         // transcription model: gpt-transcribe (2026-07-28) is more accurate
         // but emits no speaker labels, and the speech-to-text guide still
-        // routes diarized workloads here.
+        // routes diarized workloads here. OpenAI deprecated it on 2026-08-26
+        // (shutdown 2027-02-26) without naming a diarizing successor.
         case .openai: "gpt-4o-transcribe-diarize"
         // gemini-3.5-transcribe (2026-08-27) is a purpose-built ASR reached
         // through the Interactions API, not generateContent: native
@@ -180,11 +187,12 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
         configuredModel(key: "model.\(rawValue)", default: defaultModel)
     }
 
-    /// Chat model: shares the `model.<provider>` override key with summary
-    /// (pre-existing behavior — one knob steers both), but falls back to the
-    /// cheaper/faster `defaultChatModel` when unset.
+    /// Chat model when chat has no pick of its own. Settings labels
+    /// `model.<provider>` "Summary model" and tells the user chat models are
+    /// chosen in chat, so chat never inherits that override. The chat picker's
+    /// own `chatModel.<provider>` key is layered on top by AIChatModelCatalog.
     var chatModel: String {
-        configuredModel(key: "model.\(rawValue)", default: defaultChatModel)
+        defaultChatModel
     }
 
     /// Batch transcription model: `transcriptionModel.<provider>` override,
