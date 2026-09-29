@@ -14,7 +14,7 @@ struct GeminiRealtimeTransport: Sendable {
     private let receiveOperation: @Sendable (Int, @escaping ReceiveCompletion) -> Void
     private let cancelOperation: @Sendable () -> Void
     private let cancellationGate = GeminiRealtimeCancellationGate()
-    private let identity = UUID()
+    let id = UUID()
 
     init(
         send: @escaping @Sendable (Data, @escaping SendCompletion) -> Void,
@@ -56,7 +56,7 @@ struct GeminiRealtimeTransport: Sendable {
     }
 
     func matches(_ other: GeminiRealtimeTransport) -> Bool {
-        identity == other.identity
+        id == other.id
     }
 }
 
@@ -132,10 +132,81 @@ private final class GeminiRealtimePendingIO<Value: Sendable>: Sendable {
     }
 }
 
+/// Advance notice that the Live API is about to close a connection. Gemini
+/// sends it about 50 s before its session-duration cutoff and aborts a client
+/// that is still attached when `timeLeft` runs out (close code 1008).
+struct GeminiRealtimeGoAway: Equatable, Sendable {
+    private static let maximumTimeLeftSeconds: Double = 3_600
+
+    /// nil when the server omitted the field or sent something unparseable.
+    let timeLeft: Duration?
+
+    init?(message: [String: Any]) {
+        guard let body = (message["goAway"] ?? message["go_away"]) as? [String: Any] else {
+            return nil
+        }
+        timeLeft = Self.duration(from: body["timeLeft"] ?? body["time_left"])
+    }
+
+    /// Protobuf `Duration` in its JSON form: decimal seconds with an `s`
+    /// suffix, such as "50s" or "1.5s".
+    private static func duration(from value: Any?) -> Duration? {
+        guard let text = value as? String,
+              text.hasSuffix("s"),
+              let seconds = Double(text.dropLast()),
+              seconds.isFinite,
+              seconds >= 0 else {
+            return nil
+        }
+        return .seconds(min(seconds, maximumTimeLeftSeconds))
+    }
+}
+
 /// Real-time transcription using Gemini Multimodal Live API over WebSocket.
 /// Uses raw NWConnection (TCP + TLS) with manual WebSocket handshake & framing
 /// to force HTTP/1.1 and control the request URI path.
+///
+/// Gemini caps a Live connection at about ten minutes and announces the cut
+/// with `goAway`. The transcriber rotates to a fresh connection behind the
+/// same transcript stream, so callers only ever see a failure when that
+/// rotation cannot finish in time.
 actor GeminiRealtimeTranscriber: TranscriptionService {
+    /// Framing state for one socket. A goAway rotation keeps the retiring and
+    /// the replacement socket reading at the same time, so a partial frame on
+    /// one must never land in the other's buffer.
+    private struct Framing {
+        var receiveBuffer = Data()
+        var fragmentedTextBuffer: Data?
+    }
+
+    /// A replacement being dialed after goAway. Audio keeps flowing to the
+    /// retiring socket until the replacement has acknowledged setup.
+    private struct PendingRotation {
+        let retiring: GeminiRealtimeTransport
+        var replacement: GeminiRealtimeTransport?
+        var task: Task<Void, Never>?
+        var deadlineTask: Task<Void, Never>?
+    }
+
+    /// The retiring socket once audio has moved to its replacement. It was
+    /// sent audioStreamEnd, so its last utterance may still be on the way.
+    /// That text is delivered first and the replacement's is held back until
+    /// the retiring socket settles: the manager keeps one open hypothesis, and
+    /// interleaving the two sockets would overwrite or reorder it.
+    private struct DrainingConnection {
+        let transport: GeminiRealtimeTransport
+        let receiveTask: Task<Void, Never>?
+        var pendingInterim: String?
+        var flushed = false
+        var heldDeltas: [TranscriptDelta] = []
+        var timeoutTask: Task<Void, Never>?
+    }
+
+    /// Used when goAway arrives without a readable `timeLeft`.
+    private static let defaultGoAwayGrace: Duration = .seconds(30)
+    private static let maxRotationAttempts = 3
+    private static let rotationRetryDelay: Duration = .seconds(1)
+
     private let model: String
     private let transportForTesting: GeminiRealtimeTransport?
     private let transportFactoryForTesting: (@Sendable () -> GeminiRealtimeTransport)?
@@ -144,13 +215,17 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
     private let authenticateInjectedTransport: Bool
     private let startupDeadline: Duration
     private let audioStreamEndTimeout: Duration
-    private var connection: NWConnection?
+    private let rotationDrainTimeout: Duration
     private var transport: GeminiRealtimeTransport?
     private var continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
     private var receiveTask: Task<Void, Never>?
-    private var receiveBuffer = Data()
-    private var fragmentedTextBuffer: Data?
+    private var framing: [UUID: Framing] = [:]
     private var sessionGeneration: UInt64 = 0
+    private var sessionLanguage: String?
+    /// Last interim hypothesis from `transport`; nil once it finalizes.
+    private var activeInterim: String?
+    private var pendingRotation: PendingRotation?
+    private var draining: DrainingConnection?
 
     init(
         apiKey: String,
@@ -160,7 +235,8 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         startupOperationForTesting: (@Sendable () async throws -> Void)? = nil,
         tokenOperationForTesting: (@Sendable () async throws -> String)? = nil,
         startupDeadline: Duration = .seconds(15),
-        audioStreamEndTimeout: Duration = .seconds(2)
+        audioStreamEndTimeout: Duration = .seconds(2),
+        rotationDrainTimeout: Duration = .seconds(3)
     ) {
         self.model = model
         self.transportForTesting = transportForTesting
@@ -178,6 +254,7 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         }
         self.startupDeadline = startupDeadline
         self.audioStreamEndTimeout = audioStreamEndTimeout
+        self.rotationDrainTimeout = rotationDrainTimeout
     }
 
     // MARK: - Real-time Session
@@ -189,8 +266,9 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         try GeminiRealtimeHandshake.validateModel(model)
         sessionGeneration &+= 1
         let generation = sessionGeneration
-        receiveBuffer = Data()
-        fragmentedTextBuffer = nil
+        sessionLanguage = language
+        framing = [:]
+        activeInterim = nil
 
         do {
             return try await HardAsyncDeadline.run(for: startupDeadline) { [weak self] in
@@ -229,7 +307,27 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         let ephemeralToken = try await provisionEphemeralToken()
         try ensureCurrentGeneration(generation)
 
-        // Configure TLS with HTTP/1.1 ALPN only
+        let (conn, sessionTransport) = Self.makeSocket()
+        self.transport = sessionTransport
+
+        do {
+            try await connectLiveSocket(
+                conn,
+                transport: sessionTransport,
+                generation: generation,
+                token: ephemeralToken,
+                language: language
+            )
+            return makeTranscriptStream(generation: generation, transport: sessionTransport)
+        } catch {
+            tearDownCurrentSession(matching: generation, transport: sessionTransport)
+            throw error
+        }
+    }
+
+    /// Raw TCP + TLS with HTTP/1.1 ALPN only. There is no WebSocket in the
+    /// protocol stack; framing is handled manually.
+    private nonisolated static func makeSocket() -> (NWConnection, GeminiRealtimeTransport) {
         let tlsOptions = NWProtocolTLS.Options()
         sec_protocol_options_add_tls_application_protocol(tlsOptions.securityProtocolOptions, "http/1.1")
 
@@ -237,54 +335,61 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         tcpOptions.enableKeepalive = true
         tcpOptions.keepaliveIdle = 30
 
-        // Raw TCP + TLS — NO WebSocket in protocol stack (we handle framing manually)
         let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
-
         let conn = NWConnection(
             host: NWEndpoint.Host(GeminiRealtimeHandshake.host),
             port: 443,
             using: params
         )
-        let sessionTransport = GeminiRealtimeTransport(connection: conn)
-        self.connection = conn
-        self.transport = sessionTransport
+        return (conn, GeminiRealtimeTransport(connection: conn))
+    }
 
-        do {
-            // Connect with 10-second timeout
-            try await connectWithTimeout(conn, seconds: 10)
-            conn.stateUpdateHandler = nil
-            try ensureCurrentSession(generation, transport: sessionTransport)
-            RealtimeDebugLog.shared.append("Gemini: TCP connected")
+    /// TCP connect, WebSocket upgrade, then the Live setup exchange. Shared by
+    /// the first connection and every goAway replacement.
+    private func connectLiveSocket(
+        _ conn: NWConnection,
+        transport: GeminiRealtimeTransport,
+        generation: UInt64,
+        token: String,
+        language: String?
+    ) async throws {
+        // Connect with 10-second timeout
+        try await connectWithTimeout(conn, seconds: 10)
+        conn.stateUpdateHandler = nil
+        try ensureOwnedConnection(generation, transport: transport)
+        RealtimeDebugLog.shared.append("Gemini: TCP connected")
 
-            // WebSocket upgrade handshake with the correct path
-            try await performUpgrade(
-                sessionTransport,
-                generation: generation,
-                token: ephemeralToken
-            )
-            RealtimeDebugLog.shared.append("Gemini: WS upgraded")
+        // WebSocket upgrade handshake with the correct path
+        try await performUpgrade(
+            transport,
+            generation: generation,
+            token: token
+        )
+        RealtimeDebugLog.shared.append("Gemini: WS upgraded")
 
-            // Send Gemini setup message as a WebSocket text frame
-            let setupJSON = buildSetupConfig(language: language)
-            let setupData = try JSONSerialization.data(withJSONObject: setupJSON)
-            try await sendTextFrame(setupData, using: sessionTransport)
-            try ensureCurrentSession(generation, transport: sessionTransport)
-            RealtimeDebugLog.shared.append("Gemini: sent setup config")
+        try await performSetup(on: transport, generation: generation, language: language)
+    }
 
-            // Wait for setupComplete response
-            let setupResponse = try await receiveTextFrame(
-                generation: generation,
-                transport: sessionTransport
-            )
-            try ensureCurrentSession(generation, transport: sessionTransport)
-            try GeminiRealtimeHandshake.validateSetupAcknowledgement(setupResponse)
-            RealtimeDebugLog.shared.append("Gemini: received setup response")
+    /// Send the setup message and wait for setupComplete. A connection carries
+    /// no audio until this returns.
+    private func performSetup(
+        on transport: GeminiRealtimeTransport,
+        generation: UInt64,
+        language: String?
+    ) async throws {
+        let setupJSON = buildSetupConfig(language: language)
+        let setupData = try JSONSerialization.data(withJSONObject: setupJSON)
+        try await sendTextFrame(setupData, using: transport)
+        try ensureOwnedConnection(generation, transport: transport)
+        RealtimeDebugLog.shared.append("Gemini: sent setup config")
 
-            return makeTranscriptStream(generation: generation, transport: sessionTransport)
-        } catch {
-            tearDownCurrentSession(matching: generation, transport: sessionTransport)
-            throw error
-        }
+        let setupResponse = try await receiveTextFrame(
+            generation: generation,
+            transport: transport
+        )
+        try ensureOwnedConnection(generation, transport: transport)
+        try GeminiRealtimeHandshake.validateSetupAcknowledgement(setupResponse)
+        RealtimeDebugLog.shared.append("Gemini: received setup response")
     }
 
     private func provisionEphemeralToken() async throws -> String {
@@ -325,23 +430,39 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
 
         let message = Self.audioInputMessage(base64Audio: data.base64EncodedString())
         let jsonData = try JSONSerialization.data(withJSONObject: message)
-        try await sendTextFrame(jsonData, using: transport)
+        do {
+            try await sendTextFrame(jsonData, using: transport)
+        } catch {
+            // A goAway rotation can retire the socket this chunk was queued on
+            // before the send completes. The session itself is healthy, so the
+            // chunk goes to the replacement instead of surfacing as a fault.
+            guard !(error is CancellationError),
+                  !Task.isCancelled,
+                  let replacement = self.transport,
+                  !replacement.matches(transport) else {
+                throw error
+            }
+            try await sendTextFrame(jsonData, using: replacement)
+        }
     }
 
     /// Flush cached audio — Gemini buffers audio and may not return results until this is sent.
     func sendAudioStreamEnd() async throws {
         guard let transport else { return }
+        try await sendTextFrame(
+            Self.audioStreamEndMessage(),
+            using: transport,
+            timeout: audioStreamEndTimeout
+        )
+    }
+
+    private nonisolated static func audioStreamEndMessage() throws -> Data {
         let message: [String: Any] = [
             "realtimeInput": [
                 "audioStreamEnd": true
             ]
         ]
-        let jsonData = try JSONSerialization.data(withJSONObject: message)
-        try await sendTextFrame(
-            jsonData,
-            using: transport,
-            timeout: audioStreamEndTimeout
-        )
+        return try JSONSerialization.data(withJSONObject: message)
     }
 
     func stopRealtimeSession() async throws {
@@ -350,6 +471,8 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
 
     var _testHasActiveTransport: Bool { transport != nil }
     var _testHasReceiveTask: Bool { receiveTask != nil }
+    var _testIsRotating: Bool { pendingRotation != nil || draining != nil }
+    var _testRetiringConnectionIsFlushed: Bool { draining?.flushed == true }
 
     private func makeTranscriptStream(
         generation: UInt64,
@@ -363,26 +486,49 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         return pair.stream
     }
 
-    private func tearDownCurrentSession() {
-        guard transport != nil || continuation != nil || receiveTask != nil || connection != nil else {
-            return
-        }
+    private var hasSessionState: Bool {
+        transport != nil || continuation != nil || receiveTask != nil
+            || pendingRotation != nil || draining != nil
+    }
+
+    /// Ends the session and every socket it owns. With `failure`, the stream
+    /// finishes throwing so the manager's reconnect path takes over.
+    private func tearDownCurrentSession(failure: Error? = nil) {
+        guard hasSessionState else { return }
 
         sessionGeneration &+= 1
         let exactContinuation = continuation
         let exactReceiveTask = receiveTask
         let exactTransport = transport
+        let exactRotation = pendingRotation
+        let exactDraining = draining
 
         continuation = nil
         receiveTask = nil
         transport = nil
-        connection = nil
-        receiveBuffer = Data()
-        fragmentedTextBuffer = nil
+        pendingRotation = nil
+        draining = nil
+        framing = [:]
+        activeInterim = nil
 
-        exactContinuation?.finish()
+        // What the retiring socket and the held-back replacement produced is
+        // real transcript; hand it over before the stream closes.
+        if let exactDraining {
+            releaseDrainOutput(exactDraining, to: exactContinuation)
+        }
+        if let failure {
+            exactContinuation?.finish(throwing: failure)
+        } else {
+            exactContinuation?.finish()
+        }
         exactReceiveTask?.cancel()
         exactTransport?.cancel()
+        exactRotation?.task?.cancel()
+        exactRotation?.deadlineTask?.cancel()
+        exactRotation?.replacement?.cancel()
+        exactDraining?.timeoutTask?.cancel()
+        exactDraining?.receiveTask?.cancel()
+        exactDraining?.transport.cancel()
     }
 
     private func tearDownCurrentSession(
@@ -395,15 +541,15 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
 
     private func tearDownCurrentSession(matching generation: UInt64) {
         guard sessionGeneration == generation else { return }
-        if transport != nil || continuation != nil || receiveTask != nil || connection != nil {
+        if hasSessionState {
             tearDownCurrentSession()
         } else {
             sessionGeneration &+= 1
-            receiveBuffer = Data()
-            fragmentedTextBuffer = nil
+            framing = [:]
         }
     }
 
+    /// True only for the socket that currently receives audio.
     private func isCurrentSession(
         _ generation: UInt64,
         transport exactTransport: GeminiRealtimeTransport
@@ -417,6 +563,27 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         transport exactTransport: GeminiRealtimeTransport
     ) throws {
         guard isCurrentSession(generation, transport: exactTransport) else {
+            throw CancellationError()
+        }
+    }
+
+    /// True for every socket the session still owns: the active one, a
+    /// replacement mid-handshake, and a retiring one that is draining.
+    private func isOwnedConnection(
+        _ generation: UInt64,
+        transport exactTransport: GeminiRealtimeTransport
+    ) -> Bool {
+        guard sessionGeneration == generation else { return false }
+        return transport?.matches(exactTransport) == true
+            || pendingRotation?.replacement?.matches(exactTransport) == true
+            || draining?.transport.matches(exactTransport) == true
+    }
+
+    private func ensureOwnedConnection(
+        _ generation: UInt64,
+        transport exactTransport: GeminiRealtimeTransport
+    ) throws {
+        guard isOwnedConnection(generation, transport: exactTransport) else {
             throw CancellationError()
         }
     }
@@ -500,7 +667,7 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
             data: requestData,
             timeout: .seconds(10)
         )
-        try ensureCurrentSession(generation, transport: transport)
+        try ensureOwnedConnection(generation, transport: transport)
 
         var accumulator = GeminiRealtimeUpgradeHeaderAccumulator()
         while true {
@@ -508,13 +675,13 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                 transport,
                 maxLength: accumulator.remainingCapacity
             )
-            try ensureCurrentSession(generation, transport: transport)
+            try ensureOwnedConnection(generation, transport: transport)
             if let result = try accumulator.append(chunk) {
                 try GeminiRealtimeHandshake.validateUpgradeResponseHeader(
                     result.header,
                     webSocketKey: wsKey
                 )
-                receiveBuffer = result.remainder
+                framing[transport.id] = Framing(receiveBuffer: result.remainder)
                 return
             }
         }
@@ -601,7 +768,11 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         }
     }
 
-    /// Ensure at least `minBytes` are available in the receive buffer.
+    private func receiveBuffer(for transport: GeminiRealtimeTransport) -> Data {
+        framing[transport.id]?.receiveBuffer ?? Data()
+    }
+
+    /// Ensure at least `minBytes` are available in this socket's receive buffer.
     private func bufferAtLeast(
         _ minBytes: Int,
         generation: UInt64,
@@ -612,21 +783,21 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                 + GeminiRealtimeUpgradeHeaderAccumulator.maximumHeaderBytes else {
             throw GeminiWebSocketProtocolError.messageTooLarge
         }
-        while receiveBuffer.count < minBytes {
+        while receiveBuffer(for: transport).count < minBytes {
             try Task.checkCancellation()
-            try ensureCurrentSession(generation, transport: transport)
-            let missingBytes = minBytes - receiveBuffer.count
+            try ensureOwnedConnection(generation, transport: transport)
+            let missingBytes = minBytes - receiveBuffer(for: transport).count
             let chunk = try await rawReceive(
                 transport,
                 maxLength: min(65_536, missingBytes)
             )
-            try ensureCurrentSession(generation, transport: transport)
+            try ensureOwnedConnection(generation, transport: transport)
             let maximumBufferedBytes = GeminiWebSocketFrameHeader.maximumPayloadBytes
                 + GeminiRealtimeUpgradeHeaderAccumulator.maximumHeaderBytes
-            guard chunk.count <= maximumBufferedBytes - receiveBuffer.count else {
+            guard chunk.count <= maximumBufferedBytes - receiveBuffer(for: transport).count else {
                 throw GeminiWebSocketProtocolError.messageTooLarge
             }
-            receiveBuffer.append(chunk)
+            framing[transport.id, default: Framing()].receiveBuffer.append(chunk)
         }
     }
 
@@ -700,9 +871,10 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         transport: GeminiRealtimeTransport
     ) async throws -> String {
         while true {
+            try ensureOwnedConnection(generation, transport: transport)
             try await bufferAtLeast(2, generation: generation, transport: transport)
             let extendedHeaderBytes: Int
-            switch receiveBuffer[1] & 0x7F {
+            switch receiveBuffer(for: transport)[1] & 0x7F {
             case 126:
                 extendedHeaderBytes = 4
             case 127:
@@ -715,7 +887,17 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                 generation: generation,
                 transport: transport
             )
-            let header = try GeminiWebSocketFrameHeader.parse(from: receiveBuffer)
+            let header: GeminiWebSocketFrameHeader?
+            do {
+                header = try GeminiWebSocketFrameHeader.parse(from: receiveBuffer(for: transport))
+            } catch {
+                // Only the framing bits: FIN, RSV, opcode, mask, length marker.
+                let bits = receiveBuffer(for: transport).prefix(2)
+                    .map { String(format: "%02X", $0) }
+                    .joined(separator: " ")
+                RealtimeDebugLog.shared.append("Gemini: rejected frame header \(bits)")
+                throw error
+            }
             guard let header else {
                 throw GeminiWebSocketProtocolError.invalidFrame
             }
@@ -724,8 +906,12 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                 generation: generation,
                 transport: transport
             )
-            let payload = Data(receiveBuffer[header.headerBytes..<header.totalFrameBytes])
-            receiveBuffer = Data(receiveBuffer.dropFirst(header.totalFrameBytes))
+            let buffered = receiveBuffer(for: transport)
+            let payload = Data(buffered[header.headerBytes..<header.totalFrameBytes])
+            framing[transport.id, default: Framing()].receiveBuffer = Data(
+                buffered.dropFirst(header.totalFrameBytes)
+            )
+            let fragmentedTextBuffer = framing[transport.id]?.fragmentedTextBuffer
 
             switch header.opcode {
             case 0x09: // Ping → reply with Pong
@@ -739,14 +925,15 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                 continue
             case 0x08: // Close
                 throw TranscriptionError.apiError(parseCloseFrame(payload))
-            case 0x01: // Text
+            case 0x01, 0x02: // Text, or binary: Gemini Live sends its JSON in
+                // binary frames. Either way the payload must decode as UTF-8.
                 guard fragmentedTextBuffer == nil else {
                     throw GeminiWebSocketProtocolError.invalidFrame
                 }
                 if header.isFinal {
                     return try decodeTextMessage(payload)
                 }
-                fragmentedTextBuffer = payload
+                framing[transport.id, default: Framing()].fragmentedTextBuffer = payload
             case 0x00: // Continuation
                 guard var fragmentedTextBuffer else {
                     throw GeminiWebSocketProtocolError.invalidFrame
@@ -757,13 +944,14 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                 }
                 fragmentedTextBuffer.append(payload)
                 if header.isFinal {
-                    self.fragmentedTextBuffer = nil
+                    framing[transport.id]?.fragmentedTextBuffer = nil
                     return try decodeTextMessage(fragmentedTextBuffer)
                 }
-                self.fragmentedTextBuffer = fragmentedTextBuffer
-            case 0x02: // Gemini realtime messages must be UTF-8 JSON text.
-                throw GeminiWebSocketProtocolError.invalidFrame
+                framing[transport.id, default: Framing()].fragmentedTextBuffer = fragmentedTextBuffer
             default:
+                RealtimeDebugLog.shared.append(
+                    "Gemini: rejected frame with opcode \(header.opcode)"
+                )
                 throw GeminiWebSocketProtocolError.invalidFrame
             }
         }
@@ -771,6 +959,7 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
 
     private func decodeTextMessage(_ data: Data) throws -> String {
         guard let text = String(data: data, encoding: .utf8) else {
+            RealtimeDebugLog.shared.append("Gemini: rejected a message that is not UTF-8")
             throw GeminiWebSocketProtocolError.invalidFrame
         }
         return text
@@ -788,24 +977,33 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
             }
         }
         do {
-            while isCurrentSession(generation, transport: transport) {
+            while isOwnedConnection(generation, transport: transport) {
                 let text = try await receiveTextFrame(
                     generation: generation,
                     transport: transport
                 )
-                try ensureCurrentSession(generation, transport: transport)
-                try handleMessage(text)
+                try ensureOwnedConnection(generation, transport: transport)
+                try handleMessage(text, generation: generation, transport: transport)
             }
         } catch {
+            guard sessionGeneration == generation else { return }
+            if draining?.transport.matches(transport) == true {
+                // The retiring socket closing or erroring just ends its drain;
+                // the session already runs on the replacement.
+                finishDrain(generation: generation, retiring: transport, reason: .closed)
+                return
+            }
             guard isCurrentSession(generation, transport: transport) else { return }
             if error is CancellationError || Task.isCancelled { return }
-            let exactContinuation = continuation
-            exactContinuation?.finish(throwing: error)
-            tearDownCurrentSession(matching: generation, transport: transport)
+            tearDownCurrentSession(failure: error)
         }
     }
 
-    private func handleMessage(_ text: String) throws {
+    private func handleMessage(
+        _ text: String,
+        generation: UInt64,
+        transport: GeminiRealtimeTransport
+    ) throws {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
@@ -815,22 +1013,31 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
             "Gemini: received message with \(json.count) top-level fields"
         )
 
+        if let goAway = GeminiRealtimeGoAway(message: json) {
+            handleGoAway(goAway, generation: generation, transport: transport)
+        }
+
         // Handle serverContent — inputTranscription comes here
         let serverContent = (json["serverContent"] ?? json["server_content"]) as? [String: Any]
         if let serverContent {
             let turnComplete = (serverContent["turnComplete"] ?? serverContent["turn_complete"]) as? Bool ?? false
 
-            if let transcript = extractTranscript(from: serverContent, turnComplete: turnComplete) {
+            let transcript = extractTranscript(from: serverContent, turnComplete: turnComplete)
+            if let transcript {
                 RealtimeDebugLog.shared.append(
                     "Gemini: yielded \(transcript.text.utf8.count) transcript bytes"
                         + (transcript.isFinal ? " (final)" : " (interim)")
                 )
-                continuation?.yield(TranscriptDelta(
-                    text: transcript.text,
-                    isFinal: transcript.isFinal,
-                    language: nil,
-                    replacesHypothesis: usesDedicatedTranscription
-                ))
+                deliver(
+                    TranscriptDelta(
+                        text: transcript.text,
+                        isFinal: transcript.isFinal,
+                        language: nil,
+                        replacesHypothesis: usesDedicatedTranscription
+                    ),
+                    generation: generation,
+                    transport: transport
+                )
             } else {
                 NSLog(
                     "[GeminiRealtime] serverContent had %d fields without a transcript",
@@ -840,11 +1047,334 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                     "Gemini: serverContent had \(serverContent.count) fields without a transcript"
                 )
             }
+            settleDrainIfFinished(
+                generation: generation,
+                transport: transport,
+                turnSettled: turnComplete || transcript?.isFinal == true
+            )
         }
 
         if json["error"] != nil {
             throw TranscriptionError.apiError("Gemini realtime request failed")
         }
+    }
+
+    /// Route one delta by the socket it came from. The retiring socket's text
+    /// covers earlier audio, so it goes out at once; the replacement's waits
+    /// until the retiring socket is done.
+    private func deliver(
+        _ delta: TranscriptDelta,
+        generation: UInt64,
+        transport: GeminiRealtimeTransport
+    ) {
+        guard sessionGeneration == generation else { return }
+        if var retiring = draining, retiring.transport.matches(transport) {
+            retiring.pendingInterim = delta.isFinal ? nil : delta.text
+            draining = retiring
+            continuation?.yield(delta)
+            return
+        }
+        guard isCurrentSession(generation, transport: transport) else { return }
+        activeInterim = delta.isFinal ? nil : delta.text
+        if var retiring = draining {
+            retiring.heldDeltas.append(delta)
+            draining = retiring
+            return
+        }
+        continuation?.yield(delta)
+    }
+
+    // MARK: - goAway Rotation
+
+    private func handleGoAway(
+        _ goAway: GeminiRealtimeGoAway,
+        generation: UInt64,
+        transport retiring: GeminiRealtimeTransport
+    ) {
+        // A notice from a socket that is already retiring, or a repeat while
+        // its replacement is being dialed, needs nothing new.
+        guard isCurrentSession(generation, transport: retiring),
+              pendingRotation == nil else { return }
+        if let previous = draining {
+            // Rotations are about ten minutes apart and a drain lasts seconds;
+            // settle it now rather than juggle three sockets.
+            finishDrain(generation: generation, retiring: previous.transport, reason: .superseded)
+        }
+
+        let grace = goAway.timeLeft ?? Self.defaultGoAwayGrace
+        RealtimeDebugLog.shared.append("Gemini: goAway received, \(grace) left; opening replacement")
+
+        var rotation = PendingRotation(retiring: retiring)
+        rotation.deadlineTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: grace)
+            } catch {
+                return
+            }
+            await self?.rotationDeadlineElapsed(generation: generation, retiring: retiring)
+        }
+        rotation.task = Task { [weak self] in
+            await self?.runRotation(generation: generation, retiring: retiring)
+        }
+        pendingRotation = rotation
+    }
+
+    private func isRotationPending(
+        _ generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) -> Bool {
+        isCurrentSession(generation, transport: retiring)
+            && pendingRotation?.retiring.matches(retiring) == true
+    }
+
+    private func runRotation(
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) async {
+        for attempt in 1...Self.maxRotationAttempts {
+            if attempt > 1 {
+                do {
+                    try await Task.sleep(for: Self.rotationRetryDelay)
+                } catch {
+                    return
+                }
+            }
+            guard isRotationPending(generation, retiring: retiring) else { return }
+            do {
+                let replacement = try await HardAsyncDeadline.run(for: startupDeadline) { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    return try await self.openReplacement(generation: generation, retiring: retiring)
+                }
+                adoptReplacement(replacement, generation: generation, retiring: retiring)
+                return
+            } catch {
+                guard isRotationPending(generation, retiring: retiring) else { return }
+                abandonReplacement(generation: generation, retiring: retiring)
+                RealtimeDebugLog.shared.append("Gemini: replacement attempt \(attempt) failed")
+            }
+        }
+        // The retiring socket keeps working until the goAway deadline, which
+        // hands the session to the ordinary failure path.
+        RealtimeDebugLog.shared.append("Gemini: no replacement; keeping the retiring connection until its deadline")
+    }
+
+    /// Dial and set up a replacement socket. Audio stays on `retiring` until
+    /// this returns, i.e. until the replacement acknowledged setup.
+    private func openReplacement(
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) async throws -> GeminiRealtimeTransport {
+        let language = sessionLanguage
+        if transportForTesting != nil || transportFactoryForTesting != nil {
+            // Injected sockets skip TCP and the upgrade, but a replacement
+            // still runs the setup exchange: its acknowledgement is what makes
+            // moving audio safe.
+            guard let transportFactoryForTesting else {
+                throw TranscriptionError.apiError("No replacement Gemini test transport")
+            }
+            let replacement = transportFactoryForTesting()
+            try registerReplacement(replacement, generation: generation, retiring: retiring)
+            if authenticateInjectedTransport {
+                _ = try await provisionEphemeralToken()
+                try ensureOwnedConnection(generation, transport: replacement)
+            }
+            try await performSetup(on: replacement, generation: generation, language: language)
+            return replacement
+        }
+
+        let token = try await provisionEphemeralToken()
+        let (conn, replacement) = Self.makeSocket()
+        try registerReplacement(replacement, generation: generation, retiring: retiring)
+        try await connectLiveSocket(
+            conn,
+            transport: replacement,
+            generation: generation,
+            token: token,
+            language: language
+        )
+        return replacement
+    }
+
+    /// Record the replacement before its first suspension so teardown and the
+    /// goAway deadline can cancel it.
+    private func registerReplacement(
+        _ replacement: GeminiRealtimeTransport,
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) throws {
+        guard isRotationPending(generation, retiring: retiring) else {
+            throw CancellationError()
+        }
+        pendingRotation?.replacement = replacement
+    }
+
+    private func abandonReplacement(
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) {
+        guard isRotationPending(generation, retiring: retiring),
+              let replacement = pendingRotation?.replacement else { return }
+        pendingRotation?.replacement = nil
+        framing[replacement.id] = nil
+        replacement.cancel()
+    }
+
+    /// Move audio to the ready replacement and start draining the retiring
+    /// socket. The consumer's stream carries on untouched.
+    private func adoptReplacement(
+        _ replacement: GeminiRealtimeTransport,
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) {
+        guard isRotationPending(generation, retiring: retiring),
+              pendingRotation?.replacement?.matches(replacement) == true else {
+            framing[replacement.id] = nil
+            replacement.cancel()
+            return
+        }
+        pendingRotation?.deadlineTask?.cancel()
+        pendingRotation = nil
+
+        let drainTimeout = rotationDrainTimeout
+        var retired = DrainingConnection(
+            transport: retiring,
+            receiveTask: receiveTask,
+            pendingInterim: activeInterim
+        )
+        retired.timeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: drainTimeout)
+            } catch {
+                return
+            }
+            await self?.finishDrain(generation: generation, retiring: retiring, reason: .timedOut)
+        }
+        draining = retired
+        activeInterim = nil
+
+        transport = replacement
+        receiveTask = Task { [weak self] in
+            await self?.receiveLoop(generation: generation, transport: replacement)
+        }
+        Task { [weak self] in
+            await self?.flushRetiring(generation: generation, retiring: retiring)
+        }
+        RealtimeDebugLog.shared.append("Gemini: audio moved to replacement connection")
+    }
+
+    /// audioStreamEnd makes Gemini transcribe what it has buffered instead of
+    /// waiting for more speech that will never arrive on this socket.
+    private func flushRetiring(
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) async {
+        do {
+            try await sendTextFrame(
+                Self.audioStreamEndMessage(),
+                using: retiring,
+                timeout: audioStreamEndTimeout
+            )
+        } catch {
+            finishDrain(generation: generation, retiring: retiring, reason: .flushFailed)
+            return
+        }
+        guard sessionGeneration == generation,
+              var retired = draining,
+              retired.transport.matches(retiring) else { return }
+        retired.flushed = true
+        draining = retired
+    }
+
+    /// After the flush, a settled turn with no hypothesis left open means the
+    /// retiring socket has handed over everything it heard.
+    private func settleDrainIfFinished(
+        generation: UInt64,
+        transport: GeminiRealtimeTransport,
+        turnSettled: Bool
+    ) {
+        guard turnSettled,
+              let retired = draining,
+              retired.transport.matches(transport),
+              retired.flushed,
+              retired.pendingInterim == nil else { return }
+        finishDrain(generation: generation, retiring: transport, reason: .settled)
+    }
+
+    /// Why a retiring socket stopped draining. Logged so a live run shows
+    /// whether Gemini answers audioStreamEnd or the window has to expire.
+    private enum DrainEnd: String {
+        case settled = "settled after flush"
+        case closed = "closed by server"
+        case timedOut = "drain window elapsed"
+        case flushFailed = "flush failed"
+        case superseded = "next goAway"
+    }
+
+    private func finishDrain(
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport,
+        reason: DrainEnd
+    ) {
+        guard sessionGeneration == generation,
+              let retired = draining,
+              retired.transport.matches(retiring) else { return }
+        draining = nil
+        retired.timeoutTask?.cancel()
+        framing[retiring.id] = nil
+        releaseDrainOutput(retired, to: continuation)
+        Task { [weak self] in
+            await self?.closeRetired(retiring, receiveTask: retired.receiveTask)
+        }
+        RealtimeDebugLog.shared.append("Gemini: retired previous connection (\(reason.rawValue))")
+    }
+
+    private func releaseDrainOutput(
+        _ retired: DrainingConnection,
+        to continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
+    ) {
+        // An unfinalized hypothesis is still the best text for that audio. The
+        // dedicated model's next interim replaces the open hypothesis in
+        // place, so without this the replacement would overwrite it.
+        if let interim = retired.pendingInterim, usesDedicatedTranscription {
+            continuation?.yield(TranscriptDelta(
+                text: interim,
+                isFinal: true,
+                language: nil,
+                replacesHypothesis: true
+            ))
+        }
+        for delta in retired.heldDeltas {
+            continuation?.yield(delta)
+        }
+    }
+
+    /// Close code 1000 is the orderly goodbye goAway asks for; a client still
+    /// attached at the deadline is aborted with 1008 instead.
+    private func closeRetired(
+        _ retiring: GeminiRealtimeTransport,
+        receiveTask: Task<Void, Never>?
+    ) async {
+        try? await sendFrame(
+            opcode: 0x08,
+            payload: Data([0x03, 0xE8]),
+            using: retiring,
+            timeout: .seconds(1)
+        )
+        retiring.cancel()
+        receiveTask?.cancel()
+    }
+
+    private func rotationDeadlineElapsed(
+        generation: UInt64,
+        retiring: GeminiRealtimeTransport
+    ) {
+        guard isRotationPending(generation, retiring: retiring) else { return }
+        RealtimeDebugLog.shared.append("Gemini: goAway deadline passed without a replacement")
+        tearDownCurrentSession(
+            failure: TranscriptionError.apiError(
+                "Gemini realtime connection expired before a replacement was ready"
+            )
+        )
     }
 
     // MARK: - Helpers

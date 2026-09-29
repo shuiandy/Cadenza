@@ -1623,6 +1623,151 @@ struct RecordingEngineProviderBoundaryTests {
         #expect(engine.recordingState == .recording)
     }
 
+    /// A recording engine whose Gemini realtime session runs over scripted
+    /// sockets. Services after the first stand in for reconnects. The spy and
+    /// service factory come back as `harness` because the engine and manager
+    /// only hold them weakly.
+    private func makeGeminiRotationEngine(
+        _ gemini: GeminiRealtimeTranscriber,
+        reconnects: [any TranscriptionService] = [],
+        defaults: UserDefaults
+    ) async throws -> (engine: RecordingEngine, manager: TranscriptionManager, harness: [AnyObject]) {
+        defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
+        defaults.set("en", forKey: "transcriptionLanguage")
+        defaults.set(AIProvider.gemini.rawValue, forKey: "realtimeTranscriptionProvider")
+        defaults.set("en", forKey: "realtimeTranscriptionLanguage")
+        defaults.set(true, forKey: "enableRealtimeTranscription")
+
+        let factory = EngineRealtimeServiceFactory([gemini as any TranscriptionService] + reconnects)
+        let manager = TranscriptionManager(realtimeServiceFactory: factory.makeFactory())
+        let spy = RecordingEngineBoundarySpy()
+        spy.keys[.gemini] = "gemini-key"
+        let engine = RecordingEngine(
+            dependencies: spy.dependencies(
+                defaults: defaults,
+                usesInjectedRealtimeManager: true
+            ),
+            transcriptionManager: manager
+        )
+        try await attachIsolatedStore(to: engine, audioRoot: spy.storageRoot)
+        return (engine, manager, [spy, factory])
+    }
+
+    @Test func geminiGoAwayRotationLeavesReconnectBudgetAndHintUntouched() async throws {
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+
+        let transportA = GeminiTransportProbe(autoCompletesSends: true)
+        let transportB = GeminiTransportProbe(autoCompletesSends: true)
+        let transports = GeminiTransportFactoryProbe([
+            await transportA.makeTransport(),
+            await transportB.makeTransport(),
+        ])
+        let gemini = GeminiRealtimeTranscriber(
+            apiKey: "gemini-key",
+            model: "gemini-3.5-transcribe-live",
+            transportFactoryForTesting: { transports.next() },
+            rotationDrainTimeout: .milliseconds(40)
+        )
+        // No reconnect service is configured: a reconnect attempt would fail
+        // and raise the disconnected hint.
+        let (engine, manager, harness) = try await makeGeminiRotationEngine(
+            gemini,
+            defaults: isolated.defaults
+        )
+        defer {
+            engine.forceReset()
+            withExtendedLifetime(harness) {}
+        }
+
+        try await engine.startRecording(captureMicrophone: false, skipPermissionPrompt: true)
+        #expect(await waitUntilAsync {
+            let requests = await transportA.receiveRequestCount
+            return manager.isTranscribing && requests == 1
+        })
+
+        await transportA.completeReceive(
+            at: 0,
+            data: geminiServerTextFrame(#"{"goAway":{"timeLeft":"50s"}}"#)
+        )
+        #expect(await waitUntilAsync { await transportB.receiveRequestCount == 1 })
+        await transportB.completeReceive(
+            at: 0,
+            data: geminiServerTextFrame(#"{"setupComplete":{}}"#)
+        )
+        #expect(await waitUntilAsync { await transportA.cancelCount == 1 })
+
+        // Checked before any content delta, which would refill the budget
+        // anyway and hide a spent reconnect.
+        #expect(engine._test_realtimeReconnectCount == 0)
+        #expect(engine._test_isReconnectingRealtime == false)
+        #expect(engine.realtimeHint == nil)
+        #expect(manager.isTranscribing)
+        #expect(engine.recordingState == .recording)
+
+        #expect(await waitUntilAsync { await transportB.receiveRequestCount == 2 })
+        await transportB.completeReceive(
+            at: 1,
+            data: geminiServerTextFrame(#"{"serverContent":{"inputTranscription":{"text":"after rotation"}}}"#)
+        )
+        #expect(await waitUntilAsync { manager.fullText == "after rotation" })
+        #expect(engine.realtimeHint == nil)
+        #expect(await transportB.cancelCount == 0)
+    }
+
+    @Test func geminiGoAwayWithoutReplacementFallsBackToReconnect() async throws {
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+
+        let transportA = GeminiTransportProbe(autoCompletesSends: true)
+        let transportB = GeminiTransportProbe(autoCompletesSends: true)
+        let transports = GeminiTransportFactoryProbe([
+            await transportA.makeTransport(),
+            await transportB.makeTransport(),
+        ])
+        let gemini = GeminiRealtimeTranscriber(
+            apiKey: "gemini-key",
+            model: "gemini-3.5-transcribe-live",
+            transportFactoryForTesting: { transports.next() }
+        )
+        let reconnect = EngineOwnedRealtimeService(blocksStop: false)
+        let (engine, manager, harness) = try await makeGeminiRotationEngine(
+            gemini,
+            reconnects: [reconnect],
+            defaults: isolated.defaults
+        )
+        defer {
+            engine.forceReset()
+            withExtendedLifetime(harness) {}
+        }
+
+        try await engine.startRecording(captureMicrophone: false, skipPermissionPrompt: true)
+        #expect(await waitUntilAsync {
+            let requests = await transportA.receiveRequestCount
+            return manager.isTranscribing && requests == 1
+        })
+
+        // The replacement never acknowledges setup before the deadline.
+        await transportA.completeReceive(
+            at: 0,
+            data: geminiServerTextFrame(#"{"goAway":{"timeLeft":"0.1s"}}"#)
+        )
+
+        #expect(await waitUntilAsync(timeout: .seconds(3)) {
+            let starts = await reconnect.startCount
+            return starts == 1 && !engine._test_isReconnectingRealtime
+        })
+        #expect(engine._test_realtimeReconnectCount == 1)
+        #expect(engine.recordingState == .recording)
+        #expect(manager.isTranscribing)
+        // The probes record cancel on their own tasks.
+        #expect(await waitUntilAsync {
+            let retired = await transportA.cancelCount
+            let replacement = await transportB.cancelCount
+            return retired == 1 && replacement == 1
+        })
+    }
+
     @Test func forceResetCancelsHungRealtimeStartup() async throws {
         let isolated = makeDefaults()
         defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }

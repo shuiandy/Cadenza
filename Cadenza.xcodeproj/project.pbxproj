@@ -625,7 +625,7 @@
 		1140ECD29D1B77535C3C289A /* GoogleEventParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleEventParserTests.swift; sourceTree = "<group>"; };
 		1233B1CC2F4FDB9C6FCEDFDD /* RecordingAudioFinalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingAudioFinalizer.swift; sourceTree = "<group>"; };
 		12D200F135F25456D5960AEB /* MarkdownMirrorServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownMirrorServiceTests.swift; sourceTree = "<group>"; };
-		13B06F5191E0A2242DF9730F /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
+		1307C7CC683B0C84EFD8C637 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
 		15DE55F386BAE3B2F3F418D3 /* SpeakerVoiceSample.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeakerVoiceSample.swift; sourceTree = "<group>"; };
 		161D65EBBC78B75554A210D2 /* MeetingPrepGeneratorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetingPrepGeneratorTests.swift; sourceTree = "<group>"; };
 		169C6728CA47C583DB80276F /* SpeakerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeakerProfile.swift; sourceTree = "<group>"; };
@@ -1215,15 +1215,6 @@
 			path = Main;
 			sourceTree = "<group>";
 		};
-		0E8B5F59EFD81A8147FD15B2 /* Cadenza */ = {
-			isa = PBXGroup;
-			children = (
-				13B06F5191E0A2242DF9730F /* Signing.xcconfig */,
-			);
-			name = Cadenza;
-			path = .;
-			sourceTree = "<group>";
-		};
 		0F95B8EE6AC39DA997AF170D /* Persistence */ = {
 			isa = PBXGroup;
 			children = (
@@ -1744,9 +1735,9 @@
 			isa = PBXGroup;
 			children = (
 				6CC5079B706643F82BA37E7B /* Cadenza */,
-				0E8B5F59EFD81A8147FD15B2 /* Cadenza */,
 				85EDDFA827C1F481D30676B9 /* CadenzaMCP */,
 				7EF43FD7C047D735F2ACB731 /* CadenzaTests */,
+				B0CD975BDCC5E73FCF5DD8AD /* Configuration */,
 				47BD6E1E8D941720FAF815FC /* Products */,
 			);
 			sourceTree = "<group>";
@@ -1868,6 +1859,14 @@
 				F8E48D525BA9B6AF153C0666 /* TranscriptModelTests.swift */,
 			);
 			path = Models;
+			sourceTree = "<group>";
+		};
+		B0CD975BDCC5E73FCF5DD8AD /* Configuration */ = {
+			isa = PBXGroup;
+			children = (
+				1307C7CC683B0C84EFD8C637 /* Signing.xcconfig */,
+			);
+			path = Configuration;
 			sourceTree = "<group>";
 		};
 		B21C2BF4B665978783583C9C /* Shared */ = {
@@ -3037,7 +3036,7 @@
 				CODE_SIGN_ENTITLEMENTS = Cadenza/Cadenza.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = Cadenza/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -3045,7 +3044,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shuiandy.CadenzaTestHost;
 				PRODUCT_MODULE_NAME = Cadenza;
 				PRODUCT_NAME = CadenzaTestHost;
@@ -3122,7 +3121,7 @@
 				CODE_SIGN_ENTITLEMENTS = Cadenza/Cadenza.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = Cadenza/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -3130,7 +3129,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shuiandy.Cadenza;
 				PRODUCT_MODULE_NAME = Cadenza;
 				PRODUCT_NAME = Cadenza;
@@ -3150,7 +3149,7 @@
 				CODE_SIGN_ENTITLEMENTS = Cadenza/Cadenza.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = Cadenza/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -3158,7 +3157,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.shuiandy.Cadenza;
 				PRODUCT_MODULE_NAME = Cadenza;
 				PRODUCT_NAME = Cadenza;
@@ -3171,7 +3170,7 @@
 		};
 		7D9FC44F8BBF01F44D0F3456 /* Test Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 13B06F5191E0A2242DF9730F /* Signing.xcconfig */;
+			baseConfigurationReference = 1307C7CC683B0C84EFD8C637 /* Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -3235,7 +3234,7 @@
 		};
 		A1E13D07AC9970248FBC4F54 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 13B06F5191E0A2242DF9730F /* Signing.xcconfig */;
+			baseConfigurationReference = 1307C7CC683B0C84EFD8C637 /* Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -3299,7 +3298,7 @@
 		};
 		A4D6FA68988E79D8F0EAFCE7 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 13B06F5191E0A2242DF9730F /* Signing.xcconfig */;
+			baseConfigurationReference = 1307C7CC683B0C84EFD8C637 /* Signing.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;

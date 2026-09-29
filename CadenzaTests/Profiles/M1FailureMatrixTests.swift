@@ -63,15 +63,18 @@ struct M1FailureMatrixTests {
 
     @MainActor
     private func populateMinimalSource(_ fixture: Fixture) throws {
-        let container = try ModelContainer(
-            for: RecordingsStore.schema,
-            configurations: ModelConfiguration(url: fixture.paths.legacyStoreURL)
-        )
-        let context = ModelContext(container)
-        let recording = Recording(id: UUID(), title: "minimal")
-        recording.audioFilePath = fixture.audioRoot.appendingPathComponent("a.m4a").path
-        context.insert(recording)
-        try context.save()
+        try autoreleasepool {
+            let container = try ModelContainer(
+                for: RecordingsStore.schema,
+                configurations: ModelConfiguration(url: fixture.paths.legacyStoreURL)
+            )
+            let context = ModelContext(container)
+            let recording = Recording(id: UUID(), title: "minimal")
+            recording.audioFilePath = fixture.audioRoot.appendingPathComponent("a.m4a").path
+            context.insert(recording)
+            try context.save()
+        }
+        try waitForSQLiteWriteLockRelease(at: fixture.paths.legacyStoreURL)
     }
 
     // MARK: - Full-graph integrity
@@ -439,15 +442,18 @@ struct M1FailureMatrixTests {
     /// folder) migrates directly into the profile layout in one hop.
     @MainActor
     private func populateStore(at url: URL, titles: [String]) throws {
-        let container = try ModelContainer(
-            for: RecordingsStore.schema,
-            configurations: ModelConfiguration(url: url)
-        )
-        let context = ModelContext(container)
-        for title in titles {
-            context.insert(Recording(id: UUID(), title: title))
+        try autoreleasepool {
+            let container = try ModelContainer(
+                for: RecordingsStore.schema,
+                configurations: ModelConfiguration(url: url)
+            )
+            let context = ModelContext(container)
+            for title in titles {
+                context.insert(Recording(id: UUID(), title: title))
+            }
+            try context.save()
         }
-        try context.save()
+        try waitForSQLiteWriteLockRelease(at: url)
     }
 
     @Test @MainActor

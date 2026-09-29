@@ -427,3 +427,41 @@ func makeTestPendingTransfer(
         targetEvidence: .init(profile: target)
     )
 }
+
+struct SQLiteWriteLockWaitFailure: Error, CustomStringConvertible {
+    let path: String
+    let reason: String
+    var description: String { "\(reason): \(path)" }
+}
+
+/// Waits until no connection holds the write lock on a store a test just
+/// populated through a `ModelContainer`. SwiftData closes its SQLite
+/// connection when the container deallocates, which can lag the last
+/// `save()` on a loaded machine; a boot that follows immediately would
+/// then find the source busy and fail closed, a fixture race rather than
+/// a migration defect.
+func waitForSQLiteWriteLockRelease(at url: URL, timeout: TimeInterval = 5) throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            throw SQLiteWriteLockWaitFailure(path: url.path, reason: "open failed")
+        }
+        sqlite3_busy_timeout(db, 50)
+        let begin = sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil)
+        if begin == SQLITE_OK {
+            _ = sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            return
+        }
+        guard begin == SQLITE_BUSY || begin == SQLITE_LOCKED else {
+            throw SQLiteWriteLockWaitFailure(
+                path: url.path, reason: String(cString: sqlite3_errmsg(db))
+            )
+        }
+        Thread.sleep(forTimeInterval: 0.02)
+    } while Date() < deadline
+    throw SQLiteWriteLockWaitFailure(
+        path: url.path, reason: "write lock still held after \(timeout)s"
+    )
+}
