@@ -591,13 +591,17 @@ OpenAI `gpt-4o-transcribe-diarize` 使用 `diarized_json` response format（不�
 | 参数 | 值 |
 | --- | --- |
 | 会话就绪等待 | 10s，等待 `session.updated` 确认配置 |
-| `gpt-live-transcribe` | `turn_detection: null`，客户端按下列阈值 commit |
+| `gpt-live-transcribe` | `turn_detection: null`（服务端拒绝 turn detection），客户端按 `LiveCommitPolicy` commit |
 | 旧模型 server VAD | 阈值 0.5，静音窗口 500ms |
-| commit 间隔 | 2.8s |
-| commit 字节阈值 | 144,000 bytes |
+| 停顿 commit | 说话后静音 ≥ 500ms 立即 commit（`PauseDetector`） |
+| 短停顿 commit | 本轮满 144,000 bytes（3s）后，说话后静音 ≥ 200ms（按 20ms 子帧计）即 commit |
+| 兜底 commit | 连续说话 288,000 bytes（6s）或距上次 commit 6s |
 | 最小 commit | 20,000 bytes |
+| 发送粒度 | 采集缓冲（约 21ms）整条 append；大于 2,048 bytes 的块（如重连补发）按 20ms 切片，停顿落在块内也在原处 commit |
 
-OpenAI 实时配置按明确模型能力分流：`gpt-live-transcribe` 用 `languages` 数组，不请求 logprobs；旧模型保留 `language` 和 server VAD。`session.created` 只代表连接建立，不能作为配置成功；配置错误或断连直接结束 startup 并关闭该 attempt 的 socket。transcriber 是单次会话 actor，音频发送后检查 commit 阈值，停止时仅提交达到最小长度的尾部。协议回归测试注入虚构 WebSocket 事件，不访问 API 或真实音频。
+OpenAI 实时配置按明确模型能力分流：`gpt-live-transcribe` 用 `languages` 数组，不请求 logprobs；旧模型保留 `language` 和 server VAD。`session.created` 只代表连接建立，不能作为配置成功；配置错误或断连直接结束 startup 并关闭该 attempt 的 socket。transcriber 是单次会话 actor，音频发送后检查 commit 条件，停止时仅提交达到最小长度的尾部。live 模型边收音频边吐 delta，但句尾要等 commit 才出，所以固定间隔 commit 会让每句说完后还要等下一个周期；`PauseDetector` 以最近 5s 内最安静的 20ms 子帧为底噪（minimum statistics），100ms 帧 RMS 超过 max(150, 底噪×2) 算说话，说话后静音满 500ms 即 commit。2026-09-29 用虚构双语片段实测：说完到字幕补全从 p50 约 1.7s（p90 2.8s）降到 0.6–0.9s，混入比语音低 20 dB 的粉红噪声或办公室人声仍约 1s，准确率不变；固定阈值在稳定底噪下完全找不到停顿，底噪倍数取 3、4 会把轻音节误判为静音而切断句子。找不到停顿时（如密集背景人声）退回 6s 兜底，等同旧的固定节奏。
+
+流利说话常常超过 6s 都没有 500ms 停顿，兜底落在哪就切在哪，经常切进词中间，模型会在切口两侧各转出一次（"end of October. October and"）。所以一轮满 3s 后，200ms 的短静音也结束这一轮。依据（2026-09-29，同一批虚构片段）：流利语句内部的静音（塞音闭塞、词间小停顿）以 20ms 子帧计最长 120ms，短语之间是 200–300ms；把片段用 250ms 间隔拼成 88s 连续语音后离线模拟，兜底原本 8 次切进词中间，加短停顿后纯净音频为 0 次、低 20 dB 粉红噪声下为 4 次。对真实服务 A/B 三轮：一轮结尾落在标点处的比例，纯净音频从约 61% 升到 92%，粉红噪声从 63% 到 89%，词错率没有变差；办公室人声会掩盖短停顿，只从 33% 升到 47%，更多轮次仍靠兜底。协议回归测试注入虚构 WebSocket 事件，不访问 API 或真实音频。
 
 #### Gemini `GeminiRealtimeTranscriber`
 
@@ -613,11 +617,11 @@ OpenAI 实时配置按明确模型能力分流：`gpt-live-transcribe` 用 `lang
 | 转录配置 | `inputAudioTranscription: { languageCodes: [...] }` |
 | 会话上限 | 约 10 分钟；约 540s 时服务端发 `goAway`（`timeLeft` 约 50s），transcriber 内部轮换连接 |
 | goAway 轮换 | 替换连接每次尝试共用 startup deadline，最多 3 次、间隔 1s；无 `timeLeft` 时按 30s 计 |
-| 旧连接排空窗口 | 3s（flush 后收到定稿即提前结束；2026-09-28 实测句中切换约 0.4s 回定稿，静音处切换等满窗口） |
+| 旧连接排空窗口 | 固定 3s，只在服务端先关闭旧连接时提前结束（2026-09-28 实测句中切换约 0.4s 回定稿，静音处切换服务端不回） |
 
 转录文本提取优先级：`inputTranscription` → `interimInputTranscription` → `outputTranscription`。不使用 `modelTurn`（那是模型的语音回复，不是转录结果）。两代模型对 `inputTranscription` 的语义不同：专用 ASR 把它当作**整句定稿**（interim 走单独字段，且每条 delta 是整句重写，故打 `replacesHypothesis`），旧对话模型把它当作**增量**、靠 `turnComplete` 判定终态。`GeminiRealtimeTranscriber.usesDedicatedTranscription` 按 model ID 里是否含 `transcribe` 分流。实现为 actor，不再依赖 legacy `@unchecked Sendable`；raw send/receive 的 callback、deadline、caller cancellation 共享 resume-once 状态，timeout/cancel 只撤销本 session 的 exact transport。stop 先 finish stream、取消 retained receive task 和 transport，绝不等待 WebSocket close frame。startup catch 还会同时校验 generation 与 transport identity，A 的迟到失败不能撤销复用同一 service 实例后的 B。
 
-`goAway` 是计划内轮换，不是故障：收到后 transcriber 在同一条 transcript stream 背后另开一条连接（经 `GeminiEphemeralTokenProvider` 复用或新签 token，重放同一份 setup，等 `setupComplete`），此前音频仍发往旧连接。新连接就绪后音频立即切过去，旧连接收 `audioStreamEnd` 进入排空：它的文本照常先送出，新连接的 delta 暂存到旧连接落定（flush 后收到定稿、服务端关闭或排空窗口到期）再按序放出；旧连接没来得及定稿的专用 ASR 假设会补发成 final，避免被新连接的 interim 原地覆盖。随后旧连接发 1000 close frame 再断开。整个过程 stream 不结束，`onRealtimeFailure` 不触发，RecordingEngine 的重连额度与中断提示都不受影响。替换连接在 `timeLeft` 内没就绪时，stream 以错误结束，交回 RecordingEngine 现有的失败重连路径。轮换期间两条 socket 同时读帧，所以接收缓冲与分片缓冲按 transport identity 分开存放。
+`goAway` 是计划内轮换，不是故障：收到后 transcriber 在同一条 transcript stream 背后另开一条连接（经 `GeminiEphemeralTokenProvider` 复用或新签 token，重放同一份 setup，等 `setupComplete`），此前音频仍发往旧连接。新连接就绪后音频立即切过去，旧连接收 `audioStreamEnd` 进入排空：它的文本照常先送出，新连接的 delta 暂存到排空窗口结束（或服务端先关闭旧连接）再按序放出。窗口不因 flush 之后到来的定稿提前结束：那条定稿可能只是上一句自然结束，旧连接对切换前最后约 1 秒音频的回复还在后面。排空结束时旧连接的未定稿段会补发成 final 再放出新连接的文本：专用 ASR 的 interim 是整句假设，直接作为定稿；对话模型的 interim 是增量，把最后一个增量原样重发，manager 合并后文本不变但段落关闭。否则新连接的文本会原地覆盖（专用 ASR）或接续（对话模型）旧连接的段落。随后旧连接发 1000 close frame 再断开。整个过程 stream 不结束，`onRealtimeFailure` 不触发，RecordingEngine 的重连额度与中断提示都不受影响。替换连接在 `timeLeft` 内没就绪时，stream 以错误结束，交回 RecordingEngine 现有的失败重连路径。轮换期间两条 socket 同时读帧，所以接收缓冲与分片缓冲按 transport identity 分开存放。
 
 服务端的 JSON 消息用**二进制帧**（opcode 0x02）发送，`setupComplete` 也是。文本帧与二进制帧同样按 UTF-8 解码，解码失败才算非法帧；2026-07-12 的传输加固曾把二进制帧一律拒掉，导致建连必败，直到 2026-09-28 实测才发现。
 
@@ -672,6 +676,16 @@ callback 必须在 capture 前安装，因为 `AudioMixer` 会在启动时快照
 `RecordingEngine` 的 recording-ID guard 负责 UI 归属；每次 initial/reconnect 另有不可变 `RealtimeAttemptID`，解决同一录音内多个 attempt 的竞态。`TranscriptionManager` 同时维护 session generation：service 在握手完成前只存在于 pending 集合；只有 generation 与 attempt 都仍 current 才能原子提交为 active。延迟 cleanup 必须 `beginRealtimeStop(matching:)`，stop/reset 则在排队异步 close 前同步捕获精确 pending/active service。即使 provider 握手忽略 cancellation 后迟到，也只能关闭自己，不能覆盖新 session 的 stream、task、delta、watchdog 或 audio queue 状态。
 
 生产 stop 采用安全优先语义：立即 detach A，允许 B 启动，A 在 detach 后到达的 delta 丢弃，录后批量转录仍是权威结果。显式 Quality Comparison 采用不同的 draining 语义：A 保持 owner、阻止 B、接收 provider stop 时的 final delta；总 drain deadline 为 3s，且只发起一次 provider stop，完成或超时后都释放 owner。Quality 的连接和通用 test timeout 也使用 hard deadline，realtime timeout cleanup 只匹配自己的 attempt。
+
+#### 断线重连与音频补发（2026-09-29）
+
+OpenAI 实时连接会被服务端中途关闭：直接 TCP FIN、没有 WebSocket close frame，客户端收到 ENOTCONN；实测约 1/8 的一分钟会话会断一次，Gemini 同期没有断过。以前重连先固定等 2s，再加上拆除和握手，这段时间采集的音频直接丢弃；旧会话已经发出、但还没 commit 或还没出定稿的音频（通常是 1–3s 的半句话）也一起丢失。
+
+- **立即重连**：流启动或上次出字以来的第一次失败不等待；中间没有出字的连续失败仍按 `reconnectDelay` 退避，重连额度规则不变。
+- **断线期间缓存**：`RecordingEngine` 决定重连时调用 `holdRealtimeAudioForReconnect()`，从这一刻到新会话就绪之间采集到的音频进入有界缓存（20s，超出丢最旧），不再因为 `isTranscribing == false` 被丢掉。
+- **补发未定稿音频**：`gpt-live-transcribe` 的 transcriber 记下每次 commit 时的流偏移，按服务端 `input_audio_buffer.committed` 的回执顺序对应到 `item_id`（2026-09-29 用真实服务核对过：回执按 commit 顺序到达，空 commit 按序报 `input_audio_buffer_commit_empty`，纯静音轮次返回空文本的 `completed`）。某一轮连同它之前的所有轮都有了 `completed` 或 `failed`，final delta 就带上 `finalizedAudioBytes`。manager 按实际交给 service 的字节记账，收到偏移就丢掉已定稿的部分。重连时 stop 旧会话会带 `retainAudioForReplay`，把旧会话未定稿的音频和队列里没发出去的音频排在断线缓存前面；新会话 `startRealtime(preserveSegments: true)` 在接收实时音频之前先按原顺序补发。补发会重新转出旧会话留在屏幕上的尾部假设，所以先把它移除。
+- 其他任何 stop 都会丢弃缓存；重连放弃时按 token 释放，不会一直拦截音频。
+- 不上报偏移的 provider（Gemini、Apple）只补发从未发出的音频，保留尾部假设，避免文字重复。
 
 ### 5.6 说话人识别 `SpeakerDiarizer`
 

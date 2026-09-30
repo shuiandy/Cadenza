@@ -2355,21 +2355,9 @@ final class PostProcessingCoordinator {
         return sentences
     }
 
-    /// Join sentences: use space for Latin, no space for CJK.
+    /// Join sentences with the spacing their script uses; see `TranscriptSpacing`.
     private static func joinSentences(_ parts: [String]) -> String {
-        guard let first = parts.first else { return "" }
-        var result = first
-        for part in parts.dropFirst() {
-            let lastChar = result.last
-            let firstChar = part.first
-            let needsSpace = !(lastChar?.isCJK == true || firstChar?.isCJK == true)
-            if needsSpace {
-                result += " " + part
-            } else {
-                result += part
-            }
-        }
-        return result
+        parts.reduce("", TranscriptSpacing.joining)
     }
 
     private func buildReadableTranscriptEntries(from text: String, totalDuration: TimeInterval) -> [TranscriptEntry] {
@@ -2422,18 +2410,5 @@ final class PostProcessingCoordinator {
         }
 
         return chunks
-    }
-}
-
-private extension Character {
-    var isCJK: Bool {
-        guard let scalar = unicodeScalars.first else { return false }
-        let v = scalar.value
-        return (0x4E00...0x9FFF).contains(v)
-            || (0x3400...0x4DBF).contains(v)
-            || (0x3000...0x303F).contains(v)
-            || (0x3040...0x309F).contains(v)
-            || (0x30A0...0x30FF).contains(v)
-            || (0xFF00...0xFFEF).contains(v)
     }
 }

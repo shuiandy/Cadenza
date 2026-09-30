@@ -1070,34 +1070,30 @@ struct RecordingOverlayView: View {
 
                 if showLiveTranscript {
                     let recentSegments = Array(appState.liveTranscriptSegments.suffix(30))
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 8) {
-                                ForEach(recentSegments) { segment in
-                                    HStack(alignment: .top, spacing: 8) {
-                                        Text(segment.formattedTimestamp)
-                                            .font(.cadenza(11, design: .monospaced, scale: uiScale))
-                                            .foregroundStyle(.tertiary)
-                                            .frame(width: ceil(36 * max(uiScale, 1)), alignment: .trailing)
-                                        Text(segment.text)
-                                            .font(.cadenzaBody(13, scale: uiScale))
-                                            .opacity(segment.isFinal ? 1.0 : 0.5)
-                                    }
-                                    .id(segment.id)
-                                }
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 4)
-                        }
-                        .frame(minHeight: 60, maxHeight: 160)
-                        .onChange(of: appState.liveTranscriptSegments.count) {
-                            if let last = appState.liveTranscriptSegments.last {
-                                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.1)) {
-                                    proxy.scrollTo(last.id, anchor: .bottom)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(recentSegments) { segment in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text(segment.formattedTimestamp)
+                                        .font(.cadenza(11, design: .monospaced, scale: uiScale))
+                                        .foregroundStyle(.tertiary)
+                                        .frame(width: ceil(36 * max(uiScale, 1)), alignment: .trailing)
+                                    Text(segment.text)
+                                        .font(.cadenzaBody(13, scale: uiScale))
+                                        .opacity(segment.isFinal ? 1.0 : 0.5)
                                 }
                             }
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
                     }
+                    .frame(minHeight: 60, maxHeight: 160)
+                    // Captions mostly grow inside the last segment (interim
+                    // rewrites, adjacent finals merged into one), which never
+                    // changes the segment count a scrollTo used to key on.
+                    // The bottom anchor follows every size change with no
+                    // scroll feedback loop, like the chat surfaces.
+                    .defaultScrollAnchor(.bottom)
                 }
             }
 

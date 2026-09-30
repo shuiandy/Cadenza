@@ -664,6 +664,7 @@ struct ChatHangReproTests {
                 "onScrollTick"
             ],
             "Cadenza/Views/Main/RecordingOverlayPanel.swift": [
+                "ScrollViewReader",
                 "onScrollGeometryChange",
                 "scrollToBottom",
                 "keepStreamingPinnedToBottom",
@@ -681,6 +682,29 @@ struct ChatHangReproTests {
                 #expect(!code.contains(forbidden), "\(relativePath) still contains \(forbidden)")
             }
         }
+    }
+
+    @Test
+    func liveTranscriptFollowsNewTextWithTheBottomAnchor() throws {
+        // Captions mostly grow inside the last segment, so a scrollTo keyed on
+        // the segment count left new text below the fold. The bottom anchor
+        // follows every content size change without a scroll feedback loop.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let code = try String(
+            contentsOf: repoRoot.appendingPathComponent("Cadenza/Views/Main/RecordingOverlayPanel.swift"),
+            encoding: .utf8
+        )
+        let start = try #require(code.range(of: "if showLiveTranscript {"))
+        let end = try #require(code.range(
+            of: "if shouldShowSuggestions {",
+            range: start.upperBound..<code.endIndex
+        ))
+        let transcript = code[start.lowerBound..<end.lowerBound]
+        #expect(transcript.contains(".defaultScrollAnchor(.bottom)"))
+        #expect(!transcript.contains("scrollTo("))
     }
 
     @Test

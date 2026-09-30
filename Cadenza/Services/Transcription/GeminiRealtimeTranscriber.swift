@@ -189,15 +189,19 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
     }
 
     /// The retiring socket once audio has moved to its replacement. It was
-    /// sent audioStreamEnd, so its last utterance may still be on the way.
-    /// That text is delivered first and the replacement's is held back until
-    /// the retiring socket settles: the manager keeps one open hypothesis, and
+    /// sent audioStreamEnd, so text for its last audio may still be on the way.
+    /// That text is delivered first and the replacement's is held back for the
+    /// whole drain window: the manager keeps one open hypothesis, and
     /// interleaving the two sockets would overwrite or reorder it.
+    ///
+    /// The window always runs to the end (unless the server closes the socket
+    /// first). A final arriving after the flush does not mean the flush was
+    /// answered: it can be the previous sentence ending on its own, with the
+    /// reply for the last second of audio still to come.
     private struct DrainingConnection {
         let transport: GeminiRealtimeTransport
         let receiveTask: Task<Void, Never>?
         var pendingInterim: String?
-        var flushed = false
         var heldDeltas: [TranscriptDelta] = []
         var timeoutTask: Task<Void, Never>?
     }
@@ -472,7 +476,6 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
     var _testHasActiveTransport: Bool { transport != nil }
     var _testHasReceiveTask: Bool { receiveTask != nil }
     var _testIsRotating: Bool { pendingRotation != nil || draining != nil }
-    var _testRetiringConnectionIsFlushed: Bool { draining?.flushed == true }
 
     private func makeTranscriptStream(
         generation: UInt64,
@@ -1047,11 +1050,6 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
                     "Gemini: serverContent had \(serverContent.count) fields without a transcript"
                 )
             }
-            settleDrainIfFinished(
-                generation: generation,
-                transport: transport,
-                turnSettled: turnComplete || transcript?.isFinal == true
-            )
         }
 
         if json["error"] != nil {
@@ -1276,34 +1274,11 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
             )
         } catch {
             finishDrain(generation: generation, retiring: retiring, reason: .flushFailed)
-            return
         }
-        guard sessionGeneration == generation,
-              var retired = draining,
-              retired.transport.matches(retiring) else { return }
-        retired.flushed = true
-        draining = retired
     }
 
-    /// After the flush, a settled turn with no hypothesis left open means the
-    /// retiring socket has handed over everything it heard.
-    private func settleDrainIfFinished(
-        generation: UInt64,
-        transport: GeminiRealtimeTransport,
-        turnSettled: Bool
-    ) {
-        guard turnSettled,
-              let retired = draining,
-              retired.transport.matches(transport),
-              retired.flushed,
-              retired.pendingInterim == nil else { return }
-        finishDrain(generation: generation, retiring: transport, reason: .settled)
-    }
-
-    /// Why a retiring socket stopped draining. Logged so a live run shows
-    /// whether Gemini answers audioStreamEnd or the window has to expire.
+    /// Why a retiring socket stopped draining, for the realtime debug log.
     private enum DrainEnd: String {
-        case settled = "settled after flush"
         case closed = "closed by server"
         case timedOut = "drain window elapsed"
         case flushFailed = "flush failed"
@@ -1332,15 +1307,18 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         _ retired: DrainingConnection,
         to continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
     ) {
-        // An unfinalized hypothesis is still the best text for that audio. The
-        // dedicated model's next interim replaces the open hypothesis in
-        // place, so without this the replacement would overwrite it.
-        if let interim = retired.pendingInterim, usesDedicatedTranscription {
+        // Close the retiring socket's open segment before any replacement text,
+        // or the replacement would continue it: the dedicated model's interim
+        // would overwrite it in place, the dialogue model's would append to it.
+        // The dedicated model's interim is the whole hypothesis, so it becomes
+        // the final text. The dialogue model's is its latest increment, which
+        // already ends the segment, so resending it changes no text.
+        if let interim = retired.pendingInterim {
             continuation?.yield(TranscriptDelta(
                 text: interim,
                 isFinal: true,
                 language: nil,
-                replacesHypothesis: true
+                replacesHypothesis: usesDedicatedTranscription
             ))
         }
         for delta in retired.heldDeltas {

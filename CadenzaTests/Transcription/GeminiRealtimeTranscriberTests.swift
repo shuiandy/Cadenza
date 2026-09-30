@@ -1161,7 +1161,11 @@ struct GeminiRealtimeRotationTests {
         #expect(await waitUntil { await transportB.cancelCount == 1 })
     }
 
-    @Test func retiringSocketTextPrecedesHeldReplacementText() async throws {
+    @Test func retiringTextArrivingAfterAnEarlierFinalIsKept() async throws {
+        // A final that arrives after the flush can be the previous sentence
+        // ending on its own. The reply for the last audio the retiring socket
+        // heard comes after it and must still be delivered, ahead of the
+        // replacement's held text.
         let transportA = GeminiTransportProbe(autoCompletesSends: true)
         let transportB = GeminiTransportProbe(autoCompletesSends: true)
         let factory = GeminiTransportFactoryProbe([
@@ -1172,7 +1176,7 @@ struct GeminiRealtimeRotationTests {
             apiKey: "fake",
             model: Self.model,
             transportFactoryForTesting: { factory.next() },
-            rotationDrainTimeout: .seconds(30)
+            rotationDrainTimeout: .seconds(1)
         )
         let collector = GeminiDeltaCollector()
         let consumer = collector.consume(try await service.startRealtimeSession(language: nil))
@@ -1185,32 +1189,127 @@ struct GeminiRealtimeRotationTests {
         #expect(await waitUntil { await collector.deltas.count == 1 })
         #expect(await serve(#"{"goAway":{"timeLeft":"50s"}}"#, on: transportA, request: 1))
         #expect(await serve(#"{"setupComplete":{}}"#, on: transportB, request: 0))
-        #expect(await waitUntil { await service._testRetiringConnectionIsFlushed })
+        #expect(await waitUntil {
+            await transportA.sentPayloads.contains(where: isGeminiAudioStreamEnd)
+        })
 
-        // The replacement already hears the next sentence; it must wait.
         #expect(await serve(
             #"{"serverContent":{"interimInputTranscription":{"text":"and then"}}}"#,
             on: transportB,
             request: 1
         ))
-        try? await Task.sleep(for: .milliseconds(30))
-        #expect(await collector.texts == ["we should"])
-
-        // The flushed final settles the retiring socket well before its
-        // drain window, releasing the held text behind it.
         #expect(await serve(
             #"{"serverContent":{"inputTranscription":{"text":"we should ship"}}}"#,
             on: transportA,
             request: 2
         ))
+        #expect(await serve(
+            #"{"serverContent":{"inputTranscription":{"text":"right after lunch"}}}"#,
+            on: transportA,
+            request: 3
+        ))
         #expect(await waitUntil { await collector.deltas.count == 3 })
-        #expect(await collector.texts == ["we should", "we should ship", "and then"])
-        #expect(await collector.finality == [false, true, false])
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(await collector.texts == ["we should", "we should ship", "right after lunch"])
+        #expect(await transportA.cancelCount == 0)
+
+        // The window runs to its end before the replacement's text follows.
+        #expect(await waitUntil(timeout: .seconds(3)) { await collector.deltas.count == 4 })
+        #expect(await collector.texts == ["we should", "we should ship", "right after lunch", "and then"])
+        #expect(await collector.finality == [false, true, true, false])
         #expect(await waitUntil { await transportA.cancelCount == 1 })
         #expect(await transportB.cancelCount == 0)
 
         try await service.stopRealtimeSession()
         await consumer.value
+    }
+
+    @Test func dialogueModelCommitsTheRetiringSegmentWithoutChangingIt() async throws {
+        let transportA = GeminiTransportProbe(autoCompletesSends: true)
+        let transportB = GeminiTransportProbe(autoCompletesSends: true)
+        let factory = GeminiTransportFactoryProbe([
+            await transportA.makeTransport(),
+            await transportB.makeTransport(),
+        ])
+        let service = GeminiRealtimeTranscriber(
+            apiKey: "fake",
+            model: "gemini-3.1-flash-live-preview",
+            transportFactoryForTesting: { factory.next() },
+            rotationDrainTimeout: .milliseconds(60)
+        )
+        let collector = GeminiDeltaCollector()
+        let consumer = collector.consume(try await service.startRealtimeSession(language: nil))
+
+        #expect(await serve(
+            #"{"serverContent":{"inputTranscription":{"text":"we should"}}}"#,
+            on: transportA,
+            request: 0
+        ))
+        #expect(await serve(#"{"goAway":{"timeLeft":"50s"}}"#, on: transportA, request: 1))
+        #expect(await serve(#"{"setupComplete":{}}"#, on: transportB, request: 0))
+        #expect(await serve(
+            #"{"serverContent":{"inputTranscription":{"text":"next idea"}}}"#,
+            on: transportB,
+            request: 1
+        ))
+
+        // The dialogue model's deltas are increments. Its last one is resent
+        // as final, which the manager merges without changing the text.
+        #expect(await waitUntil { await collector.deltas.count == 3 })
+        #expect(await collector.texts == ["we should", "we should", "next idea"])
+        #expect(await collector.finality == [false, true, false])
+        #expect(await collector.deltas.allSatisfy { !$0.replacesHypothesis })
+
+        try await service.stopRealtimeSession()
+        await consumer.value
+    }
+
+    @MainActor
+    @Test func dialogueModelReplacementTextStartsANewSegment() async throws {
+        let transportA = GeminiTransportProbe(autoCompletesSends: true)
+        let transportB = GeminiTransportProbe(autoCompletesSends: true)
+        let factory = GeminiTransportFactoryProbe([
+            await transportA.makeTransport(),
+            await transportB.makeTransport(),
+        ])
+        let service = GeminiRealtimeTranscriber(
+            apiKey: "fake",
+            model: "gemini-3.1-flash-live-preview",
+            transportFactoryForTesting: { factory.next() },
+            rotationDrainTimeout: .milliseconds(60)
+        )
+        let manager = TranscriptionManager(realtimeServiceFactory: { _, _, _, _ in service })
+        try await manager.startRealtime(provider: .gemini, apiKey: "fake")
+
+        #expect(await serve(
+            #"{"serverContent":{"inputTranscription":{"text":"we should"}}}"#,
+            on: transportA,
+            request: 0
+        ))
+        #expect(await serve(#"{"goAway":{"timeLeft":"50s"}}"#, on: transportA, request: 1))
+        #expect(await serve(#"{"setupComplete":{}}"#, on: transportB, request: 0))
+        #expect(await serve(
+            #"{"serverContent":{"inputTranscription":{"text":"next idea"}}}"#,
+            on: transportB,
+            request: 1
+        ))
+        #expect(await waitUntil { await transportA.cancelCount == 1 })
+
+        // The manager flushes buffered interim deltas when the next one lands.
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(await serve(
+            #"{"serverContent":{"inputTranscription":{"text":"for later"}}}"#,
+            on: transportB,
+            request: 2
+        ))
+        #expect(await waitUntil { await manager.segments.count == 2 })
+        let segments = manager.segments
+        #expect(segments.first?.text == "we should")
+        #expect(segments.first?.isFinal == true)
+        #expect(segments.last?.isFinal == false)
+        #expect(segments.last?.text.hasPrefix("next idea") == true)
+
+        await manager.stopRealtime(abandonStartup: true)
     }
 
     @Test func unfinishedRetiringHypothesisIsFinalizedBeforeReplacementText() async throws {

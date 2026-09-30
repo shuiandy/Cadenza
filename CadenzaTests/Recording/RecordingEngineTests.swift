@@ -422,6 +422,7 @@ private func waitForRecordingEngineFinalizationEvents(
 }
 
 private actor EngineOwnedRealtimeService: TranscriptionService {
+    nonisolated let reportsFinalizedAudio: Bool
     private let blocksStop: Bool
     private let failsStart: Bool
     private var stopWasReleased = false
@@ -431,9 +432,10 @@ private actor EngineOwnedRealtimeService: TranscriptionService {
     private(set) var stopCount = 0
     private(set) var sentAudio: [Data] = []
 
-    init(blocksStop: Bool, failsStart: Bool = false) {
+    init(blocksStop: Bool, failsStart: Bool = false, reportsFinalizedAudio: Bool = false) {
         self.blocksStop = blocksStop
         self.failsStart = failsStart
+        self.reportsFinalizedAudio = reportsFinalizedAudio
     }
 
     func startRealtimeSession(language: String?) async throws -> AsyncThrowingStream<TranscriptDelta, Error> {
@@ -465,6 +467,10 @@ private actor EngineOwnedRealtimeService: TranscriptionService {
 
     func emit(_ text: String) {
         streamContinuation?.yield(TranscriptDelta(text: text, isFinal: true, language: "en"))
+    }
+
+    func failStream() {
+        streamContinuation?.finish(throwing: RecordingEngineBoundarySentinel.realtimeReached)
     }
 
     func releaseStop() {
@@ -540,7 +546,8 @@ private final class RecordingEngineBoundarySpy {
     func dependencies(
         defaults: UserDefaults,
         usesInjectedRealtimeManager: Bool = false,
-        realtimeStartTimeout: Duration = .seconds(5)
+        realtimeStartTimeout: Duration = .seconds(5),
+        reconnectDelay: Duration = .zero
     ) -> RecordingEngineDependencies {
         let startRealtimeOverride: (@MainActor @Sendable (RealtimeStartRequest) async throws -> Void)?
         let stopRealtimeOverride: (@MainActor @Sendable (RealtimeStopRequest) async -> Void)?
@@ -617,7 +624,7 @@ private final class RecordingEngineBoundarySpy {
             },
             startRealtime: startRealtimeOverride,
             stopRealtime: stopRealtimeOverride,
-            reconnectDelay: .zero,
+            reconnectDelay: reconnectDelay,
             realtimeStartTimeout: realtimeStartTimeout,
             recordBoundaryEvent: { [weak self] event in
                 self?.boundaryEvents.append(event)
@@ -1486,6 +1493,70 @@ struct RecordingEngineProviderBoundaryTests {
         })
         #expect(engine.recordingState == .recording)
         #expect(spy.stopRequests.count >= 2)
+    }
+
+    @Test func droppedStreamReconnectsAtOnceAndReplaysAudioFromTheGap() async throws {
+        let isolated = makeDefaults()
+        defer { isolated.defaults.removePersistentDomain(forName: isolated.name) }
+        isolated.defaults.set(AIProvider.apple.rawValue, forKey: "transcriptionProvider")
+        isolated.defaults.set("en", forKey: "transcriptionLanguage")
+        isolated.defaults.set(AIProvider.openai.rawValue, forKey: "realtimeTranscriptionProvider")
+        isolated.defaults.set("en", forKey: "realtimeTranscriptionLanguage")
+        isolated.defaults.set(true, forKey: "enableRealtimeTranscription")
+
+        let serviceA = EngineOwnedRealtimeService(blocksStop: false, reportsFinalizedAudio: true)
+        let serviceB = EngineOwnedRealtimeService(blocksStop: false, reportsFinalizedAudio: true)
+        let factory = EngineRealtimeServiceFactory([serviceA, serviceB])
+        let manager = TranscriptionManager(realtimeServiceFactory: factory.makeFactory())
+        let spy = RecordingEngineBoundarySpy()
+        spy.keys[.openai] = "openai-key"
+        // Long enough that only an immediate first retry can pass this test.
+        let engine = RecordingEngine(
+            dependencies: spy.dependencies(
+                defaults: isolated.defaults,
+                usesInjectedRealtimeManager: true,
+                reconnectDelay: .seconds(30)
+            ),
+            transcriptionManager: manager
+        )
+        try await attachIsolatedStore(to: engine, audioRoot: spy.storageRoot)
+        defer { engine.forceReset() }
+
+        try await engine.startRecording(captureMicrophone: false, skipPermissionPrompt: true)
+        #expect(await waitUntilAsync {
+            let startCount = await serviceA.startCount
+            return manager.isTranscribing && startCount == 1
+        })
+        let feed = try #require(engine.audioMixer.onTranscriptionAudio)
+        let beforeDrop = Data(repeating: 1, count: 960)
+        let duringReconnect = Data(repeating: 2, count: 960)
+        let afterReconnect = Data(repeating: 3, count: 960)
+
+        feed(beforeDrop)
+        #expect(await waitUntilAsync { await serviceA.sentAudio.count == 1 })
+        await serviceA.failStream()
+        #expect(await waitUntil { engine._test_isReconnectingRealtime })
+        feed(duringReconnect)
+
+        // A never finalized its audio, so B hears all of it before live audio.
+        #expect(await waitUntilAsync {
+            let received = await serviceB.sentAudio.reduce(Data(), +)
+            return received == beforeDrop + duringReconnect
+        })
+        #expect(await waitUntil { !engine._test_isReconnectingRealtime })
+        feed(afterReconnect)
+        #expect(await waitUntilAsync {
+            let received = await serviceB.sentAudio.reduce(Data(), +)
+            return received == beforeDrop + duringReconnect + afterReconnect
+        })
+
+        // A second failure with no text in between backs off.
+        await serviceB.failStream()
+        #expect(await waitUntil { engine._test_isReconnectingRealtime })
+        try? await Task.sleep(for: .milliseconds(300))
+        #expect(engine._test_isReconnectingRealtime)
+        #expect(engine._test_realtimeReconnectCount == 2)
+        #expect(engine.recordingState == .recording)
     }
 
     @Test func provenHealthyStreamRefillsReconnectBudget() async throws {
