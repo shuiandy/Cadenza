@@ -111,6 +111,15 @@ protocol TranscriptionService: Sendable {
 
     /// Transcribe an audio file (post-recording). Returns the full transcript.
     func transcribeFile(at url: URL, language: String?) async throws -> TranscriptResult
+
+    /// True when final deltas carry `finalizedAudioBytes`. Only then can audio
+    /// a failed session was sent, but never finalized, be replayed into its
+    /// replacement without repeating text that is already on screen.
+    var reportsFinalizedAudio: Bool { get }
+}
+
+extension TranscriptionService {
+    var reportsFinalizedAudio: Bool { false }
 }
 
 /// A delta from the real-time transcription stream.
@@ -123,17 +132,23 @@ struct TranscriptDelta: Sendable {
     /// ASR models (Apple's, gemini-3.5-transcribe-live) resend the whole
     /// utterance as it firms up; appending those would duplicate every word.
     let replacesHypothesis: Bool
+    /// Set by providers that report it: all audio this session was sent before
+    /// this byte offset now has final text. The text may be empty, for a turn
+    /// that held no speech.
+    let finalizedAudioBytes: Int?
 
     init(
         text: String,
         isFinal: Bool,
         language: String?,
-        replacesHypothesis: Bool = false
+        replacesHypothesis: Bool = false,
+        finalizedAudioBytes: Int? = nil
     ) {
         self.text = text
         self.isFinal = isFinal
         self.language = language
         self.replacesHypothesis = replacesHypothesis
+        self.finalizedAudioBytes = finalizedAudioBytes
     }
 }
 

@@ -50,6 +50,19 @@ final class TranscriptionManager {
         let attemptID: RealtimeAttemptID
     }
 
+    /// Audio kept for the session that replaces a dropped one.
+    private struct HeldRealtimeAudio {
+        let id: UUID
+        var audio: RealtimeAudioBacklog
+        /// The dropped session's unfinalized audio is included, so the
+        /// hypothesis it left on screen will be transcribed again.
+        var replacesTrailingHypothesis = false
+    }
+
+    /// 20 s of 24 kHz PCM16: an open turn (up to 6 s), turns awaiting their
+    /// transcript, and a reconnect that runs into its start timeout.
+    private static let replayCapacityBytes = 20 * 48_000
+
     private let defaults = UserDefaults.standard
     @ObservationIgnored private let realtimeServiceFactory: RealtimeTranscriptionServiceFactory?
     @ObservationIgnored private let realtimeWatchdogDelay: Duration
@@ -67,6 +80,12 @@ final class TranscriptionManager {
     private var audioDrainGeneration: UInt64?
     private var noDeltaWatchdogTask: Task<Void, Never>?
     private var noDeltaWatchdogGeneration: UInt64?
+    /// What the current session was sent and has no final text for yet. Kept
+    /// only for providers that report finalized audio.
+    @ObservationIgnored private var unfinalizedAudio = RealtimeAudioBacklog(capacity: TranscriptionManager.replayCapacityBytes)
+    @ObservationIgnored private var unfinalizedAudioGeneration: UInt64?
+    @ObservationIgnored private var sessionReportsFinalizedAudio = false
+    @ObservationIgnored private var heldAudio: HeldRealtimeAudio?
     private var realtimeDeltaCount = 0
     private var realtimeContentDeltaCount = 0
 
@@ -183,11 +202,16 @@ final class TranscriptionManager {
         realtimeDeltaCount = 0
         realtimeContentDeltaCount = 0
         sendAudioCount = 0
+        sessionReportsFinalizedAudio = service.reportsFinalizedAudio
         prepareAudioQueue(for: generation)
         if !preserveSegments {
+            heldAudio = nil
             segments = []
             fullText = ""
             onSegmentsChanged?(segments)
+        } else if let held = heldAudio {
+            heldAudio = nil
+            replay(held, with: service, generation: generation)
         }
 
         NSLog("[TranscriptionManager] session ready, listening for deltas")
@@ -339,8 +363,40 @@ final class TranscriptionManager {
     private(set) var sendAudioCount = 0
     private let maxChunksPerDrainPass = 2
 
+    /// True while capture audio should reach `sendAudio`: a session is live, or
+    /// a reconnect is holding audio for the next one.
+    var acceptsRealtimeAudio: Bool {
+        isTranscribing || heldAudio != nil
+    }
+
+    /// Holds capture audio for a reconnect instead of dropping it. The stop that
+    /// retires the failed session with `retainAudioForReplay` adds what that
+    /// session never finalized, and the next `startRealtime(preserveSegments:
+    /// true)` sends all of it ahead of live audio. Pass the returned token to
+    /// `releaseHeldRealtimeAudio` if the reconnect gives up.
+    @discardableResult
+    func holdRealtimeAudioForReconnect() -> UUID {
+        if let heldAudio { return heldAudio.id }
+        let id = UUID()
+        heldAudio = HeldRealtimeAudio(
+            id: id,
+            audio: RealtimeAudioBacklog(capacity: Self.replayCapacityBytes)
+        )
+        return id
+    }
+
+    func releaseHeldRealtimeAudio(_ id: UUID) {
+        guard heldAudio?.id == id else { return }
+        heldAudio = nil
+    }
+
     /// Send audio data to the real-time transcriber.
     func sendAudio(_ data: Data) {
+        if heldAudio != nil {
+            sendAudioCount += 1
+            heldAudio?.audio.append(data)
+            return
+        }
         guard isTranscribing,
               let generation = activeRealtimeGeneration,
               isCurrentRealtimeSession(generation),
@@ -414,20 +470,26 @@ final class TranscriptionManager {
         matching attemptID: RealtimeAttemptID,
         preserveFailureHandler: Bool = false,
         preserveRealtimeError: Bool = false,
-        awaitFinalDeltas: Bool = false
+        awaitFinalDeltas: Bool = false,
+        retainAudioForReplay: Bool = false
     ) -> RealtimeStopHandle? {
         guard currentRealtimeAttemptID == attemptID else { return nil }
         return beginRealtimeStop(
             preserveFailureHandler: preserveFailureHandler,
             preserveRealtimeError: preserveRealtimeError,
-            awaitFinalDeltas: awaitFinalDeltas
+            awaitFinalDeltas: awaitFinalDeltas,
+            retainAudioForReplay: retainAudioForReplay
         )
     }
 
+    /// - Parameter retainAudioForReplay: The session is being replaced after a
+    ///   failure. Its unsent and unfinalized audio joins the held audio, which
+    ///   any other stop discards.
     func beginRealtimeStop(
         preserveFailureHandler: Bool = false,
         preserveRealtimeError: Bool = false,
-        awaitFinalDeltas: Bool = false
+        awaitFinalDeltas: Bool = false,
+        retainAudioForReplay: Bool = false
     ) -> RealtimeStopHandle {
         let canAwaitFinalDeltas = awaitFinalDeltas
             && activeRealtimeGeneration != nil
@@ -448,6 +510,12 @@ final class TranscriptionManager {
         }
         if !preserveRealtimeError {
             realtimeError = nil
+        }
+
+        if !retainAudioForReplay {
+            heldAudio = nil
+        } else if let generation = handle.generation {
+            holdUnfinalizedAudio(of: generation)
         }
 
         if let generation = handle.generation {
@@ -694,6 +762,7 @@ final class TranscriptionManager {
         onRealtimeStreamHealthy = nil
         realtimeAudioIsSilent = nil
         onProgress = nil
+        heldAudio = nil
         isTranscribing = false
         noDeltaWatchdogTask?.cancel()
         noDeltaWatchdogTask = nil
@@ -741,6 +810,10 @@ final class TranscriptionManager {
         recordingStartTime: Date?
     ) -> Bool {
         guard isCurrentRealtimeSession(generation) else { return false }
+        if let finalizedAudioBytes = delta.finalizedAudioBytes,
+           unfinalizedAudioGeneration == generation {
+            unfinalizedAudio.discard(before: finalizedAudioBytes)
+        }
         let normalizedIncoming = delta.text
             .replacingOccurrences(of: "\r", with: "")
             .replacingOccurrences(of: "\n", with: " ")
@@ -890,6 +963,10 @@ final class TranscriptionManager {
 
             do {
                 guard !chunk.isEmpty else { continue }
+                // Recorded before the send, which may be the one that fails.
+                if sessionReportsFinalizedAudio, unfinalizedAudioGeneration == generation {
+                    unfinalizedAudio.append(chunk)
+                }
                 try await Task.detached(priority: .utility) { [service, chunk] in
                     try await service.sendAudio(chunk)
                 }.value
@@ -912,6 +989,15 @@ final class TranscriptionManager {
                     onRealtimeFailure?(error, provider, attemptID)
                 }
                 finishAudioDrain(ifOwnedBy: generation)
+                // A reconnect the failure started holds audio from here on;
+                // what was still queued comes before it.
+                if var held = heldAudio {
+                    var audio = RealtimeAudioBacklog(capacity: Self.replayCapacityBytes)
+                    appendUnsentAudio(of: generation, to: &audio)
+                    audio.append(contentsOf: held.audio)
+                    held.audio = audio
+                    heldAudio = held
+                }
                 clearAudioQueue(ifOwnedBy: generation)
                 return
             }
@@ -934,6 +1020,55 @@ final class TranscriptionManager {
         audioSendHead = 0
         audioQueueGeneration = generation
         audioDrainGeneration = nil
+        unfinalizedAudio = RealtimeAudioBacklog(capacity: Self.replayCapacityBytes)
+        unfinalizedAudioGeneration = generation
+    }
+
+    private func appendUnsentAudio(of generation: UInt64, to backlog: inout RealtimeAudioBacklog) {
+        guard audioQueueGeneration == generation else { return }
+        for chunk in audioSendQueue[audioSendHead...] {
+            backlog.append(chunk)
+        }
+    }
+
+    /// Puts the retiring session's unfinalized and unsent audio ahead of the
+    /// audio held since it failed, oldest first.
+    private func holdUnfinalizedAudio(of generation: UInt64) {
+        guard var held = heldAudio else { return }
+        var replay = RealtimeAudioBacklog(capacity: Self.replayCapacityBytes)
+        if sessionReportsFinalizedAudio,
+           unfinalizedAudioGeneration == generation,
+           !unfinalizedAudio.isEmpty {
+            replay.append(contentsOf: unfinalizedAudio)
+            held.replacesTrailingHypothesis = true
+        }
+        unfinalizedAudio = RealtimeAudioBacklog(capacity: Self.replayCapacityBytes)
+        unfinalizedAudioGeneration = nil
+        appendUnsentAudio(of: generation, to: &replay)
+        replay.append(contentsOf: held.audio)
+        held.audio = replay
+        heldAudio = held
+    }
+
+    /// Queues held audio ahead of any live audio. Called while the new session
+    /// is being installed, before capture audio can reach its queue.
+    private func replay(
+        _ held: HeldRealtimeAudio,
+        with service: any TranscriptionService,
+        generation: UInt64
+    ) {
+        if held.replacesTrailingHypothesis, let last = segments.last, !last.isFinal {
+            // The replayed audio produces this text again, now with a final.
+            segments.removeLast()
+            onSegmentsChanged?(segments)
+        }
+        guard !held.audio.isEmpty else { return }
+        NSLog(
+            "[TranscriptionManager] replaying %.1fs of audio into the reconnected session",
+            Double(held.audio.byteCount) / 48_000
+        )
+        audioSendQueue.append(contentsOf: held.audio.blocks)
+        scheduleAudioDrain(with: service, generation: generation)
     }
 
     private func finishAudioDrain(ifOwnedBy generation: UInt64) {
@@ -1033,16 +1168,25 @@ final class TranscriptionManager {
     private func mergeFinalContinuation(existing: String, incoming: String) -> String {
         let merged = mergeDeltaText(existing: existing, incoming: incoming)
         if merged != existing {
+            // Finals are separate utterances. With no overlap between them,
+            // mergeDeltaText appends bare, gluing sentences ("units.We");
+            // join them the way their script separates words instead.
+            let normalizedIncoming = incoming
+                .replacingOccurrences(of: "\r", with: "")
+                .replacingOccurrences(of: "\n", with: " ")
+            if merged == existing + normalizedIncoming {
+                return TranscriptSpacing.joining(existing, normalizedIncoming)
+            }
             return merged
         }
 
+        // The incoming final repeats text the previous one already has. It is
+        // still its own utterance ("Yes." "Yes."), so keep both.
         let lhs = existing.trimmingCharacters(in: .whitespacesAndNewlines)
         let rhs = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !lhs.isEmpty else { return rhs }
         guard !rhs.isEmpty else { return lhs }
-
-        let needsSpace = !(lhs.hasSuffix(" ") || rhs.hasPrefix(" "))
-        return needsSpace ? "\(lhs) \(rhs)" : "\(lhs)\(rhs)"
+        return TranscriptSpacing.joining(lhs, rhs)
     }
 
     private func endsSentence(text: String) -> Bool {

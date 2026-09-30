@@ -62,6 +62,25 @@ struct TranscriptSegmentationTests {
         #expect(joined.contains("第四句话"))
     }
 
+    @Test func closingQuoteStaysAttachedWhenSentencesRejoin() {
+        // The split lands inside the quote, so the second sentence starts with
+        // its closing mark and must not gain a space in front of it.
+        let text = "He said 'go.' Then we left. The next day was quiet. Nobody called at all."
+        let entries = [TranscriptEntry(startTime: 0, endTime: 120, text: text)]
+        let result = PostProcessingCoordinator.subdivideCoarseSegments(entries, maxDuration: 60)
+        #expect(result.count > 1)
+        #expect(result.first?.text == "He said 'go.' Then we left.")
+    }
+
+    @Test func chineseSentencesRejoinWithoutSpaces() {
+        let text = "这是第一句话。这是第二句话。这是第三句话。这是第四句话。"
+        let entries = [TranscriptEntry(startTime: 0, endTime: 120, text: text)]
+        let result = PostProcessingCoordinator.subdivideCoarseSegments(entries, maxDuration: 60)
+        #expect(result.count > 1)
+        #expect(result.allSatisfy { !$0.text.contains(" ") })
+        #expect(result.map(\.text).joined() == text)
+    }
+
     @Test func mixedShortAndLongSegments() {
         let entries = [
             TranscriptEntry(startTime: 0, endTime: 20, text: "Short."),

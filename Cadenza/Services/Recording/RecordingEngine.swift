@@ -77,17 +77,22 @@ struct RealtimeStopRequest: Sendable, Equatable {
     let preserveRealtimeError: Bool
     let awaitFinalDeltas: Bool
     let abandonStartup: Bool
+    /// The stopped session is being replaced after a failure; keep the audio
+    /// it never finalized for its replacement.
+    let retainAudioForReplay: Bool
 
     init(
         preserveFailureHandler: Bool = false,
         preserveRealtimeError: Bool = false,
         awaitFinalDeltas: Bool = false,
-        abandonStartup: Bool = false
+        abandonStartup: Bool = false,
+        retainAudioForReplay: Bool = false
     ) {
         self.preserveFailureHandler = preserveFailureHandler
         self.preserveRealtimeError = preserveRealtimeError
         self.awaitFinalDeltas = awaitFinalDeltas
         self.abandonStartup = abandonStartup
+        self.retainAudioForReplay = retainAudioForReplay
     }
 }
 
@@ -625,7 +630,8 @@ extension RecordingEngine {
         let handle = transcriptionManager.beginRealtimeStop(
             preserveFailureHandler: request.preserveFailureHandler,
             preserveRealtimeError: request.preserveRealtimeError,
-            awaitFinalDeltas: request.awaitFinalDeltas && !request.abandonStartup
+            awaitFinalDeltas: request.awaitFinalDeltas && !request.abandonStartup,
+            retainAudioForReplay: request.retainAudioForReplay
         )
         return .manager(handle, request)
     }
@@ -666,7 +672,8 @@ extension RecordingEngine {
             matching: attemptID,
             preserveFailureHandler: request.preserveFailureHandler,
             preserveRealtimeError: request.preserveRealtimeError,
-            awaitFinalDeltas: request.awaitFinalDeltas && !request.abandonStartup
+            awaitFinalDeltas: request.awaitFinalDeltas && !request.abandonStartup,
+            retainAudioForReplay: request.retainAudioForReplay
         ) else { return nil }
         return .manager(handle, request)
     }
@@ -897,7 +904,7 @@ extension RecordingEngine {
                     guard let self,
                           self.currentRecordingID == recordingID,
                           self.recordingState == .recording || self.recordingState == .paused,
-                          self.transcriptionManager.isTranscribing else { return }
+                          self.transcriptionManager.acceptsRealtimeAudio else { return }
                     self.transcriptionManager.sendAudio(data)
                 }
             }
@@ -1560,6 +1567,16 @@ extension RecordingEngine {
             }
             self.realtimeReconnectCount += 1
             self.isReconnectingRealtime = true
+            // The first failure since the stream started or last produced text
+            // reconnects at once: OpenAI closes healthy sessions from its side
+            // now and then, and waiting only lengthens the caption gap. Repeated
+            // failures with no text in between back off.
+            let reconnectDelay = self.realtimeReconnectCount == 1
+                ? Duration.zero
+                : self.dependencies.reconnectDelay
+            // Audio captured until the replacement is ready is sent to it first,
+            // so the drop costs caption latency rather than words.
+            let heldAudioID = self.transcriptionManager.holdRealtimeAudioForReconnect()
 
             self.log.notice("realtime stream failed (\(failedProvider.rawValue, privacy: .public)): \(error.localizedDescription, privacy: .private), reconnect \(self.realtimeReconnectCount, privacy: .public)/\(self.maxRealtimeReconnects, privacy: .public)")
 
@@ -1567,6 +1584,8 @@ extension RecordingEngine {
             self.realtimeReconnectTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer {
+                    // A started replacement has taken the held audio already.
+                    self.transcriptionManager.releaseHeldRealtimeAudio(heldAudioID)
                     if self.currentRecordingID == configuration.recordingID {
                         self.isReconnectingRealtime = false
                         self.realtimeReconnectTask = nil
@@ -1582,10 +1601,12 @@ extension RecordingEngine {
                         self.queuedRealtimeFailure = nil
                     }
                 }
-                do {
-                    try await Task.sleep(for: self.dependencies.reconnectDelay)
-                } catch {
-                    return
+                if reconnectDelay > .zero {
+                    do {
+                        try await Task.sleep(for: reconnectDelay)
+                    } catch {
+                        return
+                    }
                 }
                 guard !Task.isCancelled,
                       self.isActiveRealtimeRecording(configuration.recordingID) else { return }
@@ -1593,7 +1614,10 @@ extension RecordingEngine {
                 guard let failedAttemptStop = self.beginRealtimeStop(
                     ifRecordingIsActive: configuration.recordingID,
                     matching: failedAttemptID,
-                    request: RealtimeStopRequest(preserveFailureHandler: true)
+                    request: RealtimeStopRequest(
+                        preserveFailureHandler: true,
+                        retainAudioForReplay: true
+                    )
                 ) else {
                     self.log.notice("realtime reconnect abandoned because the failed attempt no longer owns the manager")
                     return

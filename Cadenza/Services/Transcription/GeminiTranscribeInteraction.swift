@@ -400,38 +400,8 @@ enum GeminiTranscribeInteraction {
     }
 
     /// Join words without inventing spaces inside scripts that do not use
-    /// them. Chinese, Japanese and Thai run words together; Korean does not,
-    /// so Hangul is deliberately absent from the no-space set.
+    /// them; see `TranscriptSpacing`.
     static func appending(_ word: String, to text: String) -> String {
-        guard !text.isEmpty else { return word }
-        guard let previous = text.unicodeScalars.last,
-              let next = word.unicodeScalars.first else { return text + word }
-        return needsSpace(after: previous, before: next) ? text + " " + word : text + word
-    }
-
-    static func needsSpace(after previous: Unicode.Scalar, before next: Unicode.Scalar) -> Bool {
-        if previous == " " { return false }
-        if isScriptWithoutWordSpaces(previous) || isScriptWithoutWordSpaces(next) { return false }
-        // ASCII punctuation that hugs the word it follows or precedes.
-        if ",.!?;:%)]}".unicodeScalars.contains(next) { return false }
-        if "([{".unicodeScalars.contains(previous) { return false }
-        if next == "'" || previous == "'" { return false }
-        return true
-    }
-
-    private static func isScriptWithoutWordSpaces(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.value {
-        case 0x3000...0x303F,   // CJK symbols and punctuation
-             0x3040...0x30FF,   // Hiragana, Katakana
-             0x3400...0x4DBF,   // CJK Unified Ideographs Extension A
-             0x4E00...0x9FFF,   // CJK Unified Ideographs
-             0xF900...0xFAFF,   // CJK Compatibility Ideographs
-             0xFF00...0xFF65,   // Full-width forms (excludes half-width kana)
-             0x20000...0x2FA1F, // CJK Extensions B-F
-             0x0E00...0x0E7F:   // Thai
-            return true
-        default:
-            return false
-        }
+        TranscriptSpacing.joining(text, word)
     }
 }
