@@ -103,6 +103,126 @@ enum ChatLinkPolicy {
     }
 }
 
+/// Lets `**bold**` written against Chinese and Japanese punctuation render.
+///
+/// Foundation's markdown parser follows CommonMark's flanking rules: a closing
+/// `**` right after punctuation only closes when whitespace or punctuation
+/// follows it, and an opening `**` right before punctuation only opens after
+/// whitespace or punctuation. CJK text has no spaces there, so a bold label
+/// ending in a full-width colon and followed directly by Chinese text showed
+/// its asterisks. `**` runs are paired in order, the stranded side gets a
+/// placeholder space so the parser sees the emphasis, and the placeholder is
+/// removed from the parsed result.
+enum EmphasisFlankingRepair {
+    /// FOUR-PER-EM SPACE: Unicode whitespace to the parser, and rare enough
+    /// in chat text that removing every one after parsing loses nothing.
+    static let placeholder: Character = "\u{2005}"
+
+    /// The text with placeholders added, or nil when no `**` needs one.
+    static func spaced(_ text: String) -> String? {
+        guard text.contains("**"), !text.contains(placeholder) else { return nil }
+        let characters = Array(text)
+        let delimiters = strongDelimiters(in: characters)
+        var before: Set<Int> = []
+        var after: Set<Int> = []
+        var index = 0
+        while index + 1 < delimiters.count {
+            let opener = delimiters[index]
+            let closer = delimiters[index + 1]
+            if opener > 0,
+               isWordCharacter(characters[opener - 1]),
+               opener + 2 < characters.count,
+               isPunctuation(characters[opener + 2]) {
+                before.insert(opener)
+            }
+            if closer > 0,
+               isPunctuation(characters[closer - 1]),
+               closer + 2 < characters.count,
+               isWordCharacter(characters[closer + 2]) {
+                after.insert(closer + 2)
+            }
+            index += 2
+        }
+        guard !before.isEmpty || !after.isEmpty else { return nil }
+        var result = ""
+        result.reserveCapacity(text.utf8.count + (before.count + after.count) * 3)
+        for (offset, character) in characters.enumerated() {
+            if before.contains(offset) || after.contains(offset) {
+                result.append(placeholder)
+            }
+            result.append(character)
+        }
+        return result
+    }
+
+    static func removingPlaceholders(from attributed: AttributedString) -> AttributedString {
+        var result = attributed
+        while let index = result.characters.firstIndex(of: placeholder) {
+            result.removeSubrange(index..<result.characters.index(after: index))
+        }
+        return result
+    }
+
+    /// Offsets of `**` runs outside code spans, skipping escaped asterisks
+    /// and longer runs such as `***`.
+    private static func strongDelimiters(in characters: [Character]) -> [Int] {
+        var offsets: [Int] = []
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            if character == "\\" {
+                index += 2
+                continue
+            }
+            let run = runLength(of: character, in: characters, from: index)
+            if character == "`" {
+                index = closingCodeSpan(length: run, in: characters, after: index + run) ?? index + run
+                continue
+            }
+            if character == "*", run == 2 {
+                offsets.append(index)
+            }
+            index += run
+        }
+        return offsets
+    }
+
+    private static func runLength(of character: Character, in characters: [Character], from start: Int) -> Int {
+        var end = start
+        while end < characters.count, characters[end] == character { end += 1 }
+        return end - start
+    }
+
+    /// The offset just past the backtick run that closes a code span, if any.
+    private static func closingCodeSpan(length: Int, in characters: [Character], after start: Int) -> Int? {
+        var index = start
+        while index < characters.count {
+            let run = runLength(of: characters[index], in: characters, from: index)
+            if characters[index] == "`", run == length { return index + run }
+            index += run
+        }
+        return nil
+    }
+
+    private static func isPunctuation(_ character: Character) -> Bool {
+        if character.isASCII { return character.isPunctuation || character.isSymbol }
+        return character.unicodeScalars.first.map { scalar in
+            switch scalar.properties.generalCategory {
+            case .connectorPunctuation, .dashPunctuation, .openPunctuation, .closePunctuation,
+                 .initialPunctuation, .finalPunctuation, .otherPunctuation,
+                 .mathSymbol, .currencySymbol, .modifierSymbol, .otherSymbol:
+                return true
+            default:
+                return false
+            }
+        } ?? false
+    }
+
+    private static func isWordCharacter(_ character: Character) -> Bool {
+        !character.isWhitespace && !isPunctuation(character)
+    }
+}
+
 /// Render-side caches for chat markdown.
 ///
 /// Message content is immutable once delivered, but SwiftUI re-evaluates bubble
@@ -157,16 +277,22 @@ enum MarkdownRenderCache {
         // AttributedString copy per construction — cache those too.
         let parsed: AttributedString
         if string.count <= limit {
-            parsed = (try? AttributedString(
-                markdown: string,
-                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-            )) ?? AttributedString(string)
+            parsed = parseInline(string)
         } else {
             parsed = AttributedString(string)
         }
         let attributed = sanitizeLinks(in: parsed)
         inlineCache.setObject(AttributedBox(attributed), forKey: key, cost: key.length)
         return attributed
+    }
+
+    private static func parseInline(_ string: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        if let spaced = EmphasisFlankingRepair.spaced(string),
+           let repaired = try? AttributedString(markdown: spaced, options: options) {
+            return EmphasisFlankingRepair.removingPlaceholders(from: repaired)
+        }
+        return (try? AttributedString(markdown: string, options: options)) ?? AttributedString(string)
     }
 
     private static func sanitizeLinks(in attributed: AttributedString) -> AttributedString {

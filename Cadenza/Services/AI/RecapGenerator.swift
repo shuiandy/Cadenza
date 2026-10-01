@@ -4,12 +4,15 @@ import Foundation
 @MainActor
 final class RecapGenerator {
     private let store: RecordingsStore
-    private let apiKeyResolver: (AIProvider) -> String?
+    private let accessResolver: (AIProvider) -> AIProviderAccess?
     private let defaults = UserDefaults.standard
 
-    init(store: RecordingsStore, apiKeyResolver: @escaping (AIProvider) -> String? = { KeychainManager.shared.apiKey(for: $0) }) {
+    init(
+        store: RecordingsStore,
+        accessResolver: @escaping (AIProvider) -> AIProviderAccess? = { AICredentialResolver.shared.access(for: $0) }
+    ) {
         self.store = store
-        self.apiKeyResolver = apiKeyResolver
+        self.accessResolver = accessResolver
     }
 
     // MARK: - Startup Check
@@ -228,15 +231,15 @@ final class RecapGenerator {
     private func resolveService() -> (AIServiceProtocol, String)? {
         let providerRaw = defaults.string(forKey: "defaultAIProvider") ?? AIProvider.apple.rawValue
         let provider = AIProvider(rawValue: providerRaw) ?? .apple
-        let apiKey: String
+        let access: AIProviderAccess
         if provider.requiresAPIKey {
-            guard let key = apiKeyResolver(provider), !key.isEmpty else { return nil }
-            apiKey = key
+            guard let resolved = accessResolver(provider) else { return nil }
+            access = resolved
         } else {
-            apiKey = ""
+            access = .direct(provider, apiKey: "")
         }
         let model = provider.summaryModel
-        guard let service = provider.makeChatService(apiKey: apiKey) else { return nil }
+        guard let service = provider.makeChatService(access: access) else { return nil }
         return (service, model)
     }
 

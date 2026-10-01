@@ -3,13 +3,16 @@ import Foundation
 /// Anthropic Claude API for meeting summarization.
 final class ClaudeService: AIServiceProtocol {
     let provider: AIProvider = .claude
-    private let apiKey: String
-    private let baseURL = "https://api.anthropic.com/v1/messages"
+    private let access: AIProviderAccess
     private let transport: HardenedAITransport
 
-    init(apiKey: String, transport: HardenedAITransport = .shared) {
-        self.apiKey = apiKey
+    init(access: AIProviderAccess, transport: HardenedAITransport = .shared) {
+        self.access = access
         self.transport = transport
+    }
+
+    convenience init(apiKey: String, transport: HardenedAITransport = .shared) {
+        self.init(access: .direct(.claude, apiKey: apiKey), transport: transport)
     }
 
     func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) async throws -> SummaryResult {
@@ -228,9 +231,9 @@ final class ClaudeService: AIServiceProtocol {
     // MARK: - HTTP
 
     private func postJSON(_ body: [String: Any]) async throws -> Data {
-        var request = URLRequest(url: try endpointURL())
+        var request = URLRequest(url: try access.url(path: "/v1/messages"))
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        access.authorize(&request)
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -238,14 +241,15 @@ final class ClaudeService: AIServiceProtocol {
         return try await transport.data(
             for: request,
             provider: provider,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
     }
 
     private func postStreamJSON(_ body: [String: Any]) throws -> AsyncThrowingStream<String, Error> {
-        var request = URLRequest(url: try endpointURL())
+        var request = URLRequest(url: try access.url(path: "/v1/messages"))
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        access.authorize(&request)
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -254,14 +258,8 @@ final class ClaudeService: AIServiceProtocol {
         return transport.serverSentEvents(
             for: request,
             provider: provider,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
-    }
-
-    private func endpointURL() throws -> URL {
-        guard let url = URL(string: baseURL) else {
-            throw AITransportError.unsafeEndpoint
-        }
-        return url
     }
 }

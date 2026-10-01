@@ -484,7 +484,7 @@ private final class PostProcessingProviderHarness {
         let spy = PostProcessingProviderSpy()
         let dependencies = PostProcessingTranscriptionDependencies(
             defaults: defaults,
-            apiKey: { provider in spy.apiKey(for: provider) },
+            providerAccess: { provider in spy.apiKey(for: provider).map { .direct(provider, apiKey: $0) } },
             supportsAppleLanguage: { language in
                 if let gate = appleLanguageGate {
                     return await gate.wait()
@@ -710,7 +710,7 @@ struct PostProcessingProviderBoundaryTests {
         #expect(await waitForPostProcessingToFinish(harness.coordinator, recordingID: fixture.recordingID))
         #expect(harness.spy.keyLookups == [.gemini])
         #expect(harness.spy.requests.map(\.provider) == [.gemini])
-        #expect(harness.spy.requests.first?.apiKey == "gemini-key")
+        #expect(harness.spy.requests.first?.access?.directAPIKey == "gemini-key")
         #expect(harness.spy.requests.first?.model == nil)
     }
 
@@ -834,7 +834,7 @@ struct PostProcessingProviderBoundaryTests {
         #expect(await waitForPostProcessingToFinish(harness.coordinator, recordingID: fixture.recordingID))
         #expect(harness.spy.requests.map(\.provider) == [.whisperLocal])
         #expect(harness.spy.requests.first?.model == "small.en")
-        #expect(harness.spy.requests.first?.apiKey.isEmpty == true)
+        #expect(harness.spy.requests.first?.access == nil)
         #expect(harness.spy.keyLookups.isEmpty)
     }
 
@@ -1252,8 +1252,17 @@ struct PostProcessingProviderBoundaryTests {
         ))
         let liveWiring = source[liveStart.lowerBound..<coordinatorStart.lowerBound]
 
-        #expect(liveWiring.contains("KeychainManager.shared.readOnlyAPIKey(for: provider)"))
+        // Keys come from the shared credential resolver, whose Keychain
+        // lookup must stay read-only: deciding where audio goes must not
+        // persist anything.
+        #expect(liveWiring.contains("AICredentialResolver.shared.access(for: provider)"))
         #expect(!liveWiring.contains("KeychainManager.shared.apiKey(for: provider)"))
+        let resolverSource = try String(
+            contentsOf: repoRoot.appendingPathComponent("Cadenza/Services/AI/AICredentialResolver.swift"),
+            encoding: .utf8
+        )
+        #expect(resolverSource.contains("localKey: { KeychainManager.shared.readOnlyAPIKey(for: $0) }"))
+        #expect(!resolverSource.contains("KeychainManager.shared.apiKey(for:"))
     }
 
     @Test
@@ -2800,7 +2809,7 @@ struct PostProcessingMigrationGateTests {
         defaults.set("en", forKey: "transcriptionLanguage")
         let transcriptionDependencies = PostProcessingTranscriptionDependencies(
             defaults: defaults,
-            apiKey: { _ in nil },
+            providerAccess: { _ in nil },
             supportsAppleLanguage: { _ in true },
             localWhisperState: { LocalWhisperState(model: "base", isAvailable: true) }
         )

@@ -52,6 +52,9 @@ final class WebSyncCoordinator {
     private(set) var mcpPrefs: MCPPrefsSnapshot?
     private let auth: CadenzaAuthService
     private let entitlementsRefreshPolicy: EntitlementsRefreshPolicy
+    /// Nil unless the app opts in, so a coordinator built for a test issues
+    /// only the recording sync traffic that test scripts.
+    private let speakerProfileSync: SpeakerProfileSync?
 
     init(
         store: RecordingsStore,
@@ -62,7 +65,8 @@ final class WebSyncCoordinator {
         shouldPauseHistoricalAudio: @escaping @MainActor () -> Bool = { false },
         migrationGate: StorageMigrationGate = .shared,
         historicalConsent: (@MainActor () -> HistoricalSyncConsent)? = nil,
-        entitlementsRefreshPolicy: EntitlementsRefreshPolicy = .onSessionBoundaries
+        entitlementsRefreshPolicy: EntitlementsRefreshPolicy = .onSessionBoundaries,
+        syncsSpeakerProfiles: Bool = false
     ) {
         self.entitlementsRefreshPolicy = entitlementsRefreshPolicy
         self.migrationGate = migrationGate
@@ -70,11 +74,15 @@ final class WebSyncCoordinator {
             ?? { HistoricalSyncConsent.readActiveProfile(defaults: defaults) }
         self.store = store
         self.auth = auth
-        self.api = WebSyncAPIClient(auth: auth)
+        let api = WebSyncAPIClient(auth: auth)
+        self.api = api
         self.fileReader = fileReader
         self.defaults = defaults
         self.isEnabled = startAutomatically
         self.shouldPauseHistoricalAudio = shouldPauseHistoricalAudio
+        self.speakerProfileSync = syncsSpeakerProfiles
+            ? SpeakerProfileSync(store: store, transport: api, defaults: defaults)
+            : nil
         auth.onSessionChanged = { [weak self] state, user in
             self?.sessionChanged(state: state, user: user)
         }
@@ -560,6 +568,22 @@ final class WebSyncCoordinator {
             userID: userID,
             errorRevisionBeforePass: errorRevisionBeforePass
         )
+        await runSpeakerProfileSyncIfDue(userID: userID)
+    }
+
+    /// Speaker profiles ride the identity switch the recording payload's
+    /// mappings already honor. The last-known prefs gate it, so an account
+    /// that never enabled identity generates no speaker sync requests at all.
+    private func runSpeakerProfileSyncIfDue(userID: String) async {
+        guard let speakerProfileSync,
+              mcpPrefs?.speakerIdentityEnabled == true,
+              isActiveUser(userID), !Task.isCancelled,
+              let ledgerKey = accountScopedPreferenceKey(base: "webSync.speakerProfileSync", userID: userID) else {
+            return
+        }
+        _ = await speakerProfileSync.runPassIfDue(ledgerKey: ledgerKey) { [weak self] in
+            self?.isActiveUser(userID) == true
+        }
     }
 
     private enum UserRetryLane: Sendable {

@@ -231,9 +231,50 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
     private var pendingRotation: PendingRotation?
     private var draining: DrainingConnection?
 
+    /// Reaches Gemini Live with this Mac's key, or with single-use tokens the
+    /// Cadenza server mints from the account's key: one per connection, never
+    /// cached, since a token opens exactly one session.
+    init(
+        access: AIProviderAccess,
+        model: String,
+        startupDeadline: Duration = .seconds(15),
+        mintCredential: (@Sendable (AIProviderAccess, String) async throws -> String)? = nil
+    ) {
+        if let apiKey = access.directAPIKey {
+            self.init(apiKey: apiKey, model: model, startupDeadline: startupDeadline)
+            return
+        }
+        self.init(
+            apiKey: "",
+            model: model,
+            cloudTokenOperation: Self.cloudTokenOperation(access: access, model: model, mint: mintCredential),
+            startupDeadline: startupDeadline
+        )
+    }
+
+    /// Asks Cadenza for a fresh token on every call: each connection and
+    /// goAway rotation needs its own, because a minted token opens one session.
+    static func cloudTokenOperation(
+        access: AIProviderAccess,
+        model: String,
+        mint: (@Sendable (AIProviderAccess, String) async throws -> String)? = nil
+    ) -> @Sendable () async throws -> String {
+        let mint = mint ?? { access, model in
+            try await CadenzaRealtimeCredentials.mint(access: access, model: model)
+        }
+        return {
+            let token = try await mint(access, model)
+            guard GeminiEphemeralToken.isValidName(token) else {
+                throw AIServiceError.invalidResponse
+            }
+            return token
+        }
+    }
+
     init(
         apiKey: String,
         model: String,
+        cloudTokenOperation: (@Sendable () async throws -> String)? = nil,
         transportForTesting: GeminiRealtimeTransport? = nil,
         transportFactoryForTesting: (@Sendable () -> GeminiRealtimeTransport)? = nil,
         startupOperationForTesting: (@Sendable () async throws -> Void)? = nil,
@@ -249,6 +290,9 @@ actor GeminiRealtimeTranscriber: TranscriptionService {
         if let tokenOperationForTesting {
             self.tokenOperation = tokenOperationForTesting
             self.authenticateInjectedTransport = true
+        } else if let cloudTokenOperation {
+            self.tokenOperation = cloudTokenOperation
+            self.authenticateInjectedTransport = false
         } else {
             let tokenProvider = GeminiEphemeralTokenProvider(apiKey: apiKey)
             self.tokenOperation = {

@@ -266,7 +266,7 @@ struct RecordingsChromeLayoutTests {
             in: project,
             scope: "RecordingsContentGenerationBoundary.constructService(",
             guardText: "startupPolicy: appState.startupPolicy",
-            sink: "provider.makeChatService(apiKey: apiKey)"
+            sink: "provider.makeChatService(access: access)"
         ))
 
         #expect(detail.contains(".disabled(!appState.startupPolicy.allowsContentGeneration)"))
@@ -280,7 +280,7 @@ struct RecordingsChromeLayoutTests {
             in: detail,
             scope: "RecordingsContentGenerationBoundary.constructService(",
             guardText: "startupPolicy: appState.startupPolicy",
-            sink: "createAIService(provider: provider, apiKey: apiKey)"
+            sink: "createAIService(provider: provider, access: access)"
         ))
         #expect(textPrecedes(
             in: detail,

@@ -110,7 +110,7 @@ private enum RealtimeStopOperation {
 @MainActor
 struct RecordingEngineDependencies {
     let defaults: UserDefaults
-    let apiKey: @MainActor @Sendable (AIProvider) -> String?
+    let providerAccess: @MainActor @Sendable (AIProvider) -> AIProviderAccess?
     let supportsAppleLanguage: @MainActor @Sendable (String) async -> Bool
     let localWhisperState: @MainActor @Sendable () -> (model: String, isAvailable: Bool)
     let microphoneStatus: @MainActor @Sendable () -> PermissionStatus
@@ -128,7 +128,7 @@ struct RecordingEngineDependencies {
     static func live(defaults: UserDefaults = .standard) -> Self {
         Self(
             defaults: defaults,
-            apiKey: { KeychainManager.shared.readOnlyAPIKey(for: $0) },
+            providerAccess: { AICredentialResolver.shared.access(for: $0) },
             supportsAppleLanguage: { await AppleSpeechFactory.supportsLanguage($0) },
             localWhisperState: {
                 let manager = WhisperModelManager.shared
@@ -573,7 +573,7 @@ extension RecordingEngine {
 
     private var providerResolver: TranscriptionProviderResolver {
         TranscriptionProviderResolver(
-            apiKey: dependencies.apiKey,
+            providerAccess: dependencies.providerAccess,
             supportsAppleLanguage: dependencies.supportsAppleLanguage,
             localWhisperState: {
                 let state = self.dependencies.localWhisperState()
@@ -614,7 +614,7 @@ extension RecordingEngine {
         }
         try await transcriptionManager.startRealtime(
             provider: request.configuration.selection.provider,
-            apiKey: request.configuration.selection.apiKey ?? "",
+            access: request.configuration.selection.access,
             language: request.configuration.language,
             preserveSegments: request.preserveSegments,
             recordingStartTime: request.configuration.recordingStartTime,

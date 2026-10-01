@@ -3333,20 +3333,14 @@ struct RecordingDetailView: View {
 
         let providerRaw = UserDefaults.standard.string(forKey: "defaultAIProvider") ?? AIProvider.apple.rawValue
         let provider = AIProvider(rawValue: providerRaw) ?? .apple
-        let apiKey: String
-        if provider.requiresAPIKey {
-            guard let key = KeychainManager.shared.apiKey(for: provider), !key.isEmpty else { return }
-            apiKey = key
-        } else {
-            apiKey = ""
-        }
+        guard let access = AICredentialResolver.shared.access(for: provider) else { return }
 
         isTranslating = true
         translatedText = nil
 
         guard let service = RecordingsContentGenerationBoundary.constructService(
             startupPolicy: appState.startupPolicy,
-            factory: { Optional(createAIService(provider: provider, apiKey: apiKey)) }
+            factory: { createAIService(provider: provider, access: access) }
         ) else { return }
         let systemPrompt = "You are a translator. Translate the provided meeting transcript to \(language.displayName). Keep the original meaning and tone. Output only the translated text, nothing else."
 
@@ -3413,8 +3407,8 @@ struct RecordingDetailView: View {
         }
     }
 
-    private nonisolated func createAIService(provider: AIProvider, apiKey: String) -> AIServiceProtocol {
-        provider.makeChatService(apiKey: apiKey) ?? OpenAIService(apiKey: apiKey)
+    private nonisolated func createAIService(provider: AIProvider, access: AIProviderAccess) -> AIServiceProtocol? {
+        provider.makeChatService(access: access)
     }
 
     private func formatSummaryForCopy(_ summary: SummaryDTO) -> String {

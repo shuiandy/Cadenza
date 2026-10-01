@@ -37,14 +37,14 @@ struct MeetingPrepGeneratorTests {
 
     @Test @MainActor func noAPIKeyIsPermanentFailure() async {
         let gen = MeetingPrepGenerator()
-        gen.apiKeyResolver = { _ in nil }
+        gen.accessResolver = { _ in nil }
         let r = await gen.generatePrep(contextText: "ctx", provider: .claude, model: nil)
         guard case .failure(.noAPIKey) = r else { Issue.record("expected .noAPIKey, got \(r)"); return }
     }
 
     @Test @MainActor func providerErrorIsRetryableFailure() async {
         let gen = MeetingPrepGenerator()
-        gen.apiKeyResolver = { _ in "key" }
+        gen.accessResolver = { .direct($0, apiKey: "key") }
         gen.serviceFactory = { _, _ in MockAIService(errorToThrow: URLError(.timedOut)) }
         let r = await gen.generatePrep(contextText: "ctx", provider: .claude, model: nil)
         guard case .failure(.provider) = r else { Issue.record("expected .provider, got \(r)"); return }
@@ -52,7 +52,7 @@ struct MeetingPrepGeneratorTests {
 
     @Test @MainActor func generatePrepSuccessReturnsMarkdown() async {
         let gen = MeetingPrepGenerator()
-        gen.apiKeyResolver = { _ in "key" }
+        gen.accessResolver = { .direct($0, apiKey: "key") }
         gen.serviceFactory = { _, _ in MockAIService(chunks: ["ready ", "brief"]) }
         let r = await gen.generatePrep(contextText: "ctx", provider: .claude, model: nil)
         guard case .success(let md) = r else { Issue.record("expected success, got \(r)"); return }

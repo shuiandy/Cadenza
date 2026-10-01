@@ -83,7 +83,7 @@ struct M1StorageMigrationTests {
 
             try context.save()
         }
-        try waitForSQLiteWriteLockRelease(at: fixture.paths.legacyStoreURL)
+        try waitForSQLiteConnectionsToClose(at: fixture.paths.legacyStoreURL)
 
         try FileManager.default.createDirectory(
             at: fixture.paths.legacyChatHistoryDirectory, withIntermediateDirectories: true

@@ -74,7 +74,31 @@ struct M1FailureMatrixTests {
             context.insert(recording)
             try context.save()
         }
-        try waitForSQLiteWriteLockRelease(at: fixture.paths.legacyStoreURL)
+        try waitForSQLiteConnectionsToClose(at: fixture.paths.legacyStoreURL)
+    }
+
+    // MARK: - Fixture readiness
+
+    /// The populate helpers' wait must see a connection that is still
+    /// open. An idle WAL connection holds no write lock, so only its
+    /// descriptors give it away; a wait that could not observe them would
+    /// return at once and silently reopen the race it exists to close.
+    @Test @MainActor
+    func connectionCloseWaitObservesAnOpenConnection() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        try populateMinimalSource(fixture)
+
+        var db: OpaquePointer?
+        #expect(sqlite3_open_v2(
+            fixture.paths.legacyStoreURL.path, &db, SQLITE_OPEN_READONLY, nil
+        ) == SQLITE_OK)
+        #expect(sqlite3_exec(db, "SELECT count(*) FROM sqlite_master", nil, nil, nil) == SQLITE_OK)
+        #expect(throws: SQLiteConnectionCloseWaitFailure.self) {
+            try waitForSQLiteConnectionsToClose(at: fixture.paths.legacyStoreURL, timeout: 0.1)
+        }
+        sqlite3_close(db)
+        try waitForSQLiteConnectionsToClose(at: fixture.paths.legacyStoreURL)
     }
 
     // MARK: - Full-graph integrity
@@ -311,6 +335,13 @@ struct M1FailureMatrixTests {
                 Issue.record("boundary \(boundary): expected legacy fallback, got \(failed.mode)")
                 return
             }
+            // The fallback must come from the injected interruption itself;
+            // any earlier failure falls back the same way and would leave
+            // this boundary untested.
+            #expect(
+                operations.journalWritesAttempted == boundary,
+                "boundary \(boundary): first boot fell back before the boundary: \(failed.mode)"
+            )
             #expect(FileManager.default.fileExists(atPath: fixture.paths.legacyStoreURL.path))
             #expect(DiskProfileRegistry(
                 registryURL: fixture.paths.registryURL, fileOperations: LiveFileOperations()
@@ -453,7 +484,7 @@ struct M1FailureMatrixTests {
             }
             try context.save()
         }
-        try waitForSQLiteWriteLockRelease(at: url)
+        try waitForSQLiteConnectionsToClose(at: url)
     }
 
     @Test @MainActor

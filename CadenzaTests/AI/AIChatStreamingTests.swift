@@ -481,3 +481,74 @@ struct AccumulatorIncrementalScanTests {
         #expect(accumulator.fullText.utf16.count <= 100)
     }
 }
+
+@Suite("Chat Markdown CJK Emphasis")
+struct ChatMarkdownCJKEmphasisTests {
+    private func boldText(_ attributed: AttributedString) -> [String] {
+        attributed.runs
+            .filter { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true }
+            .map { String(attributed[$0.range].characters) }
+    }
+
+    @MainActor @Test func boldClosingAfterFullWidthPunctuationRenders() {
+        MarkdownRenderCache._test_resetCaches()
+        let attributed = MarkdownRenderCache.inlineAttributed("**交付：**桂花拿铁包装设计稿。", limit: 2_000)
+        #expect(String(attributed.characters) == "交付：桂花拿铁包装设计稿。")
+        #expect(boldText(attributed) == ["交付："])
+    }
+
+    @MainActor @Test func boldOpeningBeforeFullWidthPunctuationRenders() {
+        MarkdownRenderCache._test_resetCaches()
+        let attributed = MarkdownRenderCache.inlineAttributed("先看**「试点门店」**的数据", limit: 2_000)
+        #expect(String(attributed.characters) == "先看「试点门店」的数据")
+        #expect(boldText(attributed) == ["「试点门店」"])
+    }
+
+    @MainActor @Test func emphasisTheParserAlreadyHandlesIsUnchanged() {
+        MarkdownRenderCache._test_resetCaches()
+        for (source, plain, bold) in [
+            ("。**注意**事项", "。注意事项", ["注意"]),
+            ("负责人：**小周**，交付：**设计稿（终版）**。", "负责人：小周，交付：设计稿（终版）。", ["小周", "设计稿（终版）"]),
+            ("**bold** text", "bold text", ["bold"]),
+        ] {
+            #expect(EmphasisFlankingRepair.spaced(source) == nil, "repaired \(source)")
+            let attributed = MarkdownRenderCache.inlineAttributed(source, limit: 2_000)
+            #expect(String(attributed.characters) == plain)
+            #expect(boldText(attributed) == bold)
+        }
+    }
+
+    @Test func codeSpansEscapesAndPlaceholdersAreLeftAlone() {
+        #expect(EmphasisFlankingRepair.spaced("用 `**交付：**桂花` 表示加粗") == nil)
+        #expect(EmphasisFlankingRepair.spaced(#"\**交付：**桂花"#) == nil)
+        #expect(EmphasisFlankingRepair.spaced("***交付：***桂花") == nil)
+        #expect(EmphasisFlankingRepair.spaced("**交付：**\u{2005}桂花") == nil)
+    }
+}
+
+@Suite("Chat Context Info")
+struct ChatContextInfoTests {
+    private func day(_ day: Int) -> Date {
+        Calendar.current.date(from: DateComponents(year: 2026, month: 10, day: day, hour: 12))!
+    }
+
+    @Test func singleRecordingReadsInEnglishAndChinese() {
+        let meta = ContextMetadata(recordingCount: 1, dateRange: (day(1), day(1)), speakerCount: 2)
+        #expect(AIContextAssembler.formatContextInfo(meta, locale: Locale(identifier: "en_US"))
+            == "Based on 1 recording · Oct 1 · 2 speakers")
+        #expect(AIContextAssembler.formatContextInfo(meta, locale: Locale(identifier: "zh-Hans"))
+            == "基于 1 个录音 · 10月1日 · 2 位发言人")
+    }
+
+    @Test func pluralCountsAndDateRangesAreLocalized() {
+        let meta = ContextMetadata(recordingCount: 3, dateRange: (day(1), day(5)), speakerCount: 1)
+        let english = AIContextAssembler.formatContextInfo(meta, locale: Locale(identifier: "en_US")) ?? ""
+        #expect(english.hasPrefix("Based on 3 recordings · Oct 1"))
+        #expect(english.hasSuffix("5 · 1 speaker"))
+        let german = AIContextAssembler.formatContextInfo(meta, locale: Locale(identifier: "de")) ?? ""
+        #expect(german.hasPrefix("Basierend auf 3 Aufnahmen · "))
+        #expect(german.hasSuffix(" · 1 Sprecher"))
+        #expect(AIContextAssembler.formatContextInfo(
+            ContextMetadata(recordingCount: 0, dateRange: nil, speakerCount: 0)) == nil)
+    }
+}

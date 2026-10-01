@@ -226,15 +226,14 @@ struct AIChatModelMenu: View {
         guard appState.startupPolicy.allowsContentGeneration else { return }
         guard fetchedPresets[provider.rawValue] == nil,
               !loadingProviderIDs.contains(provider.rawValue),
-              let apiKey = KeychainManager.shared.apiKey(for: provider),
-              !apiKey.isEmpty else { return }
+              let access = AICredentialResolver.shared.access(for: provider) else { return }
 
         loadingProviderIDs.insert(provider.rawValue)
         defer { loadingProviderIDs.remove(provider.rawValue) }
 
         do {
             let modelListService = AIChatModelListService()
-            let presets = try await modelListService.fetchPresets(for: provider, apiKey: apiKey)
+            let presets = try await modelListService.fetchPresets(for: provider, access: access)
             guard !presets.isEmpty else { return }
             fetchedPresets[provider.rawValue] = presets
 

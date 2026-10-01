@@ -218,15 +218,6 @@ enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
         }
     }
 
-    /// Base URL for OpenAI-compatible chat completion endpoint.
-    var chatBaseURL: String {
-        switch self {
-        case .openai: "https://api.openai.com/v1/chat/completions"
-        case .minimax: "https://api.minimax.io/v1/chat/completions"
-        default: ""
-        }
-    }
-
     /// Token budget for AI context assembly. Conservative to leave room for model thinking.
     var contextTokenBudget: Int {
         switch self {

@@ -296,6 +296,10 @@ final class AppState {
     /// tests and previews fall back to a fully in-memory, unbound service
     /// (INV-8) that owns no token slot and can never issue requests.
     let cadenzaAuth: CadenzaAuthService
+    /// Where each AI provider's key comes from for this profile's account.
+    /// Also installed as `AICredentialResolver.shared` for code without an
+    /// AppState, such as live dependencies and generators.
+    let aiCredentials: AICredentialResolver
     private(set) var calendarManager: CalendarManager!
     private(set) var exportService: ExportService!
 
@@ -811,6 +815,17 @@ final class AppState {
         )
         self.startupPolicy = resolvedStartupPolicy
         self.cadenzaAuth = cadenzaAuth ?? CadenzaAuthService.ephemeral()
+        let aiCredentials = AICredentialResolver(
+            account: self.cadenzaAuth,
+            localKey: { KeychainManager.shared.readOnlyAPIKey(for: $0) }
+        )
+        self.aiCredentials = aiCredentials
+        AICredentialResolver.shared = aiCredentials
+        if resolvedStartupPolicy.externalAccessEnabled {
+            self.cadenzaAuth.addSessionObserver { [weak aiCredentials] _, _ in
+                aiCredentials?.sessionDidChange()
+            }
+        }
         // Initialize calendar and export services
         calendarManager = CalendarManager(
             tokenManager: oauthTokenManager,
@@ -1021,6 +1036,11 @@ final class AppState {
         }
         coordinator.exportService = exportService
         coordinator.store = store
+
+        // Learn whether the account's server serves cloud AI keys, and which.
+        if startupPolicy.externalAccessEnabled {
+            aiCredentials.sessionDidChange()
+        }
 
         // Check local API key state
         if startupPolicy.inspectsCredentialStore {
@@ -1624,13 +1644,21 @@ final class AppState {
         recordingEngine.dismissRecordingError()
     }
 
-    func stopRecording() {
+    /// `userInitiated` stops (menu bar, overlay, main window, hotkey) also keep
+    /// the detected meeting from restarting the recording; pass false for
+    /// system-driven stops such as sleep.
+    func stopRecording(userInitiated: Bool = true) {
         NSLog("[AppState] stopRecording: ENTER")
 
         stopRequestTime = Date()
         showRecordingOverlay = false
         overlayController.dismiss()
 
+        if userInitiated {
+            // Before the engine stops: its stop callback resets the detector,
+            // which would discard the session this hold describes.
+            meetingDetector.holdAutoStartAfterUserStop()
+        }
         recordingEngine.stopRecording()
 
         stopRequestTime = nil

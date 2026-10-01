@@ -30,6 +30,13 @@ enum MeetingEndingReason: String, Equatable, Sendable {
     var allowsAuthoritativeAutoStopDeadline: Bool {
         self == .teamsCallAssertionReleased
     }
+
+    /// The meeting app itself reported that the call ended, as opposed to
+    /// heuristic signals fading. Such an end retires the session's calendar
+    /// event for the rest of its detection window.
+    var isAppOwnedCallEnd: Bool {
+        self == .teamsCallAssertionReleased || self == .processMicReleased
+    }
 }
 
 struct MeetingEndingEvent: Equatable, Sendable {

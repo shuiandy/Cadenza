@@ -3774,7 +3774,7 @@ actor RecordingsStore {
     /// Tracks changes visible through recording/search/MCP APIs. Internal
     /// bookkeeping such as last-access time and retry counters deliberately
     /// does not advance this timestamp.
-    private func touch(_ recording: Recording, at date: Date = Date()) {
+    func touch(_ recording: Recording, at date: Date = Date()) {
         recording.updatedAt = date
     }
 
@@ -4530,7 +4530,7 @@ actor RecordingsStore {
             && session.generation == speakerMemoryWriteGeneration
     }
 
-    private func isSpeakerMemoryEnabled() -> Bool {
+    func isSpeakerMemoryEnabled() -> Bool {
 #if DEBUG
         if let speakerMemoryConsentOverride {
             return speakerMemoryConsentOverride
@@ -4756,7 +4756,7 @@ actor RecordingsStore {
         }
     }
 
-    private func fetchVoiceSample(recordingID: UUID, rawLabel: String) -> SpeakerVoiceSample? {
+    func fetchVoiceSample(recordingID: UUID, rawLabel: String) -> SpeakerVoiceSample? {
         let descriptor = FetchDescriptor<SpeakerVoiceSample>(
             predicate: #Predicate { $0.recordingID == recordingID && $0.rawLabel == rawLabel }
         )

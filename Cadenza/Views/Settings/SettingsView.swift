@@ -2240,7 +2240,7 @@ private struct TranscriptionSettingsSection: View {
             // app will actually use. The missing-key case is labeled so the
             // user can see why summaries will fail until a key is added.
             ForEach(aiProviderOptions) { provider in
-                if provider.requiresAPIKey && !KeychainManager.shared.hasAPIKey(for: provider) {
+                if provider.requiresAPIKey && !AICredentialResolver.shared.hasUsableKey(for: provider) {
                     Text("\(provider.displayName) (API key missing)").tag(provider)
                 } else {
                     Text(provider.displayName).tag(provider)
@@ -2258,7 +2258,7 @@ private struct TranscriptionSettingsSection: View {
     private var aiProviderOptions: [AIProvider] {
         var options: [AIProvider] = [.apple]
         options += AIProvider.allCases.filter {
-            $0.requiresAPIKey && KeychainManager.shared.hasAPIKey(for: $0)
+            $0.requiresAPIKey && AICredentialResolver.shared.hasUsableKey(for: $0)
         }
         if !options.contains(defaultProvider) {
             options.append(defaultProvider)

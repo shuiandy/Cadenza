@@ -292,19 +292,13 @@ struct MeetingDetectorTests {
         #expect(recoveredCallCount == 0)
         #expect(endedCallCount == 1)
 
-        // A queued post-grace evaluation can manufacture idle → detected →
-        // active from the retained calendar event plus Cadenza's own mic. That
-        // same-bundle callback must not cancel the authoritative deadline.
+        // The released call retires its calendar event, so a queued post-grace
+        // evaluation can no longer rebuild idle → detected from that event plus
+        // Cadenza's own mic. (RecordingEngineTests still cover the engine
+        // keeping its authoritative deadline if such a callback arrives.)
         detector._test_evaluateConfidence(windows: windows)
-        #expect(detector.sessionState.isDetected)
-        detector._test_setSessionState(.detected(
-            since: Date().addingTimeInterval(-MeetingSessionState.debounceInterval - 0.1),
-            app: .teams
-        ))
-        detector._test_evaluateConfidence(windows: windows)
-
-        #expect(detector.sessionState.isActive)
-        #expect(activityCallCount == 1)
+        #expect(detector.sessionState.isIdle)
+        #expect(activityCallCount == 0)
         #expect(engine._test_hasPendingAutoStop)
         #expect(engine._test_hasAutoStopTask)
 
@@ -312,7 +306,7 @@ struct MeetingDetectorTests {
 
         #expect(engine.recordingState == .idle)
         #expect(detector.sessionState.isIdle)
-        #expect(endedCallCount == 2)
+        #expect(endedCallCount == 1)
     }
 
     @Test func teamsReleaseUnavailableGraceRecoveryRetriesThenStops() async throws {
@@ -1982,5 +1976,276 @@ struct MeetingDetectorTests {
         #expect(recoveredCalled)
         #expect(!activityCalled)
         #expect(!micDeactivatedCalled)
+    }
+
+    // MARK: - False auto-start guards (2026-10-01)
+
+    private let teamsApp = MeetingDetector.DetectedMeetingApp(
+        id: "com.microsoft.teams2",
+        app: .teams,
+        name: "Microsoft Teams",
+        pid: pid_t(4242)
+    )
+
+    private func teamsCalendarMeeting(id: String = "shift-left-standup") -> MeetingEventDTO {
+        MeetingEventDTO(
+            id: id,
+            title: "Shift Left Standup (Europe/North America)",
+            startDate: Date().addingTimeInterval(-300),
+            endDate: Date().addingTimeInterval(1800),
+            meetingURL: nil,
+            meetingApp: "teams",
+            calendarName: "Work",
+            notes: nil,
+            source: "apple",
+            calendarID: "work",
+            defaultColorHex: "",
+            organizer: nil,
+            attendees: [],
+            isRecurring: false,
+            location: nil
+        )
+    }
+
+    private func teamsWindow(_ title: String) -> CGWindowEnumerator.EnumeratedWindow {
+        CGWindowEnumerator.EnumeratedWindow(
+            pid: pid_t(4242),
+            snapshot: .init(title: title, width: 1811, height: 1082, isOnScreen: true)
+        )
+    }
+
+    private var meetingWindow: CGWindowEnumerator.EnumeratedWindow {
+        teamsWindow("Shift Left Standup (Europe/North America) | Acme | person@example.com | Microsoft Teams")
+    }
+
+    /// Drives idle → detected → active through the real transitions so the
+    /// session captures its calendar event the way production does.
+    private func activateTeamsSession(
+        _ detector: MeetingDetector,
+        windows: [CGWindowEnumerator.EnumeratedWindow]
+    ) {
+        detector._test_evaluateConfidence(windows: windows)
+        #expect(detector.sessionState.isDetected)
+        detector._test_setSessionState(.detected(
+            since: Date().addingTimeInterval(-MeetingSessionState.debounceInterval - 0.1),
+            app: .teams
+        ))
+        detector._test_evaluateConfidence(windows: windows)
+        #expect(detector.sessionState.isActive)
+    }
+
+    /// The 2026-10-01 incident: during the half hour after a standup, an
+    /// automation browsing Teams opened a page whose title passed the window
+    /// check, and calendar (+2) plus that window (+1) started a recording with
+    /// no call. "Planner" stands in for any page the tab list does not know.
+    @Test func teamsIdle_unlistedPageWithoutCallActivity_doesNotTrigger() {
+        let (detector, _, _) = makeDetector()
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(false)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+
+        detector._test_evaluateConfidence(windows: [teamsWindow("Planner | Acme | person@example.com | Microsoft Teams")])
+
+        #expect(detector.sessionState.isIdle)
+    }
+
+    /// A muted participant in a silent call has no call assertion and no
+    /// helper output (2026-08-13), but Teams' helper is capturing input, which
+    /// is enough for the meeting window to count.
+    @Test func teamsIdle_meetingWindowWithHelperInputOnly_triggers() {
+        let (detector, audioQuery, _) = makeDetector()
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(false)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+
+        #expect(detector.sessionState.isDetected)
+    }
+
+    @Test func teamsIdle_meetingWindowWithCallAssertion_triggers() {
+        let assertionQuery = MockTeamsCallAssertionQuery()
+        assertionQuery.defaultState = .active
+        let (detector, _, _) = makeDetector(teamsCallAssertionQuery: assertionQuery)
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(false)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+
+        #expect(detector.sessionState.isDetected)
+    }
+
+    /// Once Teams reports the call over, its calendar event stops counting for
+    /// the rest of the detection window (which runs 30 min past the end), so a
+    /// later mic user such as dictation cannot restart recording from it. A
+    /// different event still counts.
+    @Test func teamsCallEndedByApp_retiresCalendarEvent() {
+        let assertionQuery = MockTeamsCallAssertionQuery()
+        assertionQuery.defaultState = .active
+        let (detector, audioQuery, _) = makeDetector(teamsCallAssertionQuery: assertionQuery)
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        audioQuery.activeOutputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(true)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+
+        activateTeamsSession(detector, windows: [meetingWindow])
+
+        // Hang up.
+        assertionQuery.defaultState = .inactive
+        audioQuery.activeInputBundleIDs = []
+        audioQuery.activeOutputBundleIDs = []
+        detector._test_setSystemMicActivity(false)
+        let chatWindow = teamsWindow("Chat | ProdSec Shift Left | Acme | person@example.com | Microsoft Teams")
+        detector._test_evaluateConfidence(windows: [chatWindow])
+        #expect(detector.sessionState.isEnding)
+        detector._test_setSessionState(.ending(
+            since: Date().addingTimeInterval(-MeetingSessionState.graceInterval - 0.1),
+            app: .teams
+        ))
+        detector._test_evaluateConfidence(windows: [chatWindow])
+        #expect(detector.sessionState.isIdle)
+
+        // Same event plus an unrelated mic user: previously the Teams calendar
+        // start fallback restarted recording here.
+        detector._test_setSystemMicActivity(true)
+        detector._test_evaluateConfidence(windows: [chatWindow])
+        #expect(detector.sessionState.isIdle)
+
+        detector.currentCalendarMeeting = teamsCalendarMeeting(id: "next-meeting")
+        detector._test_evaluateConfidence(windows: [chatWindow])
+        #expect(detector.sessionState.isDetected)
+    }
+
+    /// Only the app's own end signal retires the event. A heuristic drop may
+    /// be a glitch, so the event keeps counting and a recovery can restart.
+    @Test func teamsSignalDropEnd_keepsCalendarEvent() {
+        let (detector, audioQuery, _) = makeDetector()
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(true)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+
+        activateTeamsSession(detector, windows: [meetingWindow])
+        detector._test_setActiveSince(Date().addingTimeInterval(-91))
+
+        audioQuery.activeInputBundleIDs = []
+        detector._test_setSystemMicActivity(false)
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isEnding)
+        detector._test_setSessionState(.ending(
+            since: Date().addingTimeInterval(-MeetingSessionState.graceInterval - 0.1),
+            app: .teams
+        ))
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isIdle)
+
+        detector._test_setSystemMicActivity(true)
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isDetected)
+    }
+
+    /// The 2026-10-01 incident, second half: after the user stopped the false
+    /// recording, the unchanged signals re-detected the meeting at once and
+    /// RecordingEngine restarted it when its 10 s cooldown ran out.
+    @Test func userStopHold_blocksRestartUntilSignalsClear() {
+        let (detector, audioQuery, _) = makeDetector()
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(true)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+        activateTeamsSession(detector, windows: [meetingWindow])
+
+        detector.holdAutoStartAfterUserStop()
+        detector.resetNotificationState()
+
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+        #expect(detector.sessionState.isIdle)
+
+        // Evidence clears (calendar alone is below the threshold): hold lifts.
+        audioQuery.activeInputBundleIDs = []
+        detector._test_setSystemMicActivity(false)
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isIdle)
+
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setSystemMicActivity(true)
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+        #expect(detector.sessionState.isDetected)
+    }
+
+    /// When the user stops recording a call Teams still reports as live, the
+    /// hold waits for that call to end. Screen sharing can drop the window and
+    /// the score for a while; that dip must not re-arm auto-start mid-call.
+    @Test func userStopHold_duringTeamsCall_waitsForAssertionRelease() {
+        let assertionQuery = MockTeamsCallAssertionQuery()
+        assertionQuery.defaultState = .active
+        let (detector, audioQuery, _) = makeDetector(teamsCallAssertionQuery: assertionQuery)
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        audioQuery.activeOutputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(true)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+        activateTeamsSession(detector, windows: [meetingWindow])
+
+        detector.holdAutoStartAfterUserStop()
+        detector.resetNotificationState()
+
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+        #expect(detector.sessionState.isIdle)
+
+        detector._test_setSystemMicActivity(false)
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isIdle)
+
+        detector._test_setSystemMicActivity(true)
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+        #expect(detector.sessionState.isIdle)
+
+        // The call ends: hold lifts and, since Teams itself ended the call,
+        // the event is retired like any app-owned end.
+        assertionQuery.defaultState = .inactive
+        audioQuery.activeInputBundleIDs = []
+        audioQuery.activeOutputBundleIDs = []
+        detector._test_setSystemMicActivity(false)
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isIdle)
+
+        detector._test_setSystemMicActivity(true)
+        detector._test_evaluateConfidence(windows: [])
+        #expect(detector.sessionState.isIdle)
+
+        // A new call is detected again, now without the retired event.
+        assertionQuery.defaultState = .active
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setSystemMicActivity(true)
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+        #expect(detector.sessionState.isDetected)
+    }
+
+    /// Stopping a recording while nothing is detected must not delay the next
+    /// meeting.
+    @Test func userStopHold_whileIdle_isNoop() {
+        let (detector, audioQuery, _) = makeDetector()
+        audioQuery.activeInputBundleIDs = ["com.microsoft.teams2.modulehost"]
+        detector._test_setRunningMeetingApps([teamsApp])
+        detector._test_setActiveMeetingApp(.teams)
+        detector._test_setSystemMicActivity(true)
+        detector.currentCalendarMeeting = teamsCalendarMeeting()
+
+        detector.holdAutoStartAfterUserStop()
+        detector.resetNotificationState()
+        detector._test_evaluateConfidence(windows: [meetingWindow])
+
+        #expect(detector.sessionState.isDetected)
     }
 }

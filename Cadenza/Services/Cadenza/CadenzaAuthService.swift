@@ -53,6 +53,13 @@ final class CadenzaAuthService {
     private(set) var currentUser: SignedInUser?
     private(set) var lastError: AuthError?
     var onSessionChanged: ((SessionState, SignedInUser?) -> Void)?
+    /// Further session listeners. `onSessionChanged` has a single owner (web
+    /// sync); these are for everything else that follows the session.
+    @ObservationIgnored private var sessionObservers: [(SessionState, SignedInUser?) -> Void] = []
+
+    func addSessionObserver(_ observer: @escaping (SessionState, SignedInUser?) -> Void) {
+        sessionObservers.append(observer)
+    }
 
     /// Set by `CadenzaApp` so legacy callers passing `openURL` keep working
     /// during this phase; new code should rely on `OAuthCoordinator` instead.
@@ -726,9 +733,20 @@ final class CadenzaAuthService {
         path: String,
         method: String,
         token: String,
-        backend: CadenzaBackendConfig.Resolved
+        backend: CadenzaBackendConfig.Resolved,
+        queryItems: [URLQueryItem] = []
     ) throws -> URLRequest {
-        let url = backend.apiBaseURL.appendingPathComponent(path)
+        var url = backend.apiBaseURL.appendingPathComponent(path)
+        // A query goes through URLComponents: appended to `path` it would be
+        // percent-encoded into the path segment.
+        if !queryItems.isEmpty {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+                throw URLError(.badURL)
+            }
+            components.queryItems = queryItems
+            guard let withQuery = components.url else { throw URLError(.badURL) }
+            url = withQuery
+        }
         guard backend.origin.covers(requestURL: url) else {
             assertionFailure("request URL escapes the bound issuer origin")
             throw CadenzaAPIError.notSignedIn
@@ -737,6 +755,20 @@ final class CadenzaAuthService {
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         return request
+    }
+
+    /// The bound API base and a live token, for AI calls the server makes with
+    /// the account's vault keys. Nil unless the session is signed in and
+    /// coherent. Like `makeBearerRequest`, the token only goes to the origin
+    /// that issued it: every such URL is built under this base.
+    func aiRouteCredentials() -> (apiBase: URL, token: String)? {
+        guard sessionState == .signedIn,
+              let token = currentToken(),
+              let backend = boundBackend,
+              backend.origin.covers(requestURL: backend.apiBaseURL) else {
+            return nil
+        }
+        return (backend.apiBaseURL, token)
     }
 
     /// Returns the current Bearer token string, or `nil` if signed out or
@@ -773,7 +805,8 @@ final class CadenzaAuthService {
                          method: String = "GET",
                          body: Data? = nil,
                          contentType: String? = nil,
-                         headers: [String: String] = [:]) async throws -> (Data, HTTPURLResponse) {
+                         headers: [String: String] = [:],
+                         queryItems: [URLQueryItem] = []) async throws -> (Data, HTTPURLResponse) {
         // Only a coherent signed-in session issues requests: a torn
         // artifact set (valid-looking token, missing user record) boots as
         // `.expired` and must never see its bearer used.
@@ -793,7 +826,7 @@ final class CadenzaAuthService {
             throw CadenzaAPIError.notSignedIn
         }
         var urlRequest = try Self.makeBearerRequest(
-            path: path, method: method, token: token, backend: backend
+            path: path, method: method, token: token, backend: backend, queryItems: queryItems
         )
         if let contentType {
             urlRequest.setValue(contentType, forHTTPHeaderField: "Content-Type")
@@ -858,6 +891,9 @@ final class CadenzaAuthService {
 
     private func publishSessionChange() {
         onSessionChanged?(sessionState, currentUser)
+        for observer in sessionObservers {
+            observer(sessionState, currentUser)
+        }
     }
 
     /// Writes this profile's session disposition into the registry — the

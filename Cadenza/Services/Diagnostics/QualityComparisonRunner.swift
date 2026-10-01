@@ -103,7 +103,7 @@ final class QualityComparisonRunner {
                                     } catch { return (draft ?? "", nil, error.localizedDescription) }
                                 }
                                 return await SummaryGenerator.runStreamGenerate(
-                                    provider: provider, apiKey: key, transcript: sample.transcript, language: language, model: model,
+                                    provider: provider, access: .direct(provider, apiKey: key), transcript: sample.transcript, language: language, model: model,
                                     jobTitle: nil, meetingType: .general, meetingTitle: "Fictional evaluation", knownTags: [], detailLevel: .fullBreakdown,
                                     onChunk: { _ in },
                                     onQuickDone: { quick in
@@ -162,7 +162,7 @@ final class QualityComparisonRunner {
                     var text = ""; var failure: String?
                     do {
                         let value = try await AIGenerationObservation.$trace.withValue(trace) {
-                            try await PersonalRelevanceGenerator.generate(snapshot: source, provider: provider, apiKey: key, model: model, language: "zh")
+                            try await PersonalRelevanceGenerator.generate(snapshot: source, provider: provider, access: .direct(provider, apiKey: key), model: model, language: "zh")
                         }
                         text = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
                     } catch { failure = error.localizedDescription }

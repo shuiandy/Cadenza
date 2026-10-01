@@ -9,8 +9,8 @@ enum PrepGenerationError: Error {
 /// 核心 generate(contextText:service:model:) 接受注入 service,可脱离网络单测。
 @MainActor
 final class MeetingPrepGenerator {
-    var apiKeyResolver: (AIProvider) -> String? = { KeychainManager.shared.apiKey(for: $0) }
-    var serviceFactory: (AIProvider, String) -> AIServiceProtocol? = { $0.makeChatService(apiKey: $1) }
+    var accessResolver: (AIProvider) -> AIProviderAccess? = { AICredentialResolver.shared.access(for: $0) }
+    var serviceFactory: (AIProvider, AIProviderAccess) -> AIServiceProtocol? = { $0.makeChatService(access: $1) }
     var gate: AIGenerationGate = .shared
 
     nonisolated static let systemPrompt = """
@@ -45,8 +45,8 @@ final class MeetingPrepGenerator {
     /// 薄 glue:解析 provider→key→service,分类失败。
     func generatePrep(contextText: String, provider: AIProvider,
                       model: String?) async -> Result<String, PrepGenerationError> {
-        guard let key = resolveKey(for: provider),
-              let service = serviceFactory(provider, key) else {
+        guard let access = resolveAccess(for: provider),
+              let service = serviceFactory(provider, access) else {
             return .failure(.noAPIKey)
         }
         let modelID = model ?? provider.summaryModel
@@ -57,9 +57,8 @@ final class MeetingPrepGenerator {
         }
     }
 
-    private func resolveKey(for provider: AIProvider) -> String? {
-        if !provider.requiresAPIKey { return "" }
-        guard let k = apiKeyResolver(provider), !k.isEmpty else { return nil }
-        return k
+    private func resolveAccess(for provider: AIProvider) -> AIProviderAccess? {
+        if !provider.requiresAPIKey { return .direct(provider, apiKey: "") }
+        return accessResolver(provider)
     }
 }
