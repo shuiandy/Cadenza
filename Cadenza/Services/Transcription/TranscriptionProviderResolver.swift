@@ -12,8 +12,22 @@ struct LocalWhisperState: Sendable, Equatable {
 
 struct TranscriptionProviderSelection: Sendable {
     let provider: AIProvider
-    let apiKey: String?
+    /// How the provider is reached; nil for on-device providers.
+    let access: AIProviderAccess?
     let model: String?
+
+    init(provider: AIProvider, access: AIProviderAccess?, model: String?) {
+        self.provider = provider
+        self.access = access
+        self.model = model
+    }
+
+    init(provider: AIProvider, apiKey: String?, model: String?) {
+        self.init(provider: provider, access: apiKey.map { .direct(provider, apiKey: $0) }, model: model)
+    }
+
+    /// This Mac's key, when the provider is reached directly.
+    var apiKey: String? { access?.directAPIKey }
 }
 
 enum TranscriptionProviderResolutionError: Error, LocalizedError, Sendable, Equatable {
@@ -71,7 +85,9 @@ enum TranscriptionProviderResolutionError: Error, LocalizedError, Sendable, Equa
 
 @MainActor
 struct TranscriptionProviderResolver {
-    let apiKey: @MainActor @Sendable (AIProvider) -> String?
+    /// How a cloud provider is reached: this Mac's key or the Cadenza
+    /// account's. Nil when no key is available for it.
+    let providerAccess: @MainActor @Sendable (AIProvider) -> AIProviderAccess?
     let supportsAppleLanguage: @MainActor @Sendable (String) async -> Bool
     let localWhisperState: @MainActor @Sendable () -> LocalWhisperState
 
@@ -110,11 +126,17 @@ struct TranscriptionProviderResolver {
             return TranscriptionProviderSelection(provider: provider, apiKey: nil, model: state.model)
 
         case .openai, .gemini:
-            let selectedKey = apiKey(provider)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !selectedKey.isEmpty else {
+            guard let access = providerAccess(provider) else {
                 throw TranscriptionProviderResolutionError.missingAPIKey(provider)
             }
-            return TranscriptionProviderSelection(provider: provider, apiKey: selectedKey, model: nil)
+            if let directKey = access.directAPIKey {
+                let selectedKey = directKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !selectedKey.isEmpty else {
+                    throw TranscriptionProviderResolutionError.missingAPIKey(provider)
+                }
+                return TranscriptionProviderSelection(provider: provider, apiKey: selectedKey, model: nil)
+            }
+            return TranscriptionProviderSelection(provider: provider, access: access, model: nil)
 
         case .claude, .minimax:
             throw TranscriptionProviderResolutionError.unsupportedProvider(provider, mode: mode)
@@ -122,12 +144,12 @@ struct TranscriptionProviderResolver {
     }
 
     static func live(
-        apiKey: @escaping @MainActor @Sendable (AIProvider) -> String? = {
-            KeychainManager.shared.readOnlyAPIKey(for: $0)
+        providerAccess: @escaping @MainActor @Sendable (AIProvider) -> AIProviderAccess? = {
+            AICredentialResolver.shared.access(for: $0)
         }
     ) -> TranscriptionProviderResolver {
         TranscriptionProviderResolver(
-            apiKey: apiKey,
+            providerAccess: providerAccess,
             supportsAppleLanguage: { language in
                 await AppleSpeechFactory.supportsLanguage(language)
             },

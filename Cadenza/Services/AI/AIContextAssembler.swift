@@ -653,19 +653,27 @@ actor AIContextAssembler {
         return "\(mins / 60)h \(mins % 60)min"
     }
 
-    /// Format context metadata for display: "Based on 5 recordings · Mar 13-20 · 3 speakers"
-    static func formatContextInfo(_ meta: ContextMetadata) -> String? {
+    /// Format context metadata for display: "Based on 5 recordings · Mar 13 – 20 · 3 speakers".
+    /// A nil locale follows the app's language and the user's region.
+    static func formatContextInfo(_ meta: ContextMetadata, locale: Locale? = nil) -> String? {
         guard meta.recordingCount > 0 else { return nil }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d"
-        var parts: [String] = ["Based on \(meta.recordingCount) recording\(meta.recordingCount == 1 ? "" : "s")"]
+        let recordings = LocalizedBundle.string(
+            meta.recordingCount == 1 ? "Based on %lld recording" : "Based on %lld recordings",
+            locale: locale
+        )
+        var parts: [String] = [String(format: recordings, Int64(meta.recordingCount))]
         if let range = meta.dateRange {
-            let start = formatter.string(from: range.start)
-            let end = formatter.string(from: range.end)
-            parts.append(start == end ? start : "\(start)–\(end)")
+            let formatter = DateIntervalFormatter()
+            formatter.locale = locale ?? .current
+            formatter.dateTemplate = "MMMd"
+            parts.append(formatter.string(from: range.start, to: max(range.start, range.end)))
         }
         if meta.speakerCount > 0 {
-            parts.append("\(meta.speakerCount) speaker\(meta.speakerCount == 1 ? "" : "s")")
+            let speakers = LocalizedBundle.string(
+                meta.speakerCount == 1 ? "%lld speaker" : "%lld speakers",
+                locale: locale
+            )
+            parts.append(String(format: speakers, Int64(meta.speakerCount)))
         }
         return parts.joined(separator: " · ")
     }

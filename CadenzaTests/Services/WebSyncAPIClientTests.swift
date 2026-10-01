@@ -92,6 +92,54 @@ struct WebSyncAPIClientTests {
         #expect(prefs.updatedAt == 1_780_000_000)
     }
 
+    @Test @MainActor
+    func speakerSyncUsesQueryForPullAndSnakeCaseForPush() async throws {
+        let http = FakeAuthHTTP()
+        let client = WebSyncAPIClient(auth: signedIn(http: http))
+        http.enqueue(.success(
+            data: Data(#"{"identity_enabled":true,"identity_generation":2,"voice_enabled":false,"voice_generation":1,"profiles":[],"samples":[],"cursor":5,"has_more":false}"#.utf8),
+            response: response(status: 200)
+        ))
+        http.enqueue(.success(
+            data: Data(#"{"applied_profiles":1,"applied_samples":0,"skipped_profile_ids":[],"skipped_samples":[]}"#.utf8),
+            response: response(status: 200)
+        ))
+        let profileID = UUID(uuidString: "7C0E0D3E-2F7B-4A57-9D51-3C1F9C3E2A10")!
+
+        let pulled = try await client.pullSpeakerChanges(since: 5, limit: 200, modelVersions: ["model v1"])
+        _ = try await client.pushSpeakerChanges(SpeakerSyncPushRequest(
+            identityGeneration: 2,
+            voiceGeneration: nil,
+            profiles: [SpeakerSyncProfile(
+                profileID: profileID, displayName: "Ada Example", aliases: [], notes: "",
+                teamOrOrg: nil, createdAt: 1_789_000_000, lastSeenAt: nil
+            )],
+            deletedProfileIDs: [],
+            samples: [],
+            deletedSamples: []
+        ))
+
+        let pullURL = try #require(http.requests[0].url)
+        let query = URLComponents(url: pullURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        #expect(pullURL.path.hasSuffix("/speakers/changes"))
+        #expect(query == [
+            URLQueryItem(name: "since", value: "5"),
+            URLQueryItem(name: "limit", value: "200"),
+            URLQueryItem(name: "model_version", value: "model v1"),
+        ])
+        #expect(pulled.identityGeneration == 2 && !pulled.voiceEnabled && pulled.cursor == 5)
+
+        #expect(http.requests[1].httpMethod == "POST")
+        let body = try #require(http.requests[1].httpBody)
+        let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(object["voice_generation"] == nil)
+        #expect(object["identity_generation"] as? Int == 2)
+        let profile = try #require((object["profiles"] as? [[String: Any]])?.first)
+        #expect(profile["profile_id"] as? String == "7c0e0d3e-2f7b-4a57-9d51-3c1f9c3e2a10")
+        #expect(profile["display_name"] as? String == "Ada Example")
+        #expect(profile["team_or_org"] is NSNull)
+    }
+
     private func response(status: Int) -> HTTPURLResponse {
         HTTPURLResponse(url: URL(string: "https://cadenzapp.test")!, statusCode: status, httpVersion: nil, headerFields: nil)!
     }

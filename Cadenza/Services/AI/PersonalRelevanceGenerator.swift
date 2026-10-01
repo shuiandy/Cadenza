@@ -3,7 +3,7 @@ import NaturalLanguage
 
 /// Optional personalization is independent from the canonical meeting summary.
 enum PersonalRelevanceGenerator {
-    static func generate(snapshot: SummaryContextSnapshot, provider: AIProvider, apiKey: String,
+    static func generate(snapshot: SummaryContextSnapshot, provider: AIProvider, access: AIProviderAccess,
                          model: String, language: String) async throws -> PersonalRelevance {
         // The local model keeps its compact summary path; do not add an oversized
         // multi-stage JSON pipeline or silently upload to a different provider.
@@ -12,7 +12,7 @@ enum PersonalRelevanceGenerator {
             return PersonalRelevance(summaryID: snapshot.summaryID, contextFingerprint: snapshot.fingerprint,
                 source: snapshot, relevant: relevant, suggestions: [], progress: [], createdAt: Date())
         }
-        guard let service = provider.makeChatService(apiKey: apiKey) else { throw AIServiceError.invalidResponse }
+        guard let service = provider.makeChatService(access: access) else { throw AIServiceError.invalidResponse }
         let data = try snapshot.providerData()
         guard data.count <= 100_000 else { throw AIServiceError.invalidResponse }
         let prompt = """

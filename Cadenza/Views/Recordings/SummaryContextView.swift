@@ -165,11 +165,11 @@ struct SummaryContextView: View {
         guard await saveInput(), let snapshot = await snapshot(), !Task.isCancelled else { return }
         let provider = AIProvider(rawValue: UserDefaults.standard.string(forKey: "defaultAIProvider") ?? "") ?? .apple
         let model = provider.summaryModel
-        guard let key = provider.requiresAPIKey ? KeychainManager.shared.apiKey(for: provider) : "" else {
+        guard let access = AICredentialResolver.shared.access(for: provider) else {
             error = AIServiceError.noAPIKey.localizedDescription; return
         }
         do {
-            let output = try await PersonalRelevanceGenerator.generate(snapshot: snapshot, provider: provider, apiKey: key,
+            let output = try await PersonalRelevanceGenerator.generate(snapshot: snapshot, provider: provider, access: access,
                 model: model, language: detail.summary?.language ?? "en")
             guard !Task.isCancelled, await self.snapshot()?.fingerprint == snapshot.fingerprint else { return }
             if await appState.store.savePersonalRelevance(recordingID: detail.id, result: output) { result = output }

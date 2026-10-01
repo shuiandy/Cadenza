@@ -1323,7 +1323,7 @@ struct RecordingOverlayView: View {
         return AIProvider.allCases.filter { provider in
             provider.requiresAPIKey
                 && provider.makeChatService(apiKey: "") != nil
-                && KeychainManager.shared.hasAPIKey(for: provider)
+                && AICredentialResolver.shared.hasUsableKey(for: provider)
         }
     }
 
@@ -1396,14 +1396,8 @@ struct RecordingOverlayView: View {
 
     private func resolveAIService() -> (AIServiceProtocol, String)? {
         guard appState.startupPolicy.allowsContentGeneration else { return nil }
-        let apiKey: String
-        if selectedProvider.requiresAPIKey {
-            guard let key = KeychainManager.shared.apiKey(for: selectedProvider), !key.isEmpty else { return nil }
-            apiKey = key
-        } else {
-            apiKey = ""
-        }
-        guard let service = selectedProvider.makeChatService(apiKey: apiKey) else { return nil }
+        guard let access = AICredentialResolver.shared.access(for: selectedProvider),
+              let service = selectedProvider.makeChatService(access: access) else { return nil }
         return (service, selectedModel)
     }
 

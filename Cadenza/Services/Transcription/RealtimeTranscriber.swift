@@ -33,7 +33,9 @@ struct OpenAIRealtimeTransport: Sendable {
 /// Real-time transcription using OpenAI Realtime API over WebSocket.
 /// Each manager attempt owns a fresh, single-use instance.
 actor RealtimeTranscriber: TranscriptionService {
-    private let apiKey: String
+    /// The bearer for the WebSocket: this Mac's key, or a client secret the
+    /// Cadenza server mints from the account's key for this one connection.
+    private let credential: @Sendable () async throws -> String
     private let model: String
     private let transportForTesting: OpenAIRealtimeTransport?
     private let startupTimeout: Duration
@@ -66,7 +68,31 @@ actor RealtimeTranscriber: TranscriptionService {
         startupTimeout: Duration = .seconds(10),
         commitPolicy: LiveCommitPolicy = LiveCommitPolicy()
     ) {
-        self.apiKey = apiKey
+        self.init(
+            access: .direct(.openai, apiKey: apiKey),
+            model: model,
+            transportForTesting: transportForTesting,
+            startupTimeout: startupTimeout,
+            commitPolicy: commitPolicy
+        )
+    }
+
+    init(
+        access: AIProviderAccess,
+        model: String,
+        transportForTesting: OpenAIRealtimeTransport? = nil,
+        startupTimeout: Duration = .seconds(10),
+        commitPolicy: LiveCommitPolicy = LiveCommitPolicy(),
+        mintCredential: (@Sendable (AIProviderAccess, String) async throws -> String)? = nil
+    ) {
+        if let apiKey = access.directAPIKey {
+            self.credential = { apiKey }
+        } else {
+            let mint = mintCredential ?? { access, model in
+                try await CadenzaRealtimeCredentials.mint(access: access, model: model)
+            }
+            self.credential = { try await mint(access, model) }
+        }
         self.model = model
         self.transportForTesting = transportForTesting
         self.startupTimeout = startupTimeout
@@ -128,7 +154,16 @@ actor RealtimeTranscriber: TranscriptionService {
         guard !hasStarted, !isStopping else { throw CancellationError() }
         hasStarted = true
         try Task.checkCancellation()
-        let connection = transportForTesting ?? OpenAIRealtimeTransport.connect(apiKey: apiKey)
+        let connection: OpenAIRealtimeTransport
+        if let transportForTesting {
+            connection = transportForTesting
+        } else {
+            let bearer = try await credential()
+            // Minting through Cadenza suspends; a stop in the meantime wins.
+            guard !isStopping else { throw CancellationError() }
+            try Task.checkCancellation()
+            connection = OpenAIRealtimeTransport.connect(apiKey: bearer)
+        }
         transport = connection
         lastCommitAt = Date()
         let pair = AsyncThrowingStream<TranscriptDelta, Error>.makeStream()
@@ -159,6 +194,13 @@ actor RealtimeTranscriber: TranscriptionService {
             throw error
         }
     }
+
+#if DEBUG
+    /// The bearer the next connection would use.
+    func _testBearer() async throws -> String {
+        try await credential()
+    }
+#endif
 
     func sendAudio(_ data: Data) async throws {
         guard let connection = transport, sessionReady, !isStopping else { return }

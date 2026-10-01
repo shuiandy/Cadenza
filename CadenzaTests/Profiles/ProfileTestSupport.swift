@@ -110,6 +110,10 @@ final class InstrumentedFileOperations: FileOperations, Sendable {
 
     var recorded: Record { record.withLock { $0 } }
 
+    /// Journal writes seen so far when `failJournalWriteAtCount` is set,
+    /// the injected one included.
+    var journalWritesAttempted: Int { journalWriteCount.withLock { $0 } }
+
     private func note(_ url: URL) {
         record.withLock { $0.touchedPaths.append(url.path) }
     }
@@ -428,40 +432,78 @@ func makeTestPendingTransfer(
     )
 }
 
-struct SQLiteWriteLockWaitFailure: Error, CustomStringConvertible {
+struct SQLiteConnectionCloseWaitFailure: Error, CustomStringConvertible {
     let path: String
     let reason: String
     var description: String { "\(reason): \(path)" }
 }
 
-/// Waits until no connection holds the write lock on a store a test just
-/// populated through a `ModelContainer`. SwiftData closes its SQLite
-/// connection when the container deallocates, which can lag the last
-/// `save()` on a loaded machine; a boot that follows immediately would
-/// then find the source busy and fail closed, a fixture race rather than
-/// a migration defect.
-func waitForSQLiteWriteLockRelease(at url: URL, timeout: TimeInterval = 5) throws {
+/// Waits until this process holds no descriptor on a store a test just
+/// populated through a `ModelContainer`, or on its sidecars. SwiftData
+/// closes the container's SQLite connection on a background thread some
+/// time after the container deallocates, and as the last connection that
+/// close checkpoints the WAL under an exclusive lock. A write lock that is
+/// free at one instant says nothing about a connection that has not begun
+/// closing yet: on a loaded runner the connection outlived such a probe,
+/// then held the source locked across both the boot that followed and its
+/// retry, which failed closed as busy. That is a fixture race rather than
+/// a migration defect. SQLite closes the database file last, so no open
+/// descriptor means the close, checkpoint included, is over. While the
+/// process still holds locks on the file SQLite defers closing a closed
+/// connection's descriptors, so callers close their own connections first.
+func waitForSQLiteConnectionsToClose(at url: URL, timeout: TimeInterval = 5) throws {
+    // The kernel reports descriptor paths canonically (`/private/var/...`).
+    let base = sqliteNoFollowPath(for: url)
+    let storeFiles = Set(["", "-wal", "-shm", "-journal"].map { base + $0 })
     let deadline = Date().addingTimeInterval(timeout)
-    repeat {
-        var db: OpaquePointer?
-        defer { sqlite3_close(db) }
-        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
-            throw SQLiteWriteLockWaitFailure(path: url.path, reason: "open failed")
-        }
-        sqlite3_busy_timeout(db, 50)
-        let begin = sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil)
-        if begin == SQLITE_OK {
-            _ = sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
-            return
-        }
-        guard begin == SQLITE_BUSY || begin == SQLITE_LOCKED else {
-            throw SQLiteWriteLockWaitFailure(
-                path: url.path, reason: String(cString: sqlite3_errmsg(db))
+    while true {
+        let stillOpen = try openDescriptorPaths().filter(storeFiles.contains)
+        if stillOpen.isEmpty { return }
+        guard Date() < deadline else {
+            throw SQLiteConnectionCloseWaitFailure(
+                path: url.path,
+                reason: "still open after \(timeout)s: \(stillOpen.sorted())"
             )
         }
-        Thread.sleep(forTimeInterval: 0.02)
-    } while Date() < deadline
-    throw SQLiteWriteLockWaitFailure(
-        path: url.path, reason: "write lock still held after \(timeout)s"
-    )
+        Thread.sleep(forTimeInterval: 0.002)
+    }
+}
+
+/// Paths of the files this process has open right now. The listing grows
+/// until it fits: parallel suites open descriptors between the size query
+/// and the fill, and a truncated listing could hide the one being awaited.
+private func openDescriptorPaths() throws -> [String] {
+    let pid = getpid()
+    let stride = MemoryLayout<proc_fdinfo>.stride
+    let needed = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+    guard needed > 0 else {
+        throw SQLiteConnectionCloseWaitFailure(path: "pid \(pid)", reason: "fd listing failed")
+    }
+    var capacity = Int(needed) / stride + 64
+    while true {
+        var descriptors = [proc_fdinfo](repeating: proc_fdinfo(), count: capacity)
+        let filled = descriptors.withUnsafeMutableBytes { buffer in
+            proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer.baseAddress, Int32(buffer.count))
+        }
+        guard filled > 0 else {
+            throw SQLiteConnectionCloseWaitFailure(path: "pid \(pid)", reason: "fd listing failed")
+        }
+        let count = Int(filled) / stride
+        guard count < capacity else {
+            capacity *= 2
+            continue
+        }
+        return descriptors.prefix(count).compactMap { descriptor in
+            guard descriptor.proc_fdtype == UInt32(PROX_FDTYPE_VNODE) else { return nil }
+            var info = vnode_fdinfowithpath()
+            let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+            // A descriptor closed since the listing simply drops out.
+            guard proc_pidfdinfo(
+                pid, descriptor.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size
+            ) == size else { return nil }
+            return withUnsafeBytes(of: &info.pvip.vip_path) { raw in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
+        }
+    }
 }

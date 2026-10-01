@@ -19,54 +19,64 @@ struct AIChatModelListService: Sendable {
     }
 
     func fetchPresets(for provider: AIProvider, apiKey: String) async throws -> [AIChatModelPreset] {
+        try await fetchPresets(for: provider, access: .direct(provider, apiKey: apiKey))
+    }
+
+    /// The provider's chat models, listed with the device's key or through
+    /// the Cadenza account's vault key.
+    func fetchPresets(for provider: AIProvider, access: AIProviderAccess) async throws -> [AIChatModelPreset] {
+        let access = AIProviderAccess(provider: provider, route: access.route)
         switch provider {
         case .openai:
-            try await fetchOpenAIModels(apiKey: apiKey)
+            return try await fetchOpenAIModels(access: access)
         case .claude:
-            try await fetchClaudeModels(apiKey: apiKey)
+            return try await fetchClaudeModels(access: access)
         case .gemini:
-            try await fetchGeminiModels(apiKey: apiKey)
+            return try await fetchGeminiModels(access: access)
         case .minimax:
-            try await fetchMiniMaxModels(apiKey: apiKey)
+            return try await fetchMiniMaxModels(access: access)
         case .apple, .whisperLocal:
-            AIChatModelCatalog.fallbackPresets(for: provider)
+            return AIChatModelCatalog.fallbackPresets(for: provider)
         }
     }
 
+    /// Checks a key the user typed on this device against the provider. Keys
+    /// stored in a Cadenza account are checked by the server instead.
     func validateCredential(for provider: AIProvider, apiKey: String) async throws {
-        guard var request = try Self.modelListRequest(for: provider, apiKey: apiKey) else {
+        let access = AIProviderAccess.direct(provider, apiKey: apiKey)
+        guard var request = try Self.modelListRequest(access: access) else {
             return
         }
         request.timeoutInterval = 10
-        _ = try await validatedData(for: request, provider: provider, apiKey: apiKey)
+        _ = try await validatedData(for: request, access: access)
     }
 
     // MARK: - Provider Fetching
 
-    private func fetchOpenAIModels(apiKey: String) async throws -> [AIChatModelPreset] {
-        let request = try Self.requiredModelListRequest(for: .openai, apiKey: apiKey)
+    private func fetchOpenAIModels(access: AIProviderAccess) async throws -> [AIChatModelPreset] {
+        let request = try Self.requiredModelListRequest(access: access)
 
-        let data = try await validatedData(for: request, provider: .openai, apiKey: apiKey)
+        let data = try await validatedData(for: request, access: access)
         let response = try JSONDecoder().decode(OpenAIModelsResponse.self, from: data)
         let modelIDs = try Self.validatedModelIDs(response.data.map(\.id))
             .filter(Self.isOpenAIChatModel)
         return AIChatModelCatalog.modelPresets(modelIDs)
     }
 
-    private func fetchClaudeModels(apiKey: String) async throws -> [AIChatModelPreset] {
-        let request = try Self.requiredModelListRequest(for: .claude, apiKey: apiKey)
+    private func fetchClaudeModels(access: AIProviderAccess) async throws -> [AIChatModelPreset] {
+        let request = try Self.requiredModelListRequest(access: access)
 
-        let data = try await validatedData(for: request, provider: .claude, apiKey: apiKey)
+        let data = try await validatedData(for: request, access: access)
         let response = try JSONDecoder().decode(ClaudeModelsResponse.self, from: data)
         let modelIDs = try Self.validatedModelIDs(response.data.map(\.id))
             .filter { $0.lowercased().hasPrefix("claude-") }
         return AIChatModelCatalog.modelPresets(modelIDs)
     }
 
-    private func fetchGeminiModels(apiKey: String) async throws -> [AIChatModelPreset] {
-        let request = try Self.requiredModelListRequest(for: .gemini, apiKey: apiKey)
+    private func fetchGeminiModels(access: AIProviderAccess) async throws -> [AIChatModelPreset] {
+        let request = try Self.requiredModelListRequest(access: access)
 
-        let data = try await validatedData(for: request, provider: .gemini, apiKey: apiKey)
+        let data = try await validatedData(for: request, access: access)
         let response = try JSONDecoder().decode(GeminiModelsResponse.self, from: data)
         guard response.models.count <= Self.maximumModelCount else {
             throw AITransportError.modelListItemLimitExceeded
@@ -80,10 +90,10 @@ struct AIChatModelListService: Sendable {
         return AIChatModelCatalog.modelPresets(modelIDs)
     }
 
-    private func fetchMiniMaxModels(apiKey: String) async throws -> [AIChatModelPreset] {
-        let request = try Self.requiredModelListRequest(for: .minimax, apiKey: apiKey)
+    private func fetchMiniMaxModels(access: AIProviderAccess) async throws -> [AIChatModelPreset] {
+        let request = try Self.requiredModelListRequest(access: access)
 
-        let data = try await validatedData(for: request, provider: .minimax, apiKey: apiKey)
+        let data = try await validatedData(for: request, access: access)
         let response = try JSONDecoder().decode(OpenAIModelsResponse.self, from: data)
         let modelIDs = try Self.validatedModelIDs(response.data.map(\.id))
             .filter { $0.lowercased().hasPrefix("minimax-") }
@@ -92,14 +102,15 @@ struct AIChatModelListService: Sendable {
 
     private func validatedData(
         for request: URLRequest,
-        provider: AIProvider,
-        apiKey: String
+        access: AIProviderAccess
     ) async throws -> Data {
+        let provider = access.provider
         if let transport {
             return try await transport.data(
                 for: request,
                 provider: provider,
-                redacting: [apiKey]
+                redacting: access.secrets,
+                viaCadenza: access.viaCadenza
             )
         }
 
@@ -113,66 +124,46 @@ struct AIChatModelListService: Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw AITransportError.invalidHTTPResponse
         }
+        let pinned: AIProvider? = access.viaCadenza ? nil : provider
         guard let requestURL = request.url,
               let responseURL = http.url,
-              try AIEndpointPolicy.validate(requestURL, provider: provider)
-                == AIEndpointPolicy.validate(responseURL, provider: provider) else {
+              try AIEndpointPolicy.validate(requestURL, provider: pinned)
+                == AIEndpointPolicy.validate(responseURL, provider: pinned) else {
             throw AITransportError.responseOriginMismatch
         }
         guard (200..<300).contains(http.statusCode) else {
             let bounded = data.prefix(AITransportLimits.modelList.maxErrorResponseBytes)
             var errorText = String(decoding: bounded, as: UTF8.self)
-            if !apiKey.isEmpty {
-                errorText = errorText.replacingOccurrences(of: apiKey, with: "[REDACTED]")
+            for secret in access.secrets where !secret.isEmpty {
+                errorText = errorText.replacingOccurrences(of: secret, with: "[REDACTED]")
             }
             throw AIServiceError.httpError(http.statusCode, errorText)
         }
         return data
     }
 
-    private static func requiredModelListRequest(
-        for provider: AIProvider,
-        apiKey: String
-    ) throws -> URLRequest {
-        guard let request = try modelListRequest(for: provider, apiKey: apiKey) else {
+    private static func requiredModelListRequest(access: AIProviderAccess) throws -> URLRequest {
+        guard let request = try modelListRequest(access: access) else {
             throw AITransportError.unsafeEndpoint
         }
         return request
     }
 
-    private static func modelListRequest(
-        for provider: AIProvider,
-        apiKey: String
-    ) throws -> URLRequest? {
-        let endpoint: String
-        switch provider {
-        case .openai:
-            endpoint = "https://api.openai.com/v1/models"
-        case .claude:
-            endpoint = "https://api.anthropic.com/v1/models"
+    private static func modelListRequest(access: AIProviderAccess) throws -> URLRequest? {
+        let path: String
+        switch access.provider {
+        case .openai, .claude, .minimax:
+            path = "/v1/models"
         case .gemini:
-            endpoint = "https://generativelanguage.googleapis.com/v1beta/models"
-        case .minimax:
-            endpoint = "https://api.minimax.io/v1/models"
+            path = "/v1beta/models"
         case .apple, .whisperLocal:
             return nil
         }
-
-        guard let url = URL(string: endpoint) else {
-            throw AITransportError.unsafeEndpoint
-        }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: try access.url(path: path))
         request.httpMethod = "GET"
-        switch provider {
-        case .openai, .minimax:
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        case .claude:
-            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        access.authorize(&request)
+        if access.provider == .claude {
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        case .gemini:
-            request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        case .apple, .whisperLocal:
-            break
         }
         return request
     }

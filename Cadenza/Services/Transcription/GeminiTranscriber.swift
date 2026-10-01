@@ -29,16 +29,24 @@ final class GeminiTranscriber: @unchecked Sendable {
     var onProgress: (@Sendable (Int, Int) -> Void)?
 
     init(
-        apiKey: String,
+        access: AIProviderAccess,
         model: String,
         transport: HardenedAITransport = .transcription
     ) {
         self.model = model
         self.apiClient = GeminiTranscriptionAPIClient(
-            apiKey: apiKey,
+            access: access,
             model: model,
             transport: transport
         )
+    }
+
+    convenience init(
+        apiKey: String,
+        model: String,
+        transport: HardenedAITransport = .transcription
+    ) {
+        self.init(access: .direct(.gemini, apiKey: apiKey), model: model, transport: transport)
     }
 
     /// gemini-3.5-transcribe and friends speak the Interactions API and return

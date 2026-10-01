@@ -199,6 +199,21 @@ final class MeetingDetector {
     @ObservationIgnored var currentCalendarMeeting: MeetingEventDTO?
     @ObservationIgnored private var activeSessionCalendarMeeting: MeetingEventDTO?
 
+    /// Calendar occurrence whose call the meeting app itself reported as ended
+    /// (`MeetingEndingReason.isAppOwnedCallEnd`). The detection context runs
+    /// 30 min past the scheduled end, so without this the finished event keeps
+    /// its +2 and any stray window or mic use can restart recording.
+    @ObservationIgnored private var concludedCalendarOccurrence: CalendarOccurrence?
+    /// Set when the current session entered `.ending` on an app-owned call end;
+    /// cleared if the session recovers. Read when the session reaches idle.
+    @ObservationIgnored private var sessionEndedByApp = false
+
+    /// Armed when the user stops a recording by hand while a session is
+    /// detected. Auto-start stays off until that session's evidence is gone, so
+    /// the same signals cannot override the stop (RecordingEngine's 10 s
+    /// cooldown only delays such a restart).
+    @ObservationIgnored private var userStopHold: UserStopHold?
+
     // MARK: - Types
 
     struct DetectedMeetingApp: Identifiable, Sendable {
@@ -206,6 +221,36 @@ final class MeetingDetector {
         let app: MeetingApp
         let name: String
         let pid: pid_t
+    }
+
+    /// Recurring occurrences share an event id, so the start date is part of
+    /// the identity.
+    private struct CalendarOccurrence: Equatable {
+        let id: String
+        let startDate: Date
+
+        init(_ meeting: MeetingEventDTO) {
+            id = meeting.id
+            startDate = meeting.startDate
+        }
+    }
+
+    private struct UserStopHold {
+        enum Release: String {
+            /// Teams' call assertion was live: wait for its explicit release.
+            case teamsCallEnds
+            /// The app's own mic input was live: wait for the app to release it.
+            case processMicReleased
+            /// No app-owned call evidence: wait for the score to fall below
+            /// the threshold.
+            case signalsClear
+        }
+
+        let app: MeetingApp
+        let release: Release
+        /// The session's calendar event, retired if the app later reports the
+        /// call over (the session itself was reset by the stop).
+        let calendarOccurrence: CalendarOccurrence?
     }
 
     // MARK: - Init
@@ -347,6 +392,9 @@ final class MeetingDetector {
         teamsAdHocStartCandidateSince = nil
         teamsAdHocStartSuppressedUntilSignalsClear = false
         activeSessionCalendarMeeting = nil
+        concludedCalendarOccurrence = nil
+        sessionEndedByApp = false
+        userStopHold = nil
         lastWindowDumpAt = nil
     }
 
@@ -584,20 +632,34 @@ final class MeetingDetector {
         systemMicActive = checkMicrophoneActivity()
 #endif
 
+        let teamsHelperOutputActive = isTeamsHelperOutputActive(usage: audioUsage)
+        // Before a session exists, a Teams window may only help start one while
+        // Teams itself shows call activity. Window titles alone cannot separate
+        // a call from Search, a pinned app or anything else an automation
+        // opens. Helper input is included because a silent opening has neither
+        // the assertion nor output (2026-08-13); on Teams builds where that
+        // input sticks after a call, this degrades to title checks alone.
+        let teamsCallActivityPresent = teamsCallAssertionState == .active
+            || teamsHelperOutputActive
+            || isTeamsAudioHelperInputActive(meetingApp: .teams, usage: audioUsage)
+        let teamsWindowsNeedCallActivity = (sessionState.isIdle || sessionState.isDetected)
+            && !teamsCallActivityPresent
+        let windowEvidence = meetingWindowEvidence(
+            windows: windows,
+            teamsWindowsNeedCallActivity: teamsWindowsNeedCallActivity
+        )
+
         let signals = MeetingSignals(
             meetingAppRunning: !runningMeetingApps.isEmpty,
             meetingApp: activeMeetingApp,
             processUsingMicInput: allAudioBundleIDs.contains { audioUsage[$0]?.isRunningInput == true },
             systemMicActive: systemMicActive,
             calendarMatch: hasCalendarMatch(),
-            hasMeetingWindow: hasAnyMeetingWindow(windows: windows)
+            hasMeetingWindow: windowEvidence.hasMeetingWindow
         )
         let now = Date()
         let continuityAudioActive = isContinuityAudioActive(usage: audioUsage)
         let teamsStartupAudioActive = isTeamsStartupAudioActive(usage: audioUsage)
-        // Diagnostic-only: logged alongside the input signals to validate the
-        // call-end discriminator. Does NOT participate in scoring yet.
-        let teamsHelperOutputActive = isTeamsHelperOutputActive(usage: audioUsage)
         let screenCaptureAvailable = screenCaptureAccessAvailable()
         let screenPermissionFallbackActive = shouldUseScreenPermissionFallback(
             signals: signals,
@@ -771,8 +833,16 @@ final class MeetingDetector {
             score = effectiveRawScore
         }
 
+        // Evaluated after every start fallback has floored the score: a user
+        // stop outranks all of them.
+        let userStopHoldActive = isUserStopHoldActive(
+            score: score,
+            teamsCallAssertionState: teamsCallAssertionState,
+            audioUsage: audioUsage
+        )
+
         writeMeetingDiagnostic(
-            "eval state=\(stateLabel(sessionState)) activeApp=\(activeMeetingApp?.rawValue ?? "nil") running=\(runningMeetingApps.map(\.id).joined(separator: ",")) score=\(score) raw=\(rawScore) thr=\(scoreThreshold) pmic=\(signals.processUsingMicInput ? 1 : 0) ever=\(perProcessMicEverDetected ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) toutExp=\(teamsHelperOutputKeepAliveExpired ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) screen=\(screenCaptureAvailable ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) windows=\(diagnosticWindowSummary(windows))"
+            "eval state=\(stateLabel(sessionState)) activeApp=\(activeMeetingApp?.rawValue ?? "nil") running=\(runningMeetingApps.map(\.id).joined(separator: ",")) score=\(score) raw=\(rawScore) thr=\(scoreThreshold) pmic=\(signals.processUsingMicInput ? 1 : 0) ever=\(perProcessMicEverDetected ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) toutExp=\(teamsHelperOutputKeepAliveExpired ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) calDone=\(isConcludedCalendarMeeting(currentCalendarMeeting) ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) twinHeld=\(windowEvidence.heldTeamsWindow ? 1 : 0) stopHold=\(userStopHoldActive ? 1 : 0) screen=\(screenCaptureAvailable ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) windows=\(diagnosticWindowSummary(windows))"
         )
 
         let previousState = sessionState
@@ -780,7 +850,12 @@ final class MeetingDetector {
         // bringing another meeting app to the foreground cannot transfer the
         // recording (or its app-specific end signals) to that app.
         let transitionApp = sessionState.currentApp ?? activeMeetingApp
-        let newState = sessionState.next(score: score, app: transitionApp, now: now, threshold: scoreThreshold)
+        let newState: MeetingSessionState
+        if userStopHoldActive && (sessionState.isIdle || sessionState.isDetected) {
+            newState = .idle
+        } else {
+            newState = sessionState.next(score: score, app: transitionApp, now: now, threshold: scoreThreshold)
+        }
 
         // Preserve an assertion observed on the exact idle → detected tick.
         // If Teams hangs up during the debounce window, the following explicit
@@ -1042,6 +1117,7 @@ final class MeetingDetector {
            let activeSessionCalendarMeeting {
             return activeSessionCalendarMeeting
         }
+        guard !isConcludedCalendarMeeting(currentCalendarMeeting) else { return nil }
         return currentCalendarMeeting
     }
 
@@ -1050,9 +1126,42 @@ final class MeetingDetector {
         if let currentCalendarMeeting,
            !currentCalendarMeeting.isAllDay,
            currentCalendarMeeting.isWithinDetectionContext(),
+           !isConcludedCalendarMeeting(currentCalendarMeeting),
            calendarMeeting(currentCalendarMeeting, matches: app) {
             activeSessionCalendarMeeting = currentCalendarMeeting
         }
+    }
+
+    private func isConcludedCalendarMeeting(_ meeting: MeetingEventDTO?) -> Bool {
+        guard let meeting, let concludedCalendarOccurrence else { return false }
+        return CalendarOccurrence(meeting) == concludedCalendarOccurrence
+    }
+
+    /// The event feeding the current session's calendar signal. Must be read
+    /// before `activeSessionCalendarMeeting` clears; an event that names a
+    /// different app does not belong to the session.
+    private func sessionCalendarOccurrence(app: MeetingApp?) -> CalendarOccurrence? {
+        guard let meeting = activeSessionCalendarMeeting ?? currentCalendarMeeting,
+              !meeting.isAllDay,
+              meeting.isWithinDetectionContext() else { return nil }
+        if let named = meeting.meetingApp.flatMap(MeetingApp.init(rawValue:)), named != app {
+            return nil
+        }
+        return CalendarOccurrence(meeting)
+    }
+
+    /// Retires the session's event after the meeting app reported the call
+    /// over. A rejoin is then detected like an unscheduled call.
+    private func concludeSessionCalendarMeeting(app: MeetingApp?) {
+        concludeCalendarOccurrence(sessionCalendarOccurrence(app: app), app: app)
+    }
+
+    private func concludeCalendarOccurrence(_ occurrence: CalendarOccurrence?, app: MeetingApp?) {
+        guard let occurrence else { return }
+        concludedCalendarOccurrence = occurrence
+        writeMeetingDiagnostic(
+            "calendarConcluded app=\(app?.rawValue ?? "nil") start=\(ISO8601DateFormatter().string(from: occurrence.startDate))"
+        )
     }
 
     private func calendarMeeting(_ meeting: MeetingEventDTO, matches app: MeetingApp) -> Bool {
@@ -1085,21 +1194,35 @@ final class MeetingDetector {
         return now.timeIntervalSince(lastActivatedMeetingAppAt) <= Self.recentMeetingAppActivationInterval
     }
 
-    /// Check if any running meeting app has windows consistent with an active call.
-    private func hasAnyMeetingWindow(windows: [CGWindowEnumerator.EnumeratedWindow]) -> Bool {
+    private struct WindowEvidence {
+        let hasMeetingWindow: Bool
+        /// A Teams window looked like a call but was not counted because Teams
+        /// showed no call activity (diagnostics only).
+        let heldTeamsWindow: Bool
+    }
+
+    /// Whether any running meeting app has windows consistent with an active call.
+    private func meetingWindowEvidence(
+        windows: [CGWindowEnumerator.EnumeratedWindow],
+        teamsWindowsNeedCallActivity: Bool
+    ) -> WindowEvidence {
+        var heldTeamsWindow = false
         for detectedApp in runningMeetingApps {
             let snapshots = windows
                 .filter { $0.pid == detectedApp.pid }
                 .map(\.snapshot)
-            if MeetingWindowAnalyzer.hasMeetingWindow(
+            guard MeetingWindowAnalyzer.hasMeetingWindow(
                 app: detectedApp.app,
                 snapshots: snapshots,
                 calendarTitle: calendarMeetingForDetection()?.title
-            ) {
-                return true
+            ) else { continue }
+            if detectedApp.app == .teams && teamsWindowsNeedCallActivity {
+                heldTeamsWindow = true
+                continue
             }
+            return WindowEvidence(hasMeetingWindow: true, heldTeamsWindow: heldTeamsWindow)
         }
-        return false
+        return WindowEvidence(hasMeetingWindow: false, heldTeamsWindow: heldTeamsWindow)
     }
 
     /// Teams can hide or retitle its call windows while screen sharing. Once a
@@ -1195,6 +1318,7 @@ final class MeetingDetector {
             // ending→active recovery below intentionally preserves the original
             // stamp so a flapping signal cannot keep re-arming the hold.)
             activeSince = Date()
+            sessionEndedByApp = false
             captureCalendarMeetingForActiveSession(app: current.currentApp)
             updateActiveMeetingApp()
             log.notice("meeting STARTED (app=\(self.activeMeetingApp?.displayName ?? "unknown", privacy: .public))")
@@ -1204,6 +1328,7 @@ final class MeetingDetector {
             // existing activeSince (same session). Guard against a nil stamp from
             // an externally-injected state.
             if activeSince == nil { activeSince = Date() }
+            sessionEndedByApp = false
             captureCalendarMeetingForActiveSession(app: current.currentApp)
             log.notice("meeting RECOVERED reason=\(activityReason.rawValue, privacy: .public)")
             onMeetingRecovered?(activityReason)
@@ -1211,12 +1336,17 @@ final class MeetingDetector {
 
         // active → ending: meeting signals dropped, start countdown immediately
         if previous.isActive && current.isEnding {
+            sessionEndedByApp = endingEvent.reason.isAppOwnedCallEnd
             log.notice("meeting ENDING reason=\(endingEvent.reason.rawValue, privacy: .public) (grace period started)")
             onMeetingEnding?(endingEvent)
         }
 
         // active/ending → idle: meeting ended
         if (previous.isActive || previous.isEnding) && current.isIdle {
+            if sessionEndedByApp || endingEvent.reason.isAppOwnedCallEnd {
+                concludeSessionCalendarMeeting(app: previous.currentApp)
+            }
+            sessionEndedByApp = false
             perProcessMicEverDetected = false
             teamsCallAssertionEverDetected = false
             teamsUncorroboratedKeepAliveSince = nil
@@ -1305,6 +1435,73 @@ final class MeetingDetector {
         // (resetNotificationState intentionally SETS this flag; the two resets
         // have different post-conditions by design.)
         teamsAdHocStartSuppressedUntilSignalsClear = false
+        concludedCalendarOccurrence = nil
+        sessionEndedByApp = false
+        userStopHold = nil
+    }
+
+    /// Called when the user stops a recording by hand. While a session is
+    /// detected, auto-start stays off until that session's own evidence is
+    /// gone (see `UserStopHold.Release`). A no-op when nothing is detected, so
+    /// stopping an unrelated manual recording never delays the next meeting.
+    /// Must run before the stop reaches `resetNotificationState`.
+    func holdAutoStartAfterUserStop() {
+        guard !sessionState.isIdle, let app = sessionState.currentApp else { return }
+        let release: UserStopHold.Release
+        if app == .teams, currentTeamsCallAssertionState() == .active {
+            release = .teamsCallEnds
+        } else if perProcessMicEverDetected {
+            release = .processMicReleased
+        } else {
+            release = .signalsClear
+        }
+        userStopHold = UserStopHold(
+            app: app,
+            release: release,
+            calendarOccurrence: sessionCalendarOccurrence(app: app)
+        )
+        writeMeetingDiagnostic("userStopHold armed app=\(app.rawValue) release=\(release.rawValue)")
+    }
+
+    /// Whether the user-stop hold still blocks auto-start. Releases it once the
+    /// evidence it waits on is gone, or once the session's app has quit.
+    private func isUserStopHoldActive(
+        score: Int,
+        teamsCallAssertionState: TeamsCallAssertionState,
+        audioUsage: [String: AudioProcessUsage]
+    ) -> Bool {
+        guard let hold = userStopHold else { return false }
+        let released: Bool
+        // The app itself said the call ended, which retires the event exactly
+        // as an app-owned end of a recorded session does.
+        var endedByApp = false
+        if !runningMeetingApps.contains(where: { $0.app == hold.app }) {
+            released = true
+        } else {
+            switch hold.release {
+            case .teamsCallEnds:
+                // Only an explicit release ends the call. If the query stops
+                // answering, fall back to the signals clearing rather than
+                // holding forever.
+                endedByApp = teamsCallAssertionState == .inactive
+                released = endedByApp
+                    || (teamsCallAssertionState == .unavailable && score < scoreThreshold)
+            case .processMicReleased:
+                endedByApp = !hold.app.audioBundleIdentifiers.contains { audioUsage[$0]?.isRunningInput == true }
+                released = endedByApp
+            case .signalsClear:
+                released = score < scoreThreshold
+            }
+        }
+        guard released else { return true }
+        userStopHold = nil
+        if endedByApp {
+            concludeCalendarOccurrence(hold.calendarOccurrence, app: hold.app)
+        }
+        writeMeetingDiagnostic(
+            "userStopHold released app=\(hold.app.rawValue) release=\(hold.release.rawValue) score=\(score)"
+        )
+        return false
     }
 
     /// Reset so detection can re-trigger. Used after stopping recording to allow
@@ -1322,6 +1519,12 @@ final class MeetingDetector {
         teamsAdHocStartSuppressedUntilSignalsClear = true
         if !sessionState.isIdle {
             let wasFastPoll = sessionState.isActive || sessionState.isEnding
+            // An auto-stop can land while the detector is still in its grace
+            // period, so the idle transition that concludes the event never runs.
+            if sessionState.isEnding && sessionEndedByApp {
+                concludeSessionCalendarMeeting(app: sessionState.currentApp)
+            }
+            sessionEndedByApp = false
             cancelGraceTimer()
             cancelDetectedConfirmation()
             resetTeamsAdHocStartCandidate()

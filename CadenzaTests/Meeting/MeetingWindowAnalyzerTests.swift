@@ -241,6 +241,19 @@ struct MeetingWindowAnalyzerTests {
         #expect(!MeetingWindowAnalyzer.hasMeetingWindow(app: .teams, snapshots: windows))
     }
 
+    /// 2026-10-01: an automation browsing Teams opened Search, whose
+    /// "Search | Microsoft Teams" title passed the structural check and started
+    /// a recording with no call in progress.
+    @Test(arguments: ["Search", "People", "Copilot", "Communities", "Notifications", "Settings"])
+    func teams_mainAppPage_isNotMeetingByStructure(page: String) {
+        let windows = [
+            snapshot(title: "\(page) | Microsoft Teams", width: 1811, height: 1082),
+            snapshot(title: "\(page) | Acme | person@example.com | Microsoft Teams", width: 1811, height: 1082)
+        ]
+
+        #expect(!MeetingWindowAnalyzer.hasMeetingWindow(app: .teams, snapshots: windows))
+    }
+
     /// A small (sub-threshold) window with a non-tab title must not trigger via
     /// the structural path — guards against tooltips / transient popovers that
     /// happen to carry an unusual title.

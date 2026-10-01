@@ -376,7 +376,7 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 - writer / mixer / engine 都有 `forceReset()`
 - merge 失败保留 segments 目录
 - stop continuation 只在 finalize / post-process kick-off 边界之后 resume
-- 录音停止后有 10 秒 meeting detection cooldown，防止立即重触发
+- 录音停止后有 10 秒 meeting detection cooldown。它只把重触发推迟到 cooldown 结束（期间的 activity 存入 `pendingMeetingAutoStart` 稍后重试），不能阻止同一组信号再次开录；用户手动停止由 `MeetingDetector` 的 user-stop hold 负责，见 §12.1
 - **Back-to-back 会议**：`handleMeetingActivity` 先检查 `isStopping`（存入 `pendingMeetingAutoStart`），再检查 cooldown。这保证 finalization 期间检测到的新会议不会被 cooldown 吞掉，finalization 完成后自动重新评估。上一段录音的转录/摘要仍在跑**不推迟**新录音（见 §6.4 非对称调度）
 - `MeetingDetector.resetNotificationState()` 执行完整 cleanup（cancelGraceTimer + 恢复慢速轮询），与 `handleStateTransition` 的 ending→idle 路径一致
 
@@ -704,6 +704,24 @@ OpenAI 实时连接会被服务端中途关闭：直接 TCP FIN、没有 WebSock
 `runSpeakerMemoryIfNeeded` → `SpeakerKitEmbeddingExtractor.extractEmbeddings` 再调用
 `SpeakerDiarizer.diarize`；首次分析的 `windowEmbeddings` 尚未传给该路径复用。
 因此“单次只跑一个分析”不等于“同一录音只分析一次”，见 §14.4。
+
+#### 跨设备说话人同步 `SpeakerProfileSync`
+
+协议定稿在 cadenzapp-web `docs/specs/2026-09-29-speaker-profile-sync.md`。要点：
+
+- 服务端密封存储 speaker profile 与 voice sample（`SealForVault("speakers")`），从不计算或比较向量。
+  向量只在产生它的模型里有意义，所以每个 sample 带 `modelVersion`，Mac 只拉取、只匹配
+  `SpeakerKitEmbeddingExtractor.currentModelVersion` 的样本；Windows 用自己的模型从已标注录音重算。
+- 三道开关：profile 跟服务端 `speaker_identity_enabled`（与 payload 里的 `speaker_mappings` 同一开关）；
+  sample 还要服务端 `voice_profiles_enabled` 和本机 speaker memory consent。服务端关开关即 purge 并 bump generation，
+  客户端看到 generation 变化就丢弃 ledger、从 0 重拉并全量重推。
+- `WebSyncCoordinator.run` 结束时调用，仅当上次已知 prefs 的 identity 为开时才发请求，节流 5 分钟；
+  后端 404 视为未部署，退避 6 小时。测试构造的 coordinator 默认不启用（`syncsSpeakerProfiles: false`）。
+- 冲突规则由 `SpeakerProfileSyncPlanner` 决定：ledger 记录每条记录最后推送或应用时的指纹；
+  本地指纹与 ledger 不同说明有未推送的修改，此时本地胜出；profile 墓碑总是胜出（有人删了这个人）。
+  Store 落地时再次核对指纹（`applySpeakerSyncChanges`），网络往返期间的本地编辑不会被覆盖。
+- Mac 没有删除 profile 的界面，所以本地缺失从不被当作删除推上去：ledger 里有、本地没有的 profile
+  （从旧备份恢复）会被遗忘并从 0 重拉，把它找回来。sample 的删除按差集推送，只限当前模型。
 
 ### 5.7 本地 Whisper 的窗口与预处理边界
 
@@ -1572,10 +1590,11 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 
 - per-process mic input
 - calendar match
-- window heuristic（Teams 主路径是结构识别，见下）
+- window heuristic（Teams 主路径是结构识别，见下；会话开始前需 Teams 自身通话活动佐证）
 - tHelperOut output keep-alive（sustain-only，见下）
 - system-mic keep-alive（sustain-only，只补 1 分缺口，见下）
 - minimum active hold 90s
+- user-stop hold（手动停止后压住自动开录，见下）
 - debounce 1s
 - grace 3s
 - active/ending poll 5s
@@ -1585,7 +1604,17 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 
 事故：2026-06-09 用户参加 "Global Security Town Hall - Quarterly (2026)"，`teamsInMeeting` 三条旧路径全部失败——(1) 标题关键词（"call"/"webinar"…）：真实会议窗口标题是会议名，从未命中；(2) control bar：新版 Teams 通话期间根本不再产生浮动控制条窗口（三天诊断日志证实，每次通话只有 2 个大窗口）；(3) 日历标题匹配：Town Hall 窗口名 ≠ 当时日历上下文事件名（`currentMeetingForDetectionContext` 用 `upcomingMeetings.first`，重叠事件时易选错）。win=0 连锁导致 sfallback=0，score 卡 2 < 3，自动开始/停止全灭。
 
-修复：`teamsHasStructuralMeetingWindow` 作为第 4 条路径（旧路径保留）——大窗口（≥520×320）+ 标题以 `" | microsoft teams"` 结尾 + 首段（`" | "` 分割）不在 `mainAppTabNames`（chat/calendar/activity/teams/calls/files/onedrive/apps）+ 排除 pre-join 通用屏（`"microsoft teams meeting | microsoft teams"`）和 chat 窗口。识别依据是窗口**结构**而非与日历的字符串匹配。Teams 改版新增 tab 名时需要更新 `mainAppTabNames`。
+修复：`teamsHasStructuralMeetingWindow` 作为第 4 条路径（旧路径保留）：大窗口（≥520×320）+ 标题以 `" | microsoft teams"` 结尾 + 首段（`" | "` 分割）不在 `mainAppTabNames`（chat/calendar/activity/teams/calls/files/onedrive/apps，2026-10-01 起加了 search/people/copilot/communities/notifications/settings）+ 排除 pre-join 通用屏（`"microsoft teams meeting | microsoft teams"`）和 chat 窗口。识别依据是窗口**结构**而非与日历的字符串匹配。Teams 改版新增 tab 名时需要更新 `mainAppTabNames`，但这份名单永远列不全（固定到左栏的 Teams 应用名字任意），所以会话开始前还有下一节的通话活动佐证。
+
+#### 误触发的三道闸（2026-10-01）
+
+事故：standup（09:00-09:30）结束后，一个自动化工具在 Teams 里逐个翻聊天、打开 Search 收集待办。`Search | Microsoft Teams` 首段不在名单里，结构识别判为会议窗口（+1）；日历检测上下文一直延到结束后 30 分钟（`MeetingDetectionCalendarContext.endTolerance`），standup 仍给 +2，合计 3 分开录。用户手动停止后检测器重置为 idle，同一组信号立刻重新检测，RecordingEngine 的 10 秒 cooldown 一过又开了第二段。两段录音里都没有任何通话，误触发时 `pmic`/`smic`/`startAudio`/`tHelperOut`/assertion 全是 0。
+
+1. **Teams 窗口需要通话活动佐证**（`teamsWindowsNeedCallActivity`）：idle/detected 阶段，Teams 窗口只有在 Teams 自己显示通话活动时才计入 `win`。通话活动指 call assertion active、helper output 或 helper input 任一为真；active/ending 阶段不受影响，维持逻辑照旧。这三个信号仍然**不加分**，只是让窗口证据成立的前提，所以"output/assertion 不用来发现会议"的不对称没有变。helper input 必须算进来：2026-08-13 的静音开场没有 assertion 也没有 output。它在部分 Teams 版本里通话后会粘住，那时这道闸退化为只剩名单过滤（2026-10-01 当天 2.5 小时空闲里它只在真实会议的 pre-join 亮过一次）。被挡下的窗口记为诊断字段 `twinHeld=1`。
+2. **应用自己报告通话结束后，日历事件退役**（`concludedCalendarOccurrence`）：会话因 `MeetingEndingReason.isAppOwnedCallEnd`（Teams assertion 释放、per-process mic 释放）结束时，该会话的日历事件（按 id + startDate 识别 occurrence）在剩余检测窗口内不再计分、不再触发 Teams calendar start fallback，也不再被新会话捕获。heuristic 的 signalDrop 结束不退役，因为可能只是信号抖动。重新入会按无日历的临时通话检测（smic + 有佐证的窗口）。诊断字段 `calDone=1`，退役时写 `calendarConcluded`。
+3. **手动停止的 user-stop hold**（`holdAutoStartAfterUserStop`）：`AppState.stopRecording(userInitiated:)` 在引擎停止**之前**调用（引擎的停止回调会 `resetNotificationState`，丢掉会话信息）；系统睡眠触发的停止传 `false`。只在检测器有会话时生效，手动录音之外的停止不会耽误下一个会议。释放条件按停止时的证据决定：Teams assertion 当时 active，则等它显式 `.inactive`（屏幕共享导致的分数下跌不会提前放开，query `.unavailable` 时退回到分数跌破阈值）；per-process mic 曾出现，则等该 app 释放 mic；都没有，则等分数跌破阈值一次。app 退出也会释放。hold 期间任何启动路径（含各种 fallback）都不能离开 idle。若释放是应用自己报告的通话结束，同样退役那场日历事件。诊断字段 `stopHold=1`，写 `userStopHold armed/released`。
+
+回归测试：`teams_mainAppPage_isNotMeetingByStructure`、`teamsIdle_unlistedPageWithoutCallActivity_doesNotTrigger`、`teamsIdle_meetingWindowWithHelperInputOnly_triggers`、`teamsCallEndedByApp_retiresCalendarEvent`、`teamsSignalDropEnd_keepsCalendarEvent`、`userStopHold_*`。
 
 #### Minimum active hold（90s）
 
@@ -2169,6 +2198,68 @@ MeetingPrepScheduler.tick(events:now:)          — 每场会一次
 
 配套 fixture：`CadenzaTests/DemoSeedTests.swift`，仅当 `CADENZA_DEMO_SEED_STORE` 指向真实库
 之外的 store 时才写入，否则空跑。
+
+## 12.z6 AI key 来源：本机或 Cadenza 账户（1.4.0）
+
+**规则**（产品决定，2026-09-30）：
+
+- 未登录时用本机钥匙串里的 key。
+- 登录后，如果账户所在服务器提供云端 key，就只用账户 vault 里的 key：
+  - 服务器连不上时，不回退到本机 key，只认一个来源，账单和"哪个 key 出问题"才说得清；
+  - 本机钥匙串里的 key 原样保留，登录期间不用，退出登录后照常使用；
+  - 登录期间新填的 key 只存到账户里，不写本机。
+
+服务器契约见 cadenzapp-web `docs/specs/2026-09-30-cloud-ai-keys-design.md`。key 永远不下发到设备。
+
+**`AIProviderAccess`**：描述一次调用怎么到达服务商，有两条路径：
+
+- `.direct(apiKey:)`：直连服务商。
+- `.cadenza(apiBase:sessionToken:)`：请求发到 `…/api/v1/ai/proxy/<服务商>/<原路径>`，由服务器挂上 vault key 转发。
+
+请求体和响应都是服务商原样的，所以 OpenAI/MiniMax、Claude、Gemini 的聊天与摘要服务、模型列表、两家文件转录客户端写一套请求代码即可，只有 base URL 和认证头不同。Claude 在服务器上的名字是 `anthropic`。
+
+**`HardenedAITransport` 对 `viaCadenza` 请求的处理**：
+
+- 不做服务商 host 钉扎（例如 MiniMax 的），请求的目标是账户绑定的源。
+- 带 `X-Cadenza-Proxy-Error` 的响应是服务器自己产生的错误，映射为 `CadenzaAIAccessError`，有独立文案：key 缺失、key 被拒、会话过期、限流、今日用量上限、功能暂停。其余服务商错误照旧是 `AIServiceError.httpError`。
+- 经服务器时，下列情况会发 `.cadenzaAIAccessDidFail` 通知，让 resolver 刷新 key 状态：
+  - key 缺失、key 被拒、会话过期；
+  - 服务商原样返回 401/403，说明 vault key 被拒。
+
+**`AICredentialResolver`**：`@Observable`，由 AppState 创建并安装为 `AICredentialResolver.shared`。
+
+- 读取方：
+  - live 依赖（录音引擎、后处理、转录服务商解析）；
+  - 各个生成器；
+  - 各处视图。
+  它们都在调用时读 `shared`，所以总拿到绑定了当前 profile 账户的那个实例。
+- 本机 key 只走 `KeychainManager.readOnlyAPIKey`：决定音频发往哪里，不能有写钥匙串的副作用。`PostProcessingCoordinatorTests` 用源码断言守住这一点。
+- 服务器给的 `proxy_enabled` 和账户的 key 列表按账户 ID 存进 UserDefaults 快照，离线时沿用上次看到的模式，不会悄悄换 key 来源。以下情况都视为"服务器不提供云端 key"：
+  - `proxy_enabled` 为 false；
+  - 字段缺失（旧服务器）；
+  - 404（服务器没有 vault）。
+- 刷新时机：
+  - 启动时，受 `startupPolicy.externalAccessEnabled` 约束，测试和隔离数据根不联网；
+  - 登录状态变化时，走 `CadenzaAuthService.addSessionObserver`，因为 `onSessionChanged` 已被网页同步占用；
+  - app 激活时，最多每 5 分钟一次；
+  - key 增删之后；
+  - 收到失败通知时，同一时间只跑一次。
+- 会话 token 通过 `CadenzaAuthService.aiRouteCredentials()` 取得，只发往签发它的源，与 `makeBearerRequest` 的 INV-7 相同。
+
+**实时字幕**：设备仍直连服务商，只是连接前先向服务器领一张一次性凭证（`CadenzaRealtimeCredentials`）。
+
+- OpenAI：`RealtimeTranscriber` 在连接前 mint 一个 `ek_` 作为 Bearer。领凭证期间被停止的话，以停止为准。
+- Gemini：`GeminiRealtimeTranscriber.cloudTokenOperation` 每次连接和每次 goAway 轮换都现领一张，不缓存，因为服务器签的 token 只能开一个会话。本机模式仍走原来的 `GeminiEphemeralTokenProvider`，它有缓存。
+- 断线补发、停顿断句都不受影响。
+
+**设置界面**：登录并启用云端 key 后，Integrations 里的 AI Providers 卡片：
+
+- 每行显示账户里的 key 状态：已连接、被服务商拒绝（可以替换）、未保存。
+- 只显示末四位，没有显示原文和复制按钮，因为 key 不在本机。
+- 保存直接提交到账户，由服务器校验。
+- 本机有、账户里没有的 key，会在卡片顶部逐个询问要不要上传，可以"暂不"，按账户记住。
+
+**诊断工具**：`QualityComparisonRunner`、`FunctionalTestRunner` 仍然直接用本机 key。
 
 ## 13. 当前架构优势
 

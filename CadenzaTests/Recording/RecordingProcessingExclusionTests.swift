@@ -66,7 +66,7 @@ private final class RecordingProcessingBoundarySpy {
         let storageRoot = storageRoot
         return RecordingEngineDependencies(
             defaults: defaults,
-            apiKey: { _ in nil },
+            providerAccess: { _ in nil },
             supportsAppleLanguage: { [weak self] _ in
                 guard let self else { return false }
                 self.providerChecks += 1
@@ -143,7 +143,7 @@ struct RecordingProcessingExclusionTests {
             store: store,
             transcriptionDependencies: PostProcessingTranscriptionDependencies(
                 defaults: defaults,
-                apiKey: { _ in nil },
+                providerAccess: { _ in nil },
                 supportsAppleLanguage: { _ in true },
                 localWhisperState: { LocalWhisperState(model: "base", isAvailable: true) }
             ),

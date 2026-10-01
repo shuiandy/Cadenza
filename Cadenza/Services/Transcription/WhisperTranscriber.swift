@@ -43,20 +43,29 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
     private let onProgress: (@Sendable (Int, Int) -> Void)?
 
     init(
-        apiKey: String,
+        access: AIProviderAccess,
         model: String,
         transport: HardenedAITransport = .transcription,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) {
         self.model = model
         self.apiClient = OpenAITranscriptionAPIClient(
-            apiKey: apiKey,
+            access: access,
             transport: transport
         )
         self.onProgress = onProgress
         self.retrySleep = { duration in
             try await Task.sleep(for: duration)
         }
+    }
+
+    convenience init(
+        apiKey: String,
+        model: String,
+        transport: HardenedAITransport = .transcription,
+        onProgress: (@Sendable (Int, Int) -> Void)? = nil
+    ) {
+        self.init(access: .direct(.openai, apiKey: apiKey), model: model, transport: transport, onProgress: onProgress)
     }
 
     init(

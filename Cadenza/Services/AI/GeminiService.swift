@@ -3,13 +3,16 @@ import Foundation
 /// Google Gemini API for meeting summarization.
 final class GeminiService: AIServiceProtocol {
     let provider: AIProvider = .gemini
-    private let apiKey: String
-    private let baseURL = "https://generativelanguage.googleapis.com/v1beta/models"
+    private let access: AIProviderAccess
     private let transport: HardenedAITransport
 
-    init(apiKey: String, transport: HardenedAITransport = .shared) {
-        self.apiKey = apiKey
+    init(access: AIProviderAccess, transport: HardenedAITransport = .shared) {
+        self.access = access
         self.transport = transport
+    }
+
+    convenience init(apiKey: String, transport: HardenedAITransport = .shared) {
+        self.init(access: .direct(.gemini, apiKey: apiKey), transport: transport)
     }
 
     func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) async throws -> SummaryResult {
@@ -124,14 +127,15 @@ final class GeminiService: AIServiceProtocol {
     private func postJSON(url: URL, body: [String: Any]) async throws -> Data {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        access.authorize(&request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         return try await transport.data(
             for: request,
             provider: provider,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
     }
 
@@ -141,7 +145,7 @@ final class GeminiService: AIServiceProtocol {
     ) throws -> AsyncThrowingStream<String, Error> {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        access.authorize(&request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -149,7 +153,8 @@ final class GeminiService: AIServiceProtocol {
         return transport.serverSentEvents(
             for: request,
             provider: provider,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
     }
 
@@ -157,15 +162,12 @@ final class GeminiService: AIServiceProtocol {
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
         guard !modelID.isEmpty,
               modelID.utf8.count <= 256,
-              modelID.unicodeScalars.allSatisfy(allowed.contains),
-              var components = URLComponents(string: baseURL) else {
+              modelID.unicodeScalars.allSatisfy(allowed.contains) else {
             throw AITransportError.unsafeEndpoint
         }
-        components.path += "/\(modelID):\(streaming ? "streamGenerateContent" : "generateContent")"
-        components.queryItems = streaming ? [URLQueryItem(name: "alt", value: "sse")] : nil
-        guard let url = components.url else {
-            throw AITransportError.unsafeEndpoint
-        }
-        return url
+        return try access.url(
+            path: "/v1beta/models/\(modelID):\(streaming ? "streamGenerateContent" : "generateContent")",
+            queryItems: streaming ? [URLQueryItem(name: "alt", value: "sse")] : []
+        )
     }
 }

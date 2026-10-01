@@ -20,8 +20,9 @@ final class SummaryGenerator {
     /// True when enrich phase is running (quick result already available).
     private(set) var isEnriching = false
 
-    /// Closure to resolve API keys. Defaults to KeychainManager; overridden in XPC Core.
-    var apiKeyResolver: (AIProvider) -> String? = { KeychainManager.shared.apiKey(for: $0) }
+    /// Resolves how each provider is reached: this Mac's key or the Cadenza
+    /// account's.
+    var accessResolver: (AIProvider) -> AIProviderAccess? = { AICredentialResolver.shared.access(for: $0) }
 
 #if DEBUG
     /// Completes the injected coordinator task without a network request. Tests
@@ -33,10 +34,9 @@ final class SummaryGenerator {
 #endif
 
     /// Resolve API key for provider, returning empty string for local providers.
-    private func resolveKey(for provider: AIProvider) -> String? {
-        if !provider.requiresAPIKey { return "" }
-        guard let key = apiKeyResolver(provider), !key.isEmpty else { return nil }
-        return key
+    private func resolveAccess(for provider: AIProvider) -> AIProviderAccess? {
+        if !provider.requiresAPIKey { return .direct(provider, apiKey: "") }
+        return accessResolver(provider)
     }
 
     /// Generate a summary using the specified provider.
@@ -51,7 +51,7 @@ final class SummaryGenerator {
     ) async {
         guard !isGenerating else { return }
 
-        guard let apiKey = resolveKey(for: provider) else {
+        guard let access = resolveAccess(for: provider) else {
             error = String(localized: "No API key is configured for \(provider.displayName).")
             return
         }
@@ -69,7 +69,7 @@ final class SummaryGenerator {
 
         do {
             var summaryResult = try await SummaryPrompt.$evaluationUserName.withValue(userName) { try await Self.runGenerate(
-                provider: provider, apiKey: apiKey,
+                provider: provider, access: access,
                 transcript: transcript, language: language,
                 model: modelID, jobTitle: jobTitle, meetingType: meetingType,
                 meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel
@@ -98,7 +98,7 @@ final class SummaryGenerator {
     ) async {
         guard !isGenerating else { return }
 
-        guard let apiKey = resolveKey(for: provider) else {
+        guard let access = resolveAccess(for: provider) else {
             error = String(localized: "No API key is configured for \(provider.displayName).")
             return
         }
@@ -138,7 +138,7 @@ final class SummaryGenerator {
         }
 
         let (text, parsedResult, errorMsg) = await SummaryPrompt.$evaluationUserName.withValue(userName) { await Self.runStreamGenerate(
-            provider: provider, apiKey: apiKey,
+            provider: provider, access: access,
             transcript: transcript, language: language,
             model: modelID, jobTitle: jobTitle, meetingType: meetingType,
             meetingTitle: meetingTitle, knownTags: knownTags, detailLevel: detailLevel,
@@ -167,19 +167,19 @@ final class SummaryGenerator {
         language: String = "en",
         summaryContext: String? = nil
     ) async -> [ChapterResult] {
-        guard let apiKey = resolveKey(for: provider) else { return [] }
+        guard let access = resolveAccess(for: provider) else { return [] }
         let modelID = provider.summaryModel
         return await Self.runGenerateChapters(
-            provider: provider, apiKey: apiKey,
+            provider: provider, access: access,
             transcript: transcript, language: language, model: modelID, summaryContext: summaryContext
         )
     }
 
     private nonisolated static func runGenerateChapters(
-        provider: AIProvider, apiKey: String,
+        provider: AIProvider, access: AIProviderAccess,
         transcript: String, language: String, model: String, summaryContext: String?
     ) async -> [ChapterResult] {
-        guard let service = makeService(provider: provider, apiKey: apiKey) else { return [] }
+        guard let service = makeService(provider: provider, access: access) else { return [] }
         let systemPrompt = SummaryPrompt.chaptersSystem(language: language)
         let userMessage = SummaryPrompt.user(transcript: transcript) + (summaryContext.map { "\nSaved summary (derived context, not new evidence):\n" + $0 + "\nKeep chapter descriptions consistent with final clarified scope and dates; use transcript timestamps for navigation." } ?? "")
         do {
@@ -206,12 +206,12 @@ final class SummaryGenerator {
 
     /// Non-streaming summary — prompt assembly and network I/O run off MainActor.
     private nonisolated static func runGenerate(
-        provider: AIProvider, apiKey: String,
+        provider: AIProvider, access: AIProviderAccess,
         transcript: String, language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
         meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel
     ) async throws -> SummaryResult {
-        guard let service = makeService(provider: provider, apiKey: apiKey) else {
+        guard let service = makeService(provider: provider, access: access) else {
             throw AIServiceError.noProvider("\(provider.displayName) is not available on this device")
         }
         return try await AIGenerationGate.shared.run(provider: provider) {
@@ -344,13 +344,13 @@ final class SummaryGenerator {
 
     /// Map-reduce streaming summary for long transcripts.
     private nonisolated static func runMapReduceStreamGenerate(
-        provider: AIProvider, apiKey: String,
+        provider: AIProvider, access: AIProviderAccess,
         chunks: [String], language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
         meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel,
         onChunk: @Sendable (String) async -> Void
     ) async -> (String, SummaryResult?, String?) {
-        guard let service = makeService(provider: provider, apiKey: apiKey) else {
+        guard let service = makeService(provider: provider, access: access) else {
             return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
         }
         let mapPrompt = SummaryPrompt.mapSystem(language: language, detailLevel: detailLevel)
@@ -413,7 +413,7 @@ final class SummaryGenerator {
 
     /// Streaming summary — prompt assembly, network I/O, and response parsing run off MainActor.
     nonisolated static func runStreamGenerate(
-        provider: AIProvider, apiKey: String,
+        provider: AIProvider, access: AIProviderAccess,
         transcript: String, language: String,
         model: String, jobTitle: String?, meetingType: MeetingType?,
         meetingTitle: String?, knownTags: [String], detailLevel: SummaryDetailLevel,
@@ -425,7 +425,7 @@ final class SummaryGenerator {
         // Local providers (Apple FM) have tiny context windows — use their own
         // summarize() which has compact prompts and built-in chunking.
         if !provider.requiresAPIKey {
-            guard let service = makeService(provider: provider, apiKey: apiKey) else {
+            guard let service = makeService(provider: provider, access: access) else {
                 return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
             }
             do {
@@ -450,7 +450,7 @@ final class SummaryGenerator {
         if chunks.count > 1 {
             NSLog("[SummaryGenerator] transcript %d chars → map-reduce with %d chunks", transcript.count, chunks.count)
             let (text, result, error) = await runMapReduceStreamGenerate(
-                provider: provider, apiKey: apiKey,
+                provider: provider, access: access,
                 chunks: chunks, language: language,
                 model: model, jobTitle: jobTitle,
                 meetingType: meetingType, meetingTitle: meetingTitle,
@@ -465,7 +465,7 @@ final class SummaryGenerator {
         }
 
         // Standard path: quick draft followed by a full review.
-        guard let service = makeService(provider: provider, apiKey: apiKey) else {
+        guard let service = makeService(provider: provider, access: access) else {
             return ("", nil, AIServiceError.noProvider(provider.displayName).localizedDescription)
         }
         return await runTwoStageStreamGenerate(
@@ -481,8 +481,8 @@ final class SummaryGenerator {
         )
     }
 
-    private nonisolated static func makeService(provider: AIProvider, apiKey: String) -> AIServiceProtocol? {
-        provider.makeChatService(apiKey: apiKey)
+    private nonisolated static func makeService(provider: AIProvider, access: AIProviderAccess) -> AIServiceProtocol? {
+        provider.makeChatService(access: access)
     }
 }
 
