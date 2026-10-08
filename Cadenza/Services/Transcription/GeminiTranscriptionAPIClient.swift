@@ -1,26 +1,30 @@
 import Foundation
 
 struct GeminiTranscriptionAPIClient: Sendable {
-    private static let baseURL = "https://generativelanguage.googleapis.com/v1beta/models"
-    /// The Interactions API names the model in the body, so unlike
-    /// `generateContent` this endpoint is a fixed path.
-    private static let interactionsURL = "https://generativelanguage.googleapis.com/v1beta/interactions"
     private static let allowedModelCharacters = CharacterSet(
         charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
     )
 
-    private let apiKey: String
+    private let access: AIProviderAccess
     private let model: String
     private let transport: HardenedAITransport
+
+    init(
+        access: AIProviderAccess,
+        model: String,
+        transport: HardenedAITransport = .transcription
+    ) {
+        self.access = AIProviderAccess(provider: .gemini, route: access.route)
+        self.model = model
+        self.transport = transport
+    }
 
     init(
         apiKey: String,
         model: String,
         transport: HardenedAITransport = .transcription
     ) {
-        self.apiKey = apiKey
-        self.model = model
-        self.transport = transport
+        self.init(access: .direct(.gemini, apiKey: apiKey), model: model, transport: transport)
     }
 
     func generateContent(body: Data) async throws -> Data {
@@ -33,16 +37,15 @@ struct GeminiTranscriptionAPIClient: Sendable {
     /// echoed into a request body.
     func createInteraction(body: Data) async throws -> Data {
         try validateModel()
-        guard let url = URL(string: Self.interactionsURL) else {
-            throw AITransportError.unsafeEndpoint
-        }
-        return try await post(body, to: url)
+        // The Interactions API names the model in the body, so unlike
+        // `generateContent` this endpoint is a fixed path.
+        return try await post(body, to: try access.url(path: "/v1beta/interactions"))
     }
 
     private func post(_ body: Data, to url: URL) async throws -> Data {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        access.authorize(&request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
         request.timeoutInterval = 300
@@ -50,7 +53,8 @@ struct GeminiTranscriptionAPIClient: Sendable {
         return try await transport.data(
             for: request,
             provider: .gemini,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
     }
 
@@ -64,13 +68,6 @@ struct GeminiTranscriptionAPIClient: Sendable {
 
     private func generateContentURL() throws -> URL {
         try validateModel()
-        guard var components = URLComponents(string: Self.baseURL) else {
-            throw AITransportError.unsafeEndpoint
-        }
-        components.path += "/\(model):generateContent"
-        guard let url = components.url else {
-            throw AITransportError.unsafeEndpoint
-        }
-        return url
+        return try access.url(path: "/v1beta/models/\(model):generateContent")
     }
 }

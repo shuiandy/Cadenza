@@ -117,7 +117,7 @@ struct OpenAITranscriptionAPIClientTests {
             )
         }
 
-        #expect(await waitUntil {
+        #expect(await waitUntil(timeout: Self.urlSessionCallbackTimeout) {
             OpenAITranscriptionTestURLProtocol.totalRequestCount == 1
         })
         task.cancel()
@@ -125,7 +125,7 @@ struct OpenAITranscriptionAPIClientTests {
         await #expect(throws: CancellationError.self) {
             _ = try await task.value
         }
-        #expect(await waitUntil {
+        #expect(await waitUntil(timeout: Self.urlSessionCallbackTimeout) {
             OpenAITranscriptionTestURLProtocol.stopLoadingCount == 1
         })
     }
@@ -199,6 +199,126 @@ struct OpenAITranscriptionAPIClientTests {
 
         #expect(await client.requestCount == 3)
         #expect(await delays.values == [.seconds(2), .seconds(4)])
+    }
+
+    // MARK: - 429 quota windows
+
+    // Classification lives in ProviderRateLimitTests. Bodies follow OpenAI's
+    // 429 shapes; the organisation, limits and link are invented.
+    private static let requestsPerDayBody = #"{"error":{"message":"Rate limit reached for gpt-4o-transcribe in organization org-example123 on requests per day (RPD): Limit 50, Used 50, Requested 1. Please try again in 28m48s. Visit https://example.invalid/rate-limits to learn more.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#
+    private static let requestsPerMinuteBody = #"{"error":{"message":"Rate limit reached for gpt-4o-transcribe in organization org-example123 on requests per min (RPM): Limit 3, Used 3, Requested 1. Please try again in 20s. Visit https://example.invalid/rate-limits to learn more.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#
+    private static let insufficientQuotaBody = #"{"error":{"message":"You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://example.invalid/error-codes.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#
+
+    @Test func dailyLimitStopsAfterOneAttempt() async throws {
+        let client = ScriptedOpenAITranscriptionClient(outcomes: [
+            .httpBody(429, Self.requestsPerDayBody),
+            .success(Self.validTranscriptResponse),
+        ])
+        let delays = OpenAIRetryDelayRecorder()
+        let transcriber = makeTranscriber(client: client, delays: delays)
+
+        let error = await transcriptionError {
+            _ = try await transcriber.uploadWithRetry(
+                body: WhisperMultipartBody(boundary: "boundary", data: Data())
+            )
+        }
+
+        guard case .dailyQuotaReached(.openai)? = error else {
+            Issue.record("expected the daily limit error, got \(String(describing: error))")
+            return
+        }
+        #expect(await client.requestCount == 1)
+        #expect(await delays.values.isEmpty)
+    }
+
+    @Test func emptyAccountStopsAfterOneAttempt() async throws {
+        let client = ScriptedOpenAITranscriptionClient(outcomes: [
+            .httpBody(429, Self.insufficientQuotaBody),
+            .success(Self.validTranscriptResponse),
+        ])
+        let delays = OpenAIRetryDelayRecorder()
+        let transcriber = makeTranscriber(client: client, delays: delays)
+
+        let error = await transcriptionError {
+            _ = try await transcriber.uploadWithRetry(
+                body: WhisperMultipartBody(boundary: "boundary", data: Data())
+            )
+        }
+
+        guard case .accountQuotaExhausted(.openai)? = error else {
+            Issue.record("expected the empty-account error, got \(String(describing: error))")
+            return
+        }
+        #expect(await client.requestCount == 1)
+        #expect(await delays.values.isEmpty)
+    }
+
+    @Test func perMinuteLimitIsStillRetried() async throws {
+        let client = ScriptedOpenAITranscriptionClient(outcomes: [
+            .httpBody(429, Self.requestsPerMinuteBody),
+            .success(Self.validTranscriptResponse),
+        ])
+        let delays = OpenAIRetryDelayRecorder()
+        let transcriber = makeTranscriber(client: client, delays: delays)
+
+        let result = try await transcriber.uploadWithRetry(
+            body: WhisperMultipartBody(boundary: "boundary", data: Data())
+        )
+
+        #expect(result.text == "hello")
+        #expect(await client.requestCount == 2)
+        #expect(await delays.values == [.seconds(2)])
+    }
+
+    /// Long diarized recordings go out as five-minute chunks, several at a
+    /// time. A spent daily limit must stop every chunk after its one request,
+    /// with no backoff, and leave the source file untouched.
+    @Test func chunkedDailyLimitNeverBacksOff() async throws {
+        let audioURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("openai-quota-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        try await AudioTestFixtures.writeM4A(
+            tracks: [AudioTestFixtures.sine(count: 601 * 16_000, amplitude: 0.05)],
+            to: audioURL
+        )
+        let audioBefore = try Data(contentsOf: audioURL)
+        let client = QuotaRejectingOpenAIClient(body: Self.requestsPerDayBody)
+        let delays = OpenAIRetryDelayRecorder()
+        let transcriber = WhisperTranscriber(
+            model: "gpt-4o-transcribe-diarize",
+            apiClient: client,
+            retrySleep: { duration in
+                await delays.record(duration)
+            }
+        )
+
+        let error = await transcriptionError {
+            _ = try await transcriber.transcribeFile(at: audioURL, language: nil)
+        }
+
+        guard case .dailyQuotaReached(.openai)? = error else {
+            Issue.record("expected the daily limit error, got \(String(describing: error))")
+            return
+        }
+        // 601 s splits into three chunks; each may have sent once.
+        #expect((1...3).contains(await client.requestCount))
+        #expect(await delays.values.isEmpty)
+        #expect(try Data(contentsOf: audioURL) == audioBefore)
+    }
+
+    private func transcriptionError(
+        _ operation: () async throws -> Void
+    ) async -> TranscriptionError? {
+        do {
+            try await operation()
+            Issue.record("expected transcription to fail")
+            return nil
+        } catch let error as TranscriptionError {
+            return error
+        } catch {
+            Issue.record("expected a TranscriptionError, got \(type(of: error))")
+            return nil
+        }
     }
 
     @Test func cancellationNeverRetries() async throws {
@@ -398,6 +518,12 @@ struct OpenAITranscriptionAPIClientTests {
         )
     }
 
+    /// URLSession calls `startLoading` and `stopLoading` on its own loader
+    /// thread, which a loaded CI runner can delay by more than a second after
+    /// the awaiting task has already resumed. `waitUntil` returns as soon as
+    /// the condition holds, so only a failing run waits this long.
+    private static let urlSessionCallbackTimeout: Duration = .seconds(10)
+
     private static let validTranscriptResponse = Data(
         """
         {"text":"hello","segments":[],"language":"en","duration":1}
@@ -454,6 +580,7 @@ private actor ScriptedOpenAITranscriptionClient: OpenAITranscriptionRequesting {
     enum Outcome: Sendable {
         case success(Data)
         case http(Int)
+        case httpBody(Int, String)
         case requestFailed
         case cancelled
     }
@@ -475,11 +602,28 @@ private actor ScriptedOpenAITranscriptionClient: OpenAITranscriptionRequesting {
             return data
         case .http(let statusCode):
             throw AIServiceError.httpError(statusCode, "provider failure")
+        case .httpBody(let statusCode, let body):
+            throw AIServiceError.httpError(statusCode, body)
         case .requestFailed:
             throw AITransportError.requestFailed
         case .cancelled:
             throw CancellationError()
         }
+    }
+}
+
+/// Answers every upload with the same 429, the way a spent quota does.
+private actor QuotaRejectingOpenAIClient: OpenAITranscriptionRequesting {
+    private let body: String
+    private(set) var requestCount = 0
+
+    init(body: String) {
+        self.body = body
+    }
+
+    func transcribe(multipartBody: Data, boundary: String) async throws -> Data {
+        requestCount += 1
+        throw AIServiceError.httpError(429, body)
     }
 }
 

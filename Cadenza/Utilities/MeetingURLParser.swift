@@ -162,7 +162,7 @@ enum MeetingURLParser {
         )
     }
 
-    private static func isGoogleMeetCode(_ code: String) -> Bool {
+    static func isGoogleMeetCode(_ code: String) -> Bool {
         let groups = code.split(separator: "-", omittingEmptySubsequences: false)
         return groups.count == 3
             && groups.allSatisfy { group in

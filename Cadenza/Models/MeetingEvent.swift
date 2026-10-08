@@ -179,7 +179,7 @@ enum MeetingApp: String, CaseIterable, Sendable {
         switch self {
         case .zoom: ["us.zoom.xos"]
         case .teams: ["com.microsoft.teams", "com.microsoft.teams2"]
-        case .googleMeet: [] // Browser-based
+        case .googleMeet: [] // Browser-based; see BrowserMeetingFamily
         case .webex: ["com.cisco.webexmeetingsapp"]
         case .facetime: ["com.apple.FaceTime"]
         case .slack: ["com.tinyspeck.slackmacgap"]
@@ -217,5 +217,14 @@ enum MeetingApp: String, CaseIterable, Sendable {
         default: []
         }
     }
+
+    /// Processes the audio state listener watches for microphone input, so a
+    /// meeting app taking the mic wakes the detector even while another process
+    /// keeps the input device running. Must cover every bundle ID whose input
+    /// state `MeetingDetector` reads through `audioUsage(bundleIDs:)`, browser
+    /// audio helpers included.
+    static let processInputListenerBundleIdentifiers: Set<String> = Set(
+        allCases.flatMap { $0.audioBundleIdentifiers + $0.continuityAudioBundleIdentifiers }
+    ).union(BrowserMeetingFamily.allAudioBundleIDs)
 
 }

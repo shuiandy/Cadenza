@@ -58,7 +58,7 @@ directory that the current recovery scan does not adopt automatically.
 | System Audio Recording | Capture audio produced by meeting applications | When the user enables it in Settings or starts a manual recording; automatic recording requires prior setup |
 | Microphone | Add the user's voice to the recording | From a user-initiated recording or settings action; optional |
 | Calendar | Read event timing and meeting metadata | When the user explicitly connects a calendar |
-| Screen Recording | Read meeting-window information used by local meeting detection | Never requested automatically; background checks use read-only preflight gates |
+| Screen Recording | Read meeting-window information used by local meeting detection. Browser window titles are examined only while a browser is using the microphone, only to check locally for a Google Meet call page, and are never logged or stored | Never requested automatically; background checks use read-only preflight gates |
 
 macOS controls these permissions in **System Settings → Privacy & Security**. Revoking a
 permission disables the related signal or capture source rather than authorizing a

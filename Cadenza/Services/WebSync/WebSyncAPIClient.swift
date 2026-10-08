@@ -100,6 +100,18 @@ struct MCPPrefsSnapshot: Decodable, Sendable, Equatable {
     }
 }
 
+/// The two speaker sync calls, separated from the client so a pass can be
+/// exercised without HTTP.
+@MainActor
+protocol SpeakerProfileSyncTransport: AnyObject {
+    func pullSpeakerChanges(
+        since cursor: Int64,
+        limit: Int,
+        modelVersions: [String]
+    ) async throws -> SpeakerSyncPullResponse
+    func pushSpeakerChanges(_ request: SpeakerSyncPushRequest) async throws -> SpeakerSyncPushResponse
+}
+
 @MainActor
 final class WebSyncAPIClient {
     private let auth: CadenzaAuthService
@@ -247,5 +259,42 @@ final class WebSyncAPIClient {
             path: "sync/recordings/\(clientRecordingID.uuidString.lowercased())",
             method: "DELETE"
         )
+    }
+}
+
+extension WebSyncAPIClient: SpeakerProfileSyncTransport {
+    func pullSpeakerChanges(
+        since cursor: Int64,
+        limit: Int,
+        modelVersions: [String]
+    ) async throws -> SpeakerSyncPullResponse {
+        var query = [
+            URLQueryItem(name: "since", value: String(cursor)),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        query += modelVersions.map { URLQueryItem(name: "model_version", value: $0) }
+        let (data, _) = try await auth.requestResponse(path: "speakers/changes", queryItems: query)
+        return try decoder.decode(SpeakerSyncPullResponse.self, from: data)
+    }
+
+    func pushSpeakerChanges(_ request: SpeakerSyncPushRequest) async throws -> SpeakerSyncPushResponse {
+        let data = try await auth.request(
+            path: "speakers/changes",
+            method: "POST",
+            body: try encoder.encode(request)
+        )
+        return try decoder.decode(SpeakerSyncPushResponse.self, from: data)
+    }
+}
+
+extension WebSyncAPIClient: AIProviderPrefsTransport {
+    func fetchAIProviderPrefs() async throws -> AIProviderPrefsSnapshot {
+        let data = try await auth.request(path: "me/ai-prefs")
+        return try decoder.decode(AIProviderPrefsSnapshot.self, from: data)
+    }
+
+    func patchAIProviderPrefs(_ patch: AIProviderPrefsPatch) async throws -> AIProviderPrefsSnapshot {
+        let data = try await auth.request(path: "me/ai-prefs", method: "PATCH", body: try encoder.encode(patch))
+        return try decoder.decode(AIProviderPrefsSnapshot.self, from: data)
     }
 }

@@ -331,3 +331,197 @@ struct NotionExportForcedReconnectTests {
         #expect(notion.needsForcedReconnect == false)
     }
 }
+
+@MainActor
+@Suite("NotionExportService: transcript speakers")
+struct NotionExportTranscriptSpeakerTests {
+    private func setup() -> (NotionExportService, FakeAuthHTTP) {
+        let http = FakeAuthHTTP()
+        let store = InMemoryAuthSecretStore()
+        try! writeStoredToken(into: store, value: "tok",
+                              expiresAt: Date().addingTimeInterval(3600))
+        let userStore = InMemoryUserStore()
+        userStore.user = .init(id: "u", email: "a@b", displayName: "A", pictureURL: nil)
+        let auth = try! CadenzaAuthService.bootstrapped(
+            sessionProfile: AuthTestProfile.bound(userID: "u"),
+            http: http,
+            authorizer: FakeAuthorizationProvider(),
+            secretStore: store,
+            sessionUserStore: userStore,
+            registry: ScriptedRegistry(document: makeAuthRegistryDocument(userID: "u"))
+        )
+        let suiteName = "test.notion." + UUID().uuidString
+        let notion = NotionExportService(
+            cadenzaAuth: auth,
+            authorizer: FakeAuthorizationProvider(),
+            legacyTokenStore: InMemoryAuthSecretStore(),
+            defaults: UserDefaults(suiteName: suiteName)!
+        )
+        notion.databaseID = "db-1"
+        http.enqueue(.success(
+            data: #"{"page_id":"p-1","url":"https://notion.so/p1"}"#.data(using: .utf8)!,
+            response: HTTPURLResponse(url: URL(string: "https://x")!, statusCode: 200,
+                                      httpVersion: nil, headerFields: nil)!))
+        return (notion, http)
+    }
+
+    private func makeDetail(
+        entries: [(TimeInterval, String, String?)],
+        mappings: [SpeakerLabelMappingDTO] = [],
+        suggestions: [SpeakerLabelSuggestionDTO] = []
+    ) -> RecordingDetailDTO {
+        let date = Date(timeIntervalSince1970: 1_785_628_800)
+        let segments = entries.map { start, text, speaker in
+            TranscriptEntryDTO(id: UUID(), startTime: start, endTime: start + 4,
+                               text: text, speaker: speaker)
+        }
+        return RecordingDetailDTO(
+            id: UUID(),
+            title: "Garden club planning",
+            startDate: date,
+            endDate: date.addingTimeInterval(600),
+            duration: 600,
+            meetingApp: nil,
+            meetingURL: nil,
+            language: "en",
+            tags: [],
+            meetingType: nil,
+            lastAccessedDate: nil,
+            folderID: nil,
+            audioFile: nil,
+            linkedCalendarEventID: nil,
+            transcript: TranscriptDTO(
+                id: UUID(),
+                fullText: segments.map(\.text).joined(separator: " "),
+                segments: segments,
+                detectedLanguage: "en",
+                createdAt: date
+            ),
+            summary: nil,
+            speakerMappings: mappings,
+            speakerSuggestions: suggestions
+        )
+    }
+
+    /// Paragraph texts from the single export-page request body.
+    private func paragraphs(in http: FakeAuthHTTP) throws -> [String] {
+        let body = try #require(http.requests.first?.httpBody)
+        let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let blocks = try #require(json["blocks"] as? [[String: Any]])
+        return blocks.compactMap { block in
+            block["type"] as? String == "paragraph" ? block["text"] as? String : nil
+        }
+    }
+
+    @Test func renamedSpeakersUseTheMappedName() async throws {
+        let (notion, http) = setup()
+        let detail = makeDetail(
+            entries: [
+                (0, "Seed order is in.", "SPEAKER_00"),
+                (75, "Great, thanks.", "SPEAKER_01"),
+            ],
+            mappings: [
+                SpeakerLabelMappingDTO(rawLabel: "SPEAKER_00", profileID: UUID(),
+                                       profileName: "Wren Halloway"),
+                SpeakerLabelMappingDTO(rawLabel: "SPEAKER_01", profileID: UUID(),
+                                       profileName: "Ossian Pike"),
+            ]
+        )
+
+        try await notion.exportRecording(detail)
+
+        #expect(try paragraphs(in: http) == [
+            "[00:00] Wren Halloway: Seed order is in.",
+            "[01:15] Ossian Pike: Great, thanks.",
+        ])
+    }
+
+    @Test func unmappedProviderTokensBecomeFriendlyNames() async throws {
+        let (notion, http) = setup()
+        let detail = makeDetail(entries: [
+            (0, "Morning.", "SPEAKER_00"),
+            (5, "Hi there.", "B"),
+        ])
+
+        try await notion.exportRecording(detail)
+
+        let first = SpeakerLabelFormatter.displayName(forRawLabel: "SPEAKER_00")
+        let second = SpeakerLabelFormatter.displayName(forRawLabel: "B")
+        #expect(first != "SPEAKER_00")
+        #expect(second != "B")
+        #expect(try paragraphs(in: http) == [
+            "[00:00] \(first): Morning.",
+            "[00:05] \(second): Hi there.",
+        ])
+    }
+
+    @Test func paddedLabelsMatchMappingsAndBlankLabelsDrop() async throws {
+        let (notion, http) = setup()
+        let detail = makeDetail(
+            entries: [
+                (0, "Padded.", "  SPEAKER_02 \n"),
+                (2, "Blank.", "   "),
+                (4, "Missing.", nil),
+            ],
+            mappings: [
+                SpeakerLabelMappingDTO(rawLabel: "SPEAKER_02", profileID: UUID(),
+                                       profileName: "Juno Marsh"),
+            ]
+        )
+
+        try await notion.exportRecording(detail)
+
+        #expect(try paragraphs(in: http) == [
+            "[00:00] Juno Marsh: Padded.",
+            "[00:02] Blank.",
+            "[00:04] Missing.",
+        ])
+    }
+
+    @Test func speakerSuggestionsDoNotLeakIntoExport() async throws {
+        let (notion, http) = setup()
+        let detail = makeDetail(
+            entries: [(0, "Who is this?", "SPEAKER_00")],
+            suggestions: [
+                SpeakerLabelSuggestionDTO(rawLabel: "SPEAKER_00", profileID: UUID(),
+                                          profileName: "Thea Quill", score: 0.91,
+                                          strategy: "voiceprint"),
+            ]
+        )
+
+        try await notion.exportRecording(detail)
+
+        let lines = try paragraphs(in: http)
+        let fallback = SpeakerLabelFormatter.displayName(forRawLabel: "SPEAKER_00")
+        #expect(lines == ["[00:00] \(fallback): Who is this?"])
+        #expect(!lines.joined().contains("Thea Quill"))
+    }
+
+    // Gemini recordings transcribed before ingest mapped its wire labels
+    // store spk:0, spk:1, …: zero-based, so spk:0 is Speaker 1. A rename
+    // is keyed on the stored label and still wins.
+    @Test func storedGeminiLabelsExportAsSpeakerNumbers() async throws {
+        let (notion, http) = setup()
+        let detail = makeDetail(
+            entries: [
+                (0, "Seed order is in.", "spk:0"),
+                (5, "Great, thanks.", "spk:1"),
+                (9, "Bulbs next week.", "spk:2"),
+            ],
+            mappings: [
+                SpeakerLabelMappingDTO(rawLabel: "spk:1", profileID: UUID(),
+                                       profileName: "Ossian Pike"),
+            ]
+        )
+
+        try await notion.exportRecording(detail)
+
+        let first = SpeakerLabelFormatter.displayName(forRawLabel: "Speaker 1")
+        let third = SpeakerLabelFormatter.displayName(forRawLabel: "Speaker 3")
+        #expect(try paragraphs(in: http) == [
+            "[00:00] \(first): Seed order is in.",
+            "[00:05] Ossian Pike: Great, thanks.",
+            "[00:09] \(third): Bulbs next week.",
+        ])
+    }
+}

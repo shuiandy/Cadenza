@@ -197,7 +197,8 @@ enum ExportContentRenderer {
         return names
     }
 
-    private static func normalizedSpeaker(_ raw: String?) -> String? {
+    /// Trimmed raw label, or nil when blank. Shared with the Notion exporter.
+    static func normalizedSpeaker(_ raw: String?) -> String? {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty else { return nil }
         return trimmed

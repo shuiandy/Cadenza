@@ -214,7 +214,13 @@ final class NotionExportService {
             } else {
                 for entry in transcript.segments {
                     let timestamp = Self.exportClock(entry.startTime)
-                    let speaker = entry.speaker.map { "\($0): " } ?? ""
+                    // Same resolution as the file exports: user renames win,
+                    // provider tokens become "Speaker N", blank labels drop.
+                    let speaker = ExportContentRenderer.normalizedSpeaker(entry.speaker).map {
+                        let name = ExportContentRenderer.speakerDisplayName(
+                            rawLabel: $0, mappings: recording.speakerMappings)
+                        return "\(name): "
+                    } ?? ""
                     blocks.append(.paragraph("[\(timestamp)] \(speaker)\(entry.text)"))
                 }
             }

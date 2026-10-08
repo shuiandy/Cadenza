@@ -335,7 +335,9 @@ struct CadenzaApp: App {
                 shouldPauseHistoricalAudio: { [weak state] in
                     state?.isRecording == true
                         || state?.coordinator?.hasActiveWork == true
-                }
+                },
+                syncsSpeakerProfiles: true,
+                syncsAIProviderPrefs: true
             )
             state.recordingEngine.store = store
             state.recordingEngine.coordinator = coordinator
@@ -692,6 +694,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !AppState.isRunningTests,
               let appState = AppState.shared else { return }
 
+        if appState.startupPolicy.externalAccessEnabled {
+            appState.aiCredentials.refreshIfStale()
+        }
+
         if appState.startupPolicy.checksPermissions {
             Task {
                 await appState.checkPermissionsAndRefreshCalendarIfNeeded()
@@ -811,7 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let appState = AppState.shared,
                       appState.isRecording || appState.recordingEngine.isStopping else { return }
                 NSLog("[AppDelegate] system going to sleep, stopping recording to preserve audio")
-                appState.stopRecording()
+                appState.stopRecording(userInitiated: false)
             }
         }
 

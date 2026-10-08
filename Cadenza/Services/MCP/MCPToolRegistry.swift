@@ -902,6 +902,15 @@ struct MCPToolRegistry: MCPToolProviding {
 
         let speakerNames = Dictionary(detail.speakerMappings.map { ($0.rawLabel, $0.profileName) },
                                       uniquingKeysWith: { first, _ in first })
+        // Provider tokens (`spk:0` stored before ingest mapped it, `A`,
+        // `SPEAKER_00`) are shown as "Speaker N", the same as the detail view
+        // and exports. Unlocalized, because these labels are the keys a
+        // client passes back to set_speaker_name. Mappings stay keyed on the
+        // stored label.
+        let shownLabels = SpeakerLabelFormatter.displayLabels(
+            forRawLabels: segments.compactMap(\.speaker),
+            localized: false
+        )
 
         // Roster over the FULL transcript (not just this page): tells the
         // client which labels are placeholders (resolvedName null) vs known
@@ -911,7 +920,7 @@ struct MCPToolRegistry: MCPToolProviding {
         for segment in segments {
             guard let label = segment.speaker, seenLabels.insert(label).inserted else { continue }
             roster.append(.object([
-                "label": .string(label),
+                "label": .string(shownLabels[label] ?? label),
                 "resolvedName": speakerNames[label].map { .string($0) } ?? .null,
             ]))
         }
@@ -927,7 +936,7 @@ struct MCPToolRegistry: MCPToolProviding {
             if let windowEnd, segment.startTime > windowEnd { break }
             if let windowStart, segment.endTime < windowStart { continue }
 
-            let speaker = segment.speaker.map { speakerNames[$0] ?? $0 }
+            let speaker = segment.speaker.map { speakerNames[$0] ?? shownLabels[$0] ?? $0 }
             let line = speaker.map { "\($0): \(segment.text)" } ?? segment.text
 
             // Always include at least one segment per page so a single
@@ -1270,18 +1279,25 @@ struct MCPToolRegistry: MCPToolProviding {
             // The label must actually occur in this transcript — keeps a
             // hallucinated label from minting junk mappings.
             let presentLabels = Set(detail.transcript?.segments.compactMap(\.speaker) ?? [])
-            guard presentLabels.contains(rawLabel) else {
-                let listing = presentLabels.isEmpty ? "(none)" : presentLabels.sorted().joined(separator: ", ")
+            // Clients see get_transcript's labels, where a stored `spk:0`
+            // reads "Speaker 1". Accept either form, but always map the
+            // stored label: a mapping keyed on "Speaker 1" would match
+            // nothing in the detail view, exports or Notion.
+            let shownLabels = SpeakerLabelFormatter.displayLabels(forRawLabels: presentLabels, localized: false)
+            guard let storedLabel = presentLabels.contains(rawLabel)
+                    ? rawLabel
+                    : shownLabels.first(where: { $0.value == rawLabel })?.key else {
+                let listing = shownLabels.isEmpty ? "(none)" : shownLabels.values.sorted().joined(separator: ", ")
                 return .failure("Speaker label '\(rawLabel)' does not appear in this transcript. Labels present: \(listing)")
             }
             // Find-or-create + mapping happen atomically inside the store
             // actor — concurrent calls can't mint duplicate profiles, and a
             // failed save surfaces as nil instead of a fake success.
-            guard let outcome = await store.setSpeakerName(recordingID: id, rawLabel: rawLabel, profileNamed: name) else {
+            guard let outcome = await store.setSpeakerName(recordingID: id, rawLabel: storedLabel, profileNamed: name) else {
                 return .failure("Could not persist the speaker mapping for '\(name)'")
             }
             // Participant names are sensitive — keep them out of the unified log.
-            Self.log.notice("mcp write set_speaker_name recording=\(id.uuidString, privacy: .public) label=\(rawLabel, privacy: .public) -> \(outcome.profileName, privacy: .private)")
+            Self.log.notice("mcp write set_speaker_name recording=\(id.uuidString, privacy: .public) label=\(storedLabel, privacy: .public) -> \(outcome.profileName, privacy: .private)")
             return .ok("Mapped '\(rawLabel)' to '\(outcome.profileName)' (\(outcome.reusedExisting ? "existing" : "new") speaker profile). Transcript fetches now show this name.")
 
         default:
@@ -2028,7 +2044,7 @@ struct MCPToolRegistry: MCPToolProviding {
                 "type": "object",
                 "properties": [
                     "recordingId": recordingIDProperty,
-                    "speakerLabel": ["type": "string", "description": "Raw label as it appears in the transcript, e.g. \"Speaker 1\""],
+                    "speakerLabel": ["type": "string", "description": "Speaker label as get_transcript shows it, e.g. \"Speaker 1\""],
                     "name": ["type": "string", "description": "The person's real name, e.g. \"Dinesh\""],
                 ],
                 "required": ["recordingId", "speakerLabel", "name"],

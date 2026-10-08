@@ -9,7 +9,7 @@ import Foundation
 /// - FaceTime: Large video window appears during calls
 /// - Webex: Similar to Zoom (large meeting window)
 /// - Slack: Huddle overlay window appears
-/// - Google Meet: Browser-based — cannot be detected via native windows
+/// - Google Meet: Browser-based; `BrowserMeetingEvaluator` reads browser windows instead
 ///
 /// Window detection is a Tier 2 (supporting) signal worth +1 confidence point.
 /// It is NOT relied upon as the sole trigger — per-process audio and calendar are primary.
@@ -33,7 +33,7 @@ enum MeetingWindowAnalyzer {
         case .facetime:  return facetimeInMeeting(onScreen)
         case .webex:     return webexInMeeting(onScreen)
         case .slack:     return slackInMeeting(onScreen)
-        case .googleMeet: return false // Browser-based, not detectable
+        case .googleMeet: return false // Browser-based; see GoogleMeetWindowTitle
         }
     }
 
@@ -152,6 +152,11 @@ enum MeetingWindowAnalyzer {
         /// First " | " segment of a main-app window is one of these tab names.
         /// Real meeting windows lead with the meeting name instead, which is
         /// never one of these tokens. Lowercase for case-insensitive matching.
+        ///
+        /// This list can never be complete: pinned Teams apps put arbitrary
+        /// names in the same position. It only filters the known pages, so
+        /// MeetingDetector also requires Teams' own call activity before a
+        /// Teams window may help start a session.
         static let mainAppTabNames: Set<String> = [
             "chat",
             "calendar",
@@ -160,7 +165,13 @@ enum MeetingWindowAnalyzer {
             "calls",
             "files",
             "onedrive",
-            "apps"
+            "apps",
+            "search",
+            "people",
+            "copilot",
+            "communities",
+            "notifications",
+            "settings"
         ]
     }
 

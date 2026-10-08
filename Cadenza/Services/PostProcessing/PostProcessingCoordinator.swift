@@ -103,7 +103,8 @@ enum SummaryLanguageResolver {
 struct TranscriptionExecutionRequest: Sendable, Equatable {
     let audioURL: URL
     let provider: AIProvider
-    let apiKey: String
+    /// How a cloud provider is reached; nil for on-device transcription.
+    let access: AIProviderAccess?
     let model: String?
     let language: String?
 }
@@ -138,7 +139,7 @@ typealias PostProcessingSummaryTaskFactory = @MainActor @Sendable (
 
 struct PostProcessingTranscriptionDependencies {
     let defaults: UserDefaults
-    let apiKey: @MainActor @Sendable (AIProvider) -> String?
+    let providerAccess: @MainActor @Sendable (AIProvider) -> AIProviderAccess?
     let supportsAppleLanguage: @MainActor @Sendable (String) async -> Bool
     let localWhisperState: @MainActor @Sendable () -> LocalWhisperState
 
@@ -146,8 +147,8 @@ struct PostProcessingTranscriptionDependencies {
     static func live(defaults: UserDefaults = .standard) -> Self {
         Self(
             defaults: defaults,
-            apiKey: { provider in
-                KeychainManager.shared.readOnlyAPIKey(for: provider)
+            providerAccess: { provider in
+                AICredentialResolver.shared.access(for: provider)
             },
             supportsAppleLanguage: { language in
                 await AppleSpeechFactory.supportsLanguage(language)
@@ -1163,7 +1164,7 @@ final class PostProcessingCoordinator {
                 let request = TranscriptionExecutionRequest(
                     audioURL: audioURL,
                     provider: selection.provider,
-                    apiKey: selection.apiKey ?? "",
+                    access: selection.access,
                     model: selection.model,
                     language: configuration.language
                 )
@@ -1178,7 +1179,7 @@ final class PostProcessingCoordinator {
                             try await transcriptionManager.transcribeFile(
                                 at: request.audioURL,
                                 provider: request.provider,
-                                apiKey: request.apiKey,
+                                access: request.access ?? .direct(request.provider, apiKey: ""),
                                 language: request.language,
                                 model: request.model
                             )
@@ -1654,7 +1655,7 @@ final class PostProcessingCoordinator {
                   summary.chapters.isEmpty, summary.generationMetadata?.sourceChanged != true else { return }
 
             let provider = AIProvider(rawValue: summary.provider) ?? .apple
-            if provider.requiresAPIKey, (manualSummaryGenerator.apiKeyResolver(provider) ?? "").isEmpty { return }
+            if provider.requiresAPIKey, manualSummaryGenerator.accessResolver(provider) == nil { return }
 
             let summaryID = summary.id
             let source = SummarySourceVersion.capture(transcript, mappings: detail.speakerMappings)
@@ -1792,7 +1793,7 @@ final class PostProcessingCoordinator {
             let request = TranscriptionExecutionRequest(
                 audioURL: url,
                 provider: selection.provider,
-                apiKey: selection.apiKey ?? "",
+                access: selection.access,
                 model: selection.model,
                 language: configuration.language
             )
@@ -1802,7 +1803,7 @@ final class PostProcessingCoordinator {
                 _ = try await manualTranscriptionManager.transcribeFile(
                     at: request.audioURL,
                     provider: request.provider,
-                    apiKey: request.apiKey,
+                    access: request.access ?? .direct(request.provider, apiKey: ""),
                     language: request.language,
                     model: request.model
                 )
@@ -2227,7 +2228,7 @@ final class PostProcessingCoordinator {
     func resolveConfiguredTranscriptionProvider() async throws -> ConfiguredPostProcessingTranscription {
         let language = transcriptionDependencies.defaults.string(forKey: "transcriptionLanguage") ?? "auto"
         let resolver = TranscriptionProviderResolver(
-            apiKey: transcriptionDependencies.apiKey,
+            providerAccess: transcriptionDependencies.providerAccess,
             supportsAppleLanguage: transcriptionDependencies.supportsAppleLanguage,
             localWhisperState: transcriptionDependencies.localWhisperState
         )

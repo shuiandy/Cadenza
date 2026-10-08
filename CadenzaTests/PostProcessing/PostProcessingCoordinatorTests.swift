@@ -484,7 +484,7 @@ private final class PostProcessingProviderHarness {
         let spy = PostProcessingProviderSpy()
         let dependencies = PostProcessingTranscriptionDependencies(
             defaults: defaults,
-            apiKey: { provider in spy.apiKey(for: provider) },
+            providerAccess: { provider in spy.apiKey(for: provider).map { .direct(provider, apiKey: $0) } },
             supportsAppleLanguage: { language in
                 if let gate = appleLanguageGate {
                     return await gate.wait()
@@ -710,7 +710,7 @@ struct PostProcessingProviderBoundaryTests {
         #expect(await waitForPostProcessingToFinish(harness.coordinator, recordingID: fixture.recordingID))
         #expect(harness.spy.keyLookups == [.gemini])
         #expect(harness.spy.requests.map(\.provider) == [.gemini])
-        #expect(harness.spy.requests.first?.apiKey == "gemini-key")
+        #expect(harness.spy.requests.first?.access?.directAPIKey == "gemini-key")
         #expect(harness.spy.requests.first?.model == nil)
     }
 
@@ -816,6 +816,90 @@ struct PostProcessingProviderBoundaryTests {
         #expect(detailAfter.transcript?.fullText == detailBefore.transcript?.fullText)
     }
 
+    /// A spent Gemini daily quota fails the job, so nothing downstream may
+    /// treat the recording as empty: the merged audio, its segment files and
+    /// the row all survive, and a retry the next day reaches the same audio.
+    @Test
+    func geminiDailyQuotaFailureKeepsRecordingForALaterRetry() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gemini-quota-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try await makeIsolatedStore(audioRoot: root)
+        let defaultsName = "PostProcessingGeminiQuotaTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: defaultsName))
+        defaults.removePersistentDomain(forName: defaultsName)
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        defaults.set(AIProvider.gemini.rawValue, forKey: "transcriptionProvider")
+        defaults.set("auto", forKey: "transcriptionLanguage")
+        let coordinator = PostProcessingCoordinator(
+            store: store,
+            transcriptionDependencies: PostProcessingTranscriptionDependencies(
+                defaults: defaults,
+                providerAccess: { provider in
+                    provider == .gemini ? .direct(.gemini, apiKey: "fictional-gemini-key") : nil
+                },
+                supportsAppleLanguage: { _ in true },
+                localWhisperState: { LocalWhisperState(model: "base", isAvailable: true) }
+            ),
+            recordingsDirectory: root
+        )
+        var attempts: [URL] = []
+        coordinator.transcriptionRunnerOverride = { _, request in
+            attempts.append(request.audioURL)
+            throw TranscriptionError.dailyQuotaReached(.gemini)
+        }
+
+        let recordingID = UUID()
+        let segmentsDirectory = root
+            .appendingPathComponent("segments", isDirectory: true)
+            .appendingPathComponent(recordingID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: segmentsDirectory, withIntermediateDirectories: true)
+        let segmentURL = segmentsDirectory.appendingPathComponent("segment-000.m4a")
+        let segmentBytes = Data("fictional-segment".utf8)
+        try segmentBytes.write(to: segmentURL)
+        let audioURL = root.appendingPathComponent("\(recordingID.uuidString).m4a")
+        let audioBytes = Data("fictional-merged-audio".utf8)
+        try audioBytes.write(to: audioURL)
+        #expect(await store.createRecording(
+            id: recordingID,
+            title: "Quarterly planning",
+            startDate: Date(),
+            segmentsDirURL: segmentsDirectory
+        ))
+        #expect(await store.finalizeRecording(id: recordingID, duration: 2 * 3_600, audioFileURL: audioURL) == .saved)
+
+        await coordinator.startPostProcessing(
+            recordingID: recordingID,
+            audioURL: audioURL,
+            meetingTitle: nil
+        )
+        #expect(await waitForPostProcessingToFinish(coordinator, recordingID: recordingID))
+
+        #expect(attempts.count == 1)
+        let quotaMessage = TranscriptionError.dailyQuotaReached(.gemini).localizedDescription
+        #expect(coordinator.postProcessingError?.contains(quotaMessage) == true)
+        #expect(try Data(contentsOf: audioURL) == audioBytes)
+        #expect(try Data(contentsOf: segmentURL) == segmentBytes)
+        let detail = try #require(await store.fetchRecordingDetail(recordingID: recordingID))
+        #expect(detail.transcript == nil)
+        #expect(await store.fetchTrashedRecordings().isEmpty)
+
+        // The next launch sweeps short untranscribed recordings; a failed
+        // long one must stay put for the retry.
+        await store.trashShortUntranscribedRecordings(minDuration: 30)
+        #expect(await store.fetchTrashedRecordings().isEmpty)
+
+        coordinator.transcriptionRunnerOverride = { _, request in
+            attempts.append(request.audioURL)
+        }
+        await coordinator.retryTranscription(recordingID: recordingID)
+
+        #expect(attempts.count == 2)
+        #expect(attempts.last?.resolvingSymlinksInPath().path == audioURL.resolvingSymlinksInPath().path)
+        #expect(try Data(contentsOf: audioURL) == audioBytes)
+    }
+
     @Test
     func availableWhisperModelIsPassedToRunner() async throws {
         let harness = try await PostProcessingProviderHarness()
@@ -834,7 +918,7 @@ struct PostProcessingProviderBoundaryTests {
         #expect(await waitForPostProcessingToFinish(harness.coordinator, recordingID: fixture.recordingID))
         #expect(harness.spy.requests.map(\.provider) == [.whisperLocal])
         #expect(harness.spy.requests.first?.model == "small.en")
-        #expect(harness.spy.requests.first?.apiKey.isEmpty == true)
+        #expect(harness.spy.requests.first?.access == nil)
         #expect(harness.spy.keyLookups.isEmpty)
     }
 
@@ -1252,8 +1336,17 @@ struct PostProcessingProviderBoundaryTests {
         ))
         let liveWiring = source[liveStart.lowerBound..<coordinatorStart.lowerBound]
 
-        #expect(liveWiring.contains("KeychainManager.shared.readOnlyAPIKey(for: provider)"))
+        // Keys come from the shared credential resolver, whose Keychain
+        // lookup must stay read-only: deciding where audio goes must not
+        // persist anything.
+        #expect(liveWiring.contains("AICredentialResolver.shared.access(for: provider)"))
         #expect(!liveWiring.contains("KeychainManager.shared.apiKey(for: provider)"))
+        let resolverSource = try String(
+            contentsOf: repoRoot.appendingPathComponent("Cadenza/Services/AI/AICredentialResolver.swift"),
+            encoding: .utf8
+        )
+        #expect(resolverSource.contains("localKey: { KeychainManager.shared.readOnlyAPIKey(for: $0) }"))
+        #expect(!resolverSource.contains("KeychainManager.shared.apiKey(for:"))
     }
 
     @Test
@@ -2800,7 +2893,7 @@ struct PostProcessingMigrationGateTests {
         defaults.set("en", forKey: "transcriptionLanguage")
         let transcriptionDependencies = PostProcessingTranscriptionDependencies(
             defaults: defaults,
-            apiKey: { _ in nil },
+            providerAccess: { _ in nil },
             supportsAppleLanguage: { _ in true },
             localWhisperState: { LocalWhisperState(model: "base", isAvailable: true) }
         )

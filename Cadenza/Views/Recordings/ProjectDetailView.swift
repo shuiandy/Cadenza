@@ -757,18 +757,12 @@ struct FolderDetailView: View {
     private func resolveAIService() -> (AIServiceProtocol, String)? {
         guard appState.startupPolicy.allowsContentGeneration else { return nil }
         guard let provider = AIProvider(rawValue: defaultProviderRaw) else { return nil }
-        let apiKey: String
-        if provider.requiresAPIKey {
-            guard let key = KeychainManager.shared.apiKey(for: provider), !key.isEmpty else { return nil }
-            apiKey = key
-        } else {
-            apiKey = ""
-        }
+        guard let access = AICredentialResolver.shared.access(for: provider) else { return nil }
         let modelID = provider.chatModel
         return RecordingsContentGenerationBoundary.constructService(
             startupPolicy: appState.startupPolicy
         ) {
-            provider.makeChatService(apiKey: apiKey).map { ($0, modelID) }
+            provider.makeChatService(access: access).map { ($0, modelID) }
         }
     }
 

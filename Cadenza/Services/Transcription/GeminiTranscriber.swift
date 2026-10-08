@@ -29,16 +29,24 @@ final class GeminiTranscriber: @unchecked Sendable {
     var onProgress: (@Sendable (Int, Int) -> Void)?
 
     init(
-        apiKey: String,
+        access: AIProviderAccess,
         model: String,
         transport: HardenedAITransport = .transcription
     ) {
         self.model = model
         self.apiClient = GeminiTranscriptionAPIClient(
-            apiKey: apiKey,
+            access: access,
             model: model,
             transport: transport
         )
+    }
+
+    convenience init(
+        apiKey: String,
+        model: String,
+        transport: HardenedAITransport = .transcription
+    ) {
+        self.init(access: .direct(.gemini, apiKey: apiKey), model: model, transport: transport)
     }
 
     /// gemini-3.5-transcribe and friends speak the Interactions API and return
@@ -281,6 +289,13 @@ final class GeminiTranscriber: @unchecked Sendable {
                 )
                 return result
             } catch {
+                if let limit = ProviderRateLimit(error: error),
+                   let quotaError = limit.transcriptionError(provider: .gemini) {
+                    geminiTranscriberLog.error(
+                        "429 is \(String(describing: limit), privacy: .public); not retrying"
+                    )
+                    throw quotaError
+                }
                 lastError = error
                 if Self.isRetryableRequestError(error), attempt < Self.maxRetries - 1 {
                     continue
@@ -296,8 +311,11 @@ final class GeminiTranscriber: @unchecked Sendable {
         if case AITransportError.requestFailed = error {
             return true
         }
-        if case AIServiceError.httpError(let statusCode, _) = error {
-            return statusCode == 429 || (500...599).contains(statusCode)
+        if case AIServiceError.httpError(let statusCode, let body) = error {
+            if statusCode == 429 {
+                return ProviderRateLimit(body: body) == .shortWindow
+            }
+            return (500...599).contains(statusCode)
         }
         return false
     }
@@ -376,6 +394,9 @@ final class GeminiTranscriber: @unchecked Sendable {
                     return (chunk.index, chunk.start, chunk.duration, result)
                 }
             }
+            // The first failure, a spent daily quota included, leaves this
+            // loop; the group then cancels the remaining chunks, and those
+            // still waiting for an API permit never send a request.
             var results: [(Int, TimeInterval, TimeInterval, TranscriptResult)] = []
             for try await item in group {
                 results.append(item)
@@ -407,7 +428,7 @@ final class GeminiTranscriber: @unchecked Sendable {
                         startTime: segStart,
                         endTime: segEnd,
                         text: seg.text,
-                        // spk_1 in chunk 0 and spk_1 in chunk 1 are unrelated
+                        // spk:0 in chunk 0 and spk:0 in chunk 1 are unrelated
                         // request-local labels. Keeping them would invent a
                         // recording-wide identity out of nothing, so split
                         // audio defers to the later local diarization pass —

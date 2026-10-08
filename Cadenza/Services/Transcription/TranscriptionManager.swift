@@ -4,7 +4,7 @@ import Foundation
 /// realtime attempt. Exact late cleanup intentionally targets that instance.
 typealias RealtimeTranscriptionServiceFactory = @MainActor @Sendable (
     _ provider: AIProvider,
-    _ apiKey: String,
+    _ access: AIProviderAccess?,
     _ model: String?,
     _ language: String?
 ) throws -> any TranscriptionService
@@ -133,6 +133,28 @@ final class TranscriptionManager {
         recordingStartTime: Date? = nil,
         attemptID: RealtimeAttemptID = RealtimeAttemptID()
     ) async throws {
+        try await startRealtime(
+            provider: provider,
+            access: .direct(provider, apiKey: apiKey),
+            model: model,
+            language: language,
+            preserveSegments: preserveSegments,
+            recordingStartTime: recordingStartTime,
+            attemptID: attemptID
+        )
+    }
+
+    /// Starts a realtime session with a cloud provider reached through
+    /// `access` (nil for on-device providers).
+    func startRealtime(
+        provider: AIProvider,
+        access: AIProviderAccess?,
+        model: String? = nil,
+        language: String? = nil,
+        preserveSegments: Bool = false,
+        recordingStartTime: Date? = nil,
+        attemptID: RealtimeAttemptID = RealtimeAttemptID()
+    ) async throws {
         try Task.checkCancellation()
         if let busyPhase = realtimeBusyPhase {
             throw RealtimeSessionBusyError(phase: busyPhase)
@@ -144,7 +166,7 @@ final class TranscriptionManager {
         let lang = language == "auto" ? nil : language
         let service = try makeRealtimeService(
             provider: provider,
-            apiKey: apiKey,
+            access: access,
             model: model,
             language: lang
         )
@@ -335,19 +357,24 @@ final class TranscriptionManager {
 
     private func makeRealtimeService(
         provider: AIProvider,
-        apiKey: String,
+        access: AIProviderAccess?,
         model: String?,
         language: String?
     ) throws -> any TranscriptionService {
         if let realtimeServiceFactory {
-            return try realtimeServiceFactory(provider, apiKey, model, language)
+            return try realtimeServiceFactory(provider, access, model, language)
         }
 
         switch provider {
-        case .openai:
-            return RealtimeTranscriber(apiKey: apiKey, model: model ?? provider.realtimeModel)
-        case .gemini:
-            return GeminiRealtimeTranscriber(apiKey: apiKey, model: model ?? provider.realtimeModel)
+        case .openai, .gemini:
+            guard let access else {
+                throw TranscriptionError.apiError("No API key for \(provider.displayName)")
+            }
+            let providerAccess = AIProviderAccess(provider: provider, route: access.route)
+            let model = model ?? provider.realtimeModel
+            return provider == .openai
+                ? RealtimeTranscriber(access: providerAccess, model: model)
+                : GeminiRealtimeTranscriber(access: providerAccess, model: model)
         case .claude, .minimax:
             throw TranscriptionError.notSupported("\(provider.displayName) does not support real-time audio transcription")
         case .apple:
@@ -654,6 +681,12 @@ final class TranscriptionManager {
     // MARK: - Post-recording Transcription
 
     func transcribeFile(at url: URL, provider: AIProvider, apiKey: String, language: String? = nil, model: String? = nil) async throws -> TranscriptResult {
+        try await transcribeFile(at: url, provider: provider, access: .direct(provider, apiKey: apiKey), language: language, model: model)
+    }
+
+    /// Transcribes a file with a cloud provider reached through `access` (the
+    /// device's key or the Cadenza account's vault key), or on the device.
+    func transcribeFile(at url: URL, provider: AIProvider, access: AIProviderAccess, language: String? = nil, model: String? = nil) async throws -> TranscriptResult {
         isTranscribing = true
         defer { isTranscribing = false }
 
@@ -674,7 +707,7 @@ final class TranscriptionManager {
 
         // File I/O and network run off MainActor via nonisolated static method.
         let result = try await Self.runTranscription(
-            at: url, provider: provider, apiKey: apiKey,
+            at: url, provider: provider, access: access,
             language: lang, model: resolvedModel, onProgress: progressCb
         )
 
@@ -685,20 +718,20 @@ final class TranscriptionManager {
 
     /// Nonisolated transcription dispatch — file I/O and network run off MainActor.
     private nonisolated static func runTranscription(
-        at url: URL, provider: AIProvider, apiKey: String,
+        at url: URL, provider: AIProvider, access: AIProviderAccess,
         language: String?, model: String,
         onProgress: (@Sendable (Int, Int) -> Void)?
     ) async throws -> TranscriptResult {
         switch provider {
         case .openai:
             let transcriber = WhisperTranscriber(
-                apiKey: apiKey,
+                access: AIProviderAccess(provider: .openai, route: access.route),
                 model: model,
                 onProgress: onProgress
             )
             return try await transcriber.transcribeFile(at: url, language: language)
         case .gemini:
-            let transcriber = GeminiTranscriber(apiKey: apiKey, model: model)
+            let transcriber = GeminiTranscriber(access: AIProviderAccess(provider: .gemini, route: access.route), model: model)
             transcriber.onProgress = onProgress
             return try await transcriber.transcribeFile(at: url, language: language)
         case .apple:

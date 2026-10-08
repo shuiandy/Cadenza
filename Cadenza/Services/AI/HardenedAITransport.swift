@@ -336,16 +336,26 @@ struct HardenedAITransport: Sendable {
         self.clock = clock
     }
 
+    /// - Parameter viaCadenza: The request goes to the Cadenza server, which
+    ///   calls the provider with the account's vault key. The provider's own
+    ///   host pinning does not apply to it, and errors the server raised
+    ///   itself arrive as `CadenzaAIAccessError`.
     func data(
         for request: URLRequest,
         provider: AIProvider? = nil,
-        redacting secrets: [String] = []
+        redacting secrets: [String] = [],
+        viaCadenza: Bool = false
     ) async throws -> Data {
         let trace = AIGenerationObservation.trace
         let traceID = trace?.begin(request: request, provider: provider)
         defer { if let traceID { trace?.finish(traceID) } }
         do {
-            let data = try await performData(for: request, provider: provider, redacting: secrets)
+            let data = try await performData(
+                for: request,
+                pinnedProvider: viaCadenza ? nil : provider,
+                redacting: secrets,
+                viaCadenza: viaCadenza
+            )
             if let traceID { trace?.observe(data: data, requestID: traceID) }
             return data
         } catch is CancellationError {
@@ -354,6 +364,8 @@ struct HardenedAITransport: Sendable {
             throw error
         } catch let error as AIServiceError {
             throw error
+        } catch let error as CadenzaAIAccessError {
+            throw error
         } catch {
             throw AITransportError.requestFailed
         }
@@ -361,8 +373,9 @@ struct HardenedAITransport: Sendable {
 
     private func performData(
         for request: URLRequest,
-        provider: AIProvider?,
-        redacting secrets: [String]
+        pinnedProvider provider: AIProvider?,
+        redacting secrets: [String],
+        viaCadenza: Bool
     ) async throws -> Data {
         let expectedOrigin = try validatedOrigin(
             for: request,
@@ -378,12 +391,7 @@ struct HardenedAITransport: Sendable {
                 maximumByteCount: limits.maxErrorResponseBytes,
                 truncateAtLimit: true
             )
-            let message = Self.sanitizedErrorMessage(
-                data: errorData,
-                statusCode: http.statusCode,
-                secrets: secrets
-            )
-            throw AIServiceError.httpError(http.statusCode, message)
+            throw Self.failure(for: http, errorData: errorData, secrets: secrets, viaCadenza: viaCadenza)
         }
 
         if http.expectedContentLength > Int64(limits.maxBufferedResponseBytes) {
@@ -399,9 +407,11 @@ struct HardenedAITransport: Sendable {
     func serverSentEvents(
         for request: URLRequest,
         provider: AIProvider? = nil,
-        redacting secrets: [String] = []
+        redacting secrets: [String] = [],
+        viaCadenza: Bool = false
     ) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
+        let pinnedProvider = viaCadenza ? nil : provider
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 let trace = AIGenerationObservation.trace
                 let traceID = trace?.begin(request: request, provider: provider)
@@ -409,7 +419,7 @@ struct HardenedAITransport: Sendable {
                 do {
                     let expectedOrigin = try validatedOrigin(
                         for: request,
-                        provider: provider,
+                        provider: pinnedProvider,
                         secrets: secrets
                     )
                     var parser = BoundedSSEParser(limits: limits, clock: clock)
@@ -417,7 +427,7 @@ struct HardenedAITransport: Sendable {
                     let http = try validatedResponse(
                         response,
                         expectedOrigin: expectedOrigin,
-                        provider: provider
+                        provider: pinnedProvider
                     )
 
                     if !(200..<300).contains(http.statusCode) {
@@ -426,12 +436,7 @@ struct HardenedAITransport: Sendable {
                             maximumByteCount: limits.maxErrorResponseBytes,
                             truncateAtLimit: true
                         )
-                        let message = Self.sanitizedErrorMessage(
-                            data: errorData,
-                            statusCode: http.statusCode,
-                            secrets: secrets
-                        )
-                        throw AIServiceError.httpError(http.statusCode, message)
+                        throw Self.failure(for: http, errorData: errorData, secrets: secrets, viaCadenza: viaCadenza)
                     }
                     if http.expectedContentLength > Int64(limits.maxSSETotalBytes) {
                         throw AITransportError.streamResponseTooLarge
@@ -456,6 +461,8 @@ struct HardenedAITransport: Sendable {
                 } catch let error as AITransportError {
                     continuation.finish(throwing: error)
                 } catch let error as AIServiceError {
+                    continuation.finish(throwing: error)
+                } catch let error as CadenzaAIAccessError {
                     continuation.finish(throwing: error)
                 } catch {
                     continuation.finish(throwing: AITransportError.requestFailed)
@@ -514,6 +521,39 @@ struct HardenedAITransport: Sendable {
             result.append(byte)
         }
         return result
+    }
+
+    /// The error for a non-2xx response. Through Cadenza, the server's own
+    /// errors carry a code header; a provider 401/403 means the vault key was
+    /// rejected. Either way the account's key status may have changed, so the
+    /// credential resolver is told to refresh it.
+    ///
+    /// A 504 through Cadenza without the proxy's marker never reached the
+    /// proxy: the server's front end gave up waiting. It is the server's
+    /// error, not a provider 5xx, so callers do not retry it into the same
+    /// timeout. A provider's own 504 arrives marked and stays a provider error.
+    private static func failure(
+        for http: HTTPURLResponse,
+        errorData: Data,
+        secrets: [String],
+        viaCadenza: Bool
+    ) -> Error {
+        if viaCadenza, let code = http.value(forHTTPHeaderField: CadenzaAIAccessError.headerName), !code.isEmpty {
+            let error = CadenzaAIAccessError(code: code)
+            if error.invalidatesKeyStatus {
+                NotificationCenter.default.post(name: .cadenzaAIAccessDidFail, object: nil)
+            }
+            return error
+        }
+        if viaCadenza, http.statusCode == 504,
+           http.value(forHTTPHeaderField: CadenzaAIAccessError.proxyHeaderName) == nil {
+            return CadenzaAIAccessError(code: CadenzaAIAccessError.gatewayTimeoutCode)
+        }
+        if viaCadenza, http.statusCode == 401 || http.statusCode == 403 {
+            NotificationCenter.default.post(name: .cadenzaAIAccessDidFail, object: nil)
+        }
+        let message = sanitizedErrorMessage(data: errorData, statusCode: http.statusCode, secrets: secrets)
+        return AIServiceError.httpError(http.statusCode, message)
     }
 
     private static func sanitizedErrorMessage(

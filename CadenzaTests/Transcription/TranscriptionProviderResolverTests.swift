@@ -18,9 +18,9 @@ private final class TranscriptionProviderResolverSpy {
 
     func makeResolver() -> TranscriptionProviderResolver {
         TranscriptionProviderResolver(
-            apiKey: { [self] provider in
+            providerAccess: { [self] provider in
                 keyLookups.append(provider)
-                return keys[provider]
+                return keys[provider].map { .direct(provider, apiKey: $0) }
             },
             supportsAppleLanguage: { [self] language in
                 appleLanguageLookups.append(language)

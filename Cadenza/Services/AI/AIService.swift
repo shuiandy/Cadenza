@@ -3,11 +3,16 @@ import Foundation
 extension AIProvider {
     /// Create the chat/summary service for this provider. Returns nil for transcription-only providers.
     func makeChatService(apiKey: String) -> AIServiceProtocol? {
+        makeChatService(access: .direct(self, apiKey: apiKey))
+    }
+
+    /// Create the chat/summary service that reaches the provider through
+    /// `access`: the device's own key, or the Cadenza account's vault key.
+    func makeChatService(access: AIProviderAccess) -> AIServiceProtocol? {
         switch self {
-        case .openai: OpenAIService(apiKey: apiKey)
-        case .minimax: OpenAIService(apiKey: apiKey, baseURL: AIProvider.minimax.chatBaseURL, provider: .minimax)
-        case .claude: ClaudeService(apiKey: apiKey)
-        case .gemini: GeminiService(apiKey: apiKey)
+        case .openai, .minimax: OpenAIService(access: AIProviderAccess(provider: self, route: access.route))
+        case .claude: ClaudeService(access: AIProviderAccess(provider: self, route: access.route))
+        case .gemini: GeminiService(access: AIProviderAccess(provider: self, route: access.route))
         case .apple:
             AppleFoundationModelFactory.makeService()
         case .whisperLocal:

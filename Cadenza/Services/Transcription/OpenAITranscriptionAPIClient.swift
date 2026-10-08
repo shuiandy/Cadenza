@@ -5,25 +5,28 @@ protocol OpenAITranscriptionRequesting: Sendable {
 }
 
 struct OpenAITranscriptionAPIClient: OpenAITranscriptionRequesting, Sendable {
-    private static let endpoint = URL(
-        string: "https://api.openai.com/v1/audio/transcriptions"
-    )!
-
-    private let apiKey: String
+    private let access: AIProviderAccess
     private let transport: HardenedAITransport
+
+    init(
+        access: AIProviderAccess,
+        transport: HardenedAITransport = .transcription
+    ) {
+        self.access = AIProviderAccess(provider: .openai, route: access.route)
+        self.transport = transport
+    }
 
     init(
         apiKey: String,
         transport: HardenedAITransport = .transcription
     ) {
-        self.apiKey = apiKey
-        self.transport = transport
+        self.init(access: .direct(.openai, apiKey: apiKey), transport: transport)
     }
 
     func transcribe(multipartBody: Data, boundary: String) async throws -> Data {
-        var request = URLRequest(url: Self.endpoint)
+        var request = URLRequest(url: try access.url(path: "/v1/audio/transcriptions"))
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        access.authorize(&request)
         request.setValue(
             "multipart/form-data; boundary=\(boundary)",
             forHTTPHeaderField: "Content-Type"
@@ -35,7 +38,8 @@ struct OpenAITranscriptionAPIClient: OpenAITranscriptionRequesting, Sendable {
             return try await transport.data(
                 for: request,
                 provider: .openai,
-                redacting: [apiKey]
+                redacting: access.secrets,
+                viaCadenza: access.viaCadenza
             )
         } catch {
             if Task.isCancelled {

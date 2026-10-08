@@ -84,11 +84,54 @@ struct GeminiTranscribeInteractionTests {
         #expect(GeminiTranscribeInteraction.duration("later") == nil)
     }
 
-    @Test func wireSpeakerLabelsBecomeCadenzaLabels() {
-        #expect(GeminiTranscribeInteraction.speakerLabel("spk_1") == "Speaker 1")
-        #expect(GeminiTranscribeInteraction.speakerLabel("spk_12") == "Speaker 12")
-        #expect(GeminiTranscribeInteraction.speakerLabel("speaker_2") == "Speaker 2")
-        #expect(GeminiTranscribeInteraction.speakerLabel("Andy") == "Andy")
+    // The live wire form is `spk:N`, zero-based in order of first appearance.
+    // Everywhere else in Cadenza "Speaker 1" is the first voice and there is
+    // no "Speaker 0" (SpeakerLabelFormatter rejects it), so the index shifts.
+    @Test(arguments: [
+        ("spk:0", "Speaker 1"),
+        ("spk:1", "Speaker 2"),
+        ("spk:12", "Speaker 13"),
+        ("SPK:0", "Speaker 1"),
+        (" spk:2 ", "Speaker 3"),
+    ])
+    func liveColonLabelsBecomeOneBasedSpeakers(_ raw: String, _ expected: String) {
+        #expect(GeminiTranscribeInteraction.speakerLabel(raw) == expected)
+    }
+
+    // The underscore and bare forms keep working and read the same index as
+    // the colon form, so a separator change cannot renumber a speaker.
+    @Test(arguments: [
+        ("spk_0", "Speaker 1"),
+        ("spk_1", "Speaker 2"),
+        ("spk_12", "Speaker 13"),
+        ("spk3", "Speaker 4"),
+        ("speaker_0", "Speaker 1"),
+        ("speaker:2", "Speaker 3"),
+    ])
+    func underscoreAndBareLabelsReadTheSameIndex(_ raw: String, _ expected: String) {
+        #expect(GeminiTranscribeInteraction.speakerLabel(raw) == expected)
+    }
+
+    // Anything that is not a recognised wire label is left alone: a name, an
+    // already one-based display label (which must not be shifted again), and
+    // malformed or hostile indices, including one that would overflow `+ 1`.
+    @Test(arguments: [
+        "Marisol",
+        "Speaker 3",
+        "spk:",
+        "spk:a",
+        "spk:-1",
+        "spk::1",
+        "spk:1.5",
+        "spk:٣",
+        "spk:9223372036854775807",
+        "spk:99999999999999999999",
+    ])
+    func unrecognisedLabelsPassThroughUntouched(_ raw: String) {
+        #expect(GeminiTranscribeInteraction.speakerLabel(raw) == raw)
+    }
+
+    @Test func blankOrMissingLabelsMeanNoSpeaker() {
         #expect(GeminiTranscribeInteraction.speakerLabel("  ") == nil)
         #expect(GeminiTranscribeInteraction.speakerLabel(nil) == nil)
     }
@@ -214,7 +257,8 @@ struct GeminiTranscribeInteractionTests {
     private func response(
         outputKey: String = "output_text",
         startKey: String = "start_offset",
-        endKey: String = "end_offset"
+        endKey: String = "end_offset",
+        speakers: (first: String, second: String) = ("spk:0", "spk:1")
     ) -> Data {
         let json: [String: Any] = [
             "id": "int_1",
@@ -228,9 +272,9 @@ struct GeminiTranscribeInteractionTests {
                             "type": "text",
                             "text": "Hello there Hi",
                             "annotations": [
-                                ["type": "word_info", "text": "Hello", startKey: "0s", endKey: "0.5s", "speaker": "spk_1"],
-                                ["type": "word_info", "text": "there", startKey: "0.5s", endKey: "1s", "speaker": "spk_1"],
-                                ["type": "word_info", "text": "Hi", startKey: "1.1s", endKey: "1.5s", "speaker": "spk_2"],
+                                ["type": "word_info", "text": "Hello", startKey: "0s", endKey: "0.5s", "speaker": speakers.first],
+                                ["type": "word_info", "text": "there", startKey: "0.5s", endKey: "1s", "speaker": speakers.first],
+                                ["type": "word_info", "text": "Hi", startKey: "1.1s", endKey: "1.5s", "speaker": speakers.second],
                             ]
                         ]
                     ]
@@ -263,6 +307,53 @@ struct GeminiTranscribeInteractionTests {
         #expect(camel.segments.count == snake.segments.count)
         #expect(camel.segments[0].speaker == snake.segments[0].speaker)
         #expect(camel.segments[1].startTime == snake.segments[1].startTime)
+    }
+
+    // Labels as the live API sends them: colon-separated and zero-based, with
+    // a third voice joining and the first coming back. A returning speaker
+    // must keep their number, and every label must be one the display layer
+    // understands; a raw "spk:0" or a "Speaker 0" would fall through
+    // SpeakerLabelFormatter untranslated.
+    @Test func liveColonLabelledResponseYieldsStableOneBasedSpeakers() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "id": "int_2",
+            "status": "completed",
+            "output_text": "Morning all. Hi Hello Let's start.",
+            "steps": [["type": "model_output", "content": [[
+                "type": "text",
+                "text": "Morning all. Hi Hello Let's start.",
+                "annotations": [
+                    ["type": "word_info", "text": "Morning", "start_offset": "0s", "end_offset": "0.4s", "speaker": "spk:0"],
+                    ["type": "word_info", "text": "all.", "start_offset": "0.4s", "end_offset": "0.8s", "speaker": "spk:0"],
+                    ["type": "word_info", "text": "Hi", "start_offset": "1s", "end_offset": "1.3s", "speaker": "spk:1"],
+                    ["type": "word_info", "text": "Hello", "start_offset": "1.5s", "end_offset": "1.9s", "speaker": "spk:2"],
+                    ["type": "word_info", "text": "Let's", "start_offset": "2.1s", "end_offset": "2.4s", "speaker": "spk:0"],
+                    ["type": "word_info", "text": "start.", "start_offset": "2.4s", "end_offset": "2.8s", "speaker": "spk:0"],
+                ]
+            ]]]]
+        ])
+
+        let parsed = try GeminiTranscribeInteraction.parse(data, language: "en", audioDuration: 3)
+
+        #expect(parsed.quality.isDegraded == false)
+        #expect(parsed.quality.speakerLabelledWordCount == 6)
+        #expect(parsed.result.segments.map(\.text) == ["Morning all.", "Hi", "Hello", "Let's start."])
+        #expect(parsed.result.segments.map(\.speaker) == ["Speaker 1", "Speaker 2", "Speaker 3", "Speaker 1"])
+        #expect(parsed.result.segments[3].startTime == 2.1)
+        for speaker in parsed.result.segments.compactMap(\.speaker) {
+            #expect(SpeakerLabelFormatter.speakerIndex(forRawLabel: speaker) != nil)
+        }
+    }
+
+    @Test func underscoreLabelledResponseParsesLikeTheColonForm() throws {
+        let colon = try GeminiTranscribeInteraction.parse(response(), language: "en").result
+        let underscore = try GeminiTranscribeInteraction.parse(
+            response(speakers: ("spk_0", "spk_1")),
+            language: "en"
+        ).result
+
+        #expect(underscore.segments.map(\.speaker) == colon.segments.map(\.speaker))
+        #expect(underscore.segments.map(\.speaker) == ["Speaker 1", "Speaker 2"])
     }
 
     // One segment here because the transcript is one sentence, not because a
@@ -388,9 +479,9 @@ struct GeminiTranscribeInteractionTests {
             "steps": [["type": "model_output", "content": [[
                 "type": "text",
                 "annotations": [
-                    ["type": "word_info", "text": "Hello", "speaker": "spk_1"],
-                    ["type": "word_info", "text": "there", "speaker": "spk_1"],
-                    ["type": "word_info", "text": "Hi", "speaker": "spk_2"],
+                    ["type": "word_info", "text": "Hello", "speaker": "spk:0"],
+                    ["type": "word_info", "text": "there", "speaker": "spk:0"],
+                    ["type": "word_info", "text": "Hi", "speaker": "spk:1"],
                 ]
             ]]]]
         ])

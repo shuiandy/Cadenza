@@ -125,7 +125,9 @@ Transcription only helps if the recording actually started. Cadenza can decide t
   several signals — per-process microphone use, an active calendar event, meeting-window
   structure, system microphone state — and, if automatic recording is enabled, starts
   only when the combined score clears a threshold. Debounce, a grace period, and a minimum
-  active hold keep it from flapping on transient signals.
+  active hold keep it from flapping on transient signals. Google Meet in a browser is
+  detected from the browser's own microphone use plus a Meet tab or a Meet calendar
+  event (verified with Chrome).
 - **System audio + microphone.** Captured through a Core Audio process tap, mixed into a
   single track. The microphone is optional and off by default.
 - **Segmented writes.** After the recording has been durably registered, audio lands on disk

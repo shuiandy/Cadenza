@@ -186,8 +186,104 @@ struct GeminiTranscriptionAPIClientTests {
         )
     }
 
+    // MARK: - 429 quota windows
+
+    // Classification lives in ProviderRateLimitTests; these drive the real
+    // transcriber over a stubbed network. The body's shape follows the
+    // Interactions API's 429; the limit, tier and link are invented.
+    private static let interactionsDailyQuotaBody = #"{"error":{"message":"Rate limit exceeded for model gemini-3.5-transcribe (limit: 40 requests per day on Tier 7). Please retry in 3h07m12s or upgrade your tier at https://example.invalid/rate-limit.","code":"too_many_requests"}}"#
+
+    @Test func dailyQuotaSendsOneRequestAndSurfacesOnlyTheLocalizedMessage() async throws {
+        GeminiTranscriptionTestURLProtocol.reset(
+            mode: .status(429, Self.interactionsDailyQuotaBody)
+        )
+        let audioURL = try await makeAudioFixture(seconds: 1)
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let audioBefore = try Data(contentsOf: audioURL)
+        let transcriber = GeminiTranscriber(
+            apiKey: "fictional-gemini-key",
+            model: "gemini-3.5-transcribe",
+            transport: makeTransport(maxErrorResponseBytes: 2_048)
+        )
+
+        let error = await transcriptionError {
+            _ = try await transcriber.transcribeFile(at: audioURL, language: nil)
+        }
+
+        guard case .dailyQuotaReached(.gemini)? = error else {
+            Issue.record("expected the daily quota error, got \(String(describing: error))")
+            return
+        }
+        #expect(GeminiTranscriptionTestURLProtocol.totalRequestCount == 1)
+        let message = try #require(error?.errorDescription)
+        for providerText in ["per day", "Tier 7", "3h07m12s", "example.invalid", "too_many_requests"] {
+            #expect(!message.contains(providerText))
+        }
+        #expect(try Data(contentsOf: audioURL) == audioBefore)
+    }
+
+    /// Recordings over ten minutes go out as five-minute chunks, several at a
+    /// time. A spent daily cap must stop every chunk after its one request
+    /// instead of three apiece, and leave the source file untouched.
+    @Test func chunkedDailyQuotaNeverRetriesAChunk() async throws {
+        GeminiTranscriptionTestURLProtocol.reset(
+            mode: .status(429, Self.interactionsDailyQuotaBody)
+        )
+        let audioURL = try await makeAudioFixture(seconds: 601)
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let audioBefore = try Data(contentsOf: audioURL)
+        let transcriber = GeminiTranscriber(
+            apiKey: "fictional-gemini-key",
+            model: "gemini-3.5-transcribe",
+            transport: makeTransport(
+                maxBufferedResponseBytes: 1_024,
+                maxErrorResponseBytes: 2_048
+            )
+        )
+
+        let error = await transcriptionError {
+            _ = try await transcriber.transcribeFile(at: audioURL, language: nil)
+        }
+
+        guard case .dailyQuotaReached(.gemini)? = error else {
+            Issue.record("expected the daily quota error, got \(String(describing: error))")
+            return
+        }
+        let bodies = GeminiTranscriptionTestURLProtocol.requestBodies
+        // 601 s splits into three chunks; each may have sent once.
+        #expect((1...3).contains(bodies.count))
+        #expect(Set(bodies).count == bodies.count, "a chunk was retried")
+        #expect(try Data(contentsOf: audioURL) == audioBefore)
+    }
+
+    private func makeAudioFixture(seconds: Int) async throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gemini-quota-\(UUID().uuidString).m4a")
+        try await AudioTestFixtures.writeM4A(
+            tracks: [AudioTestFixtures.sine(count: seconds * 16_000, amplitude: 0.05)],
+            to: url
+        )
+        return url
+    }
+
+    private func transcriptionError(
+        _ operation: () async throws -> Void
+    ) async -> TranscriptionError? {
+        do {
+            try await operation()
+            Issue.record("expected transcription to fail")
+            return nil
+        } catch let error as TranscriptionError {
+            return error
+        } catch {
+            Issue.record("expected a TranscriptionError, got \(type(of: error))")
+            return nil
+        }
+    }
+
     private func makeTransport(
-        maxBufferedResponseBytes: Int = 1_024
+        maxBufferedResponseBytes: Int = 1_024,
+        maxErrorResponseBytes: Int = 128
     ) -> HardenedAITransport {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [GeminiTranscriptionTestURLProtocol.self]
@@ -195,7 +291,7 @@ struct GeminiTranscriptionAPIClientTests {
             configuration: configuration,
             limits: AITransportLimits(
                 maxBufferedResponseBytes: maxBufferedResponseBytes,
-                maxErrorResponseBytes: 128,
+                maxErrorResponseBytes: maxErrorResponseBytes,
                 maxSSETotalBytes: 1,
                 maxSSELineBytes: 1,
                 maxSSEFrameCount: 1,
@@ -212,6 +308,7 @@ private final class GeminiTranscriptionTestURLProtocol: URLProtocol {
         case oversized
         case errorEcho
         case originMismatch
+        case status(Int, String)
     }
 
     struct CapturedRequest: Sendable {
@@ -227,6 +324,7 @@ private final class GeminiTranscriptionTestURLProtocol: URLProtocol {
         var mode: Mode = .success
         var capturedRequest: CapturedRequest?
         var requestCountByHost: [String: Int] = [:]
+        var requestBodies: [Data] = []
     }
 
     private static let state = Mutex(State())
@@ -247,6 +345,11 @@ private final class GeminiTranscriptionTestURLProtocol: URLProtocol {
         state.withLock { $0.requestCountByHost[host, default: 0] }
     }
 
+    /// Every request body, in arrival order. A body seen twice is a retry.
+    static var requestBodies: [Data] {
+        state.withLock { $0.requestBodies }
+    }
+
     override class func canInit(with request: URLRequest) -> Bool {
         true
     }
@@ -261,6 +364,7 @@ private final class GeminiTranscriptionTestURLProtocol: URLProtocol {
             return
         }
 
+        let body = requestBodyData()
         let mode = Self.state.withLock { state -> Mode in
             state.requestCountByHost[host, default: 0] += 1
             state.capturedRequest = CapturedRequest(
@@ -268,9 +372,10 @@ private final class GeminiTranscriptionTestURLProtocol: URLProtocol {
                 apiKey: request.value(forHTTPHeaderField: "x-goog-api-key"),
                 contentType: request.value(forHTTPHeaderField: "Content-Type"),
                 method: request.httpMethod,
-                body: requestBodyData(),
+                body: body,
                 timeoutInterval: request.timeoutInterval
             )
+            state.requestBodies.append(body ?? Data())
             return state.mode
         }
 
@@ -306,6 +411,8 @@ private final class GeminiTranscriptionTestURLProtocol: URLProtocol {
                 body: Data("{}".utf8),
                 url: URL(string: "https://different-origin.example/response")!
             )
+        case .status(let statusCode, let body):
+            send(statusCode: statusCode, body: Data(body.utf8), url: url)
         }
     }
 

@@ -8,20 +8,23 @@ final class OpenAIService: AIServiceProtocol {
     }
 
     let provider: AIProvider
-    private let apiKey: String
-    private let baseURL: String
+    private let access: AIProviderAccess
     private let transport: HardenedAITransport
 
-    init(
+    /// OpenAI and MiniMax share the chat completions surface; `access.provider`
+    /// picks the origin and the Cadenza proxy path.
+    init(access: AIProviderAccess, transport: HardenedAITransport = .shared) {
+        self.access = access
+        self.provider = access.provider
+        self.transport = transport
+    }
+
+    convenience init(
         apiKey: String,
-        baseURL: String = "https://api.openai.com/v1/chat/completions",
         provider: AIProvider = .openai,
         transport: HardenedAITransport = .shared
     ) {
-        self.apiKey = apiKey
-        self.baseURL = baseURL
-        self.provider = provider
-        self.transport = transport
+        self.init(access: .direct(provider, apiKey: apiKey), transport: transport)
     }
 
     func summarize(transcript: String, language: String, model: String?, jobTitle: String? = nil, meetingType: MeetingType? = nil, meetingTitle: String? = nil, knownTags: [String], detailLevel: SummaryDetailLevel = SummaryDetailLevel.load()) async throws -> SummaryResult {
@@ -242,23 +245,24 @@ final class OpenAIService: AIServiceProtocol {
     }
 
     private func postJSON(_ body: [String: Any]) async throws -> Data {
-        var request = URLRequest(url: try endpointURL())
+        var request = URLRequest(url: try access.url(path: "/v1/chat/completions"))
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        access.authorize(&request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         return try await transport.data(
             for: request,
             provider: provider,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
     }
 
     private func postStreamJSON(_ body: [String: Any]) throws -> AsyncThrowingStream<String, Error> {
-        var request = URLRequest(url: try endpointURL())
+        var request = URLRequest(url: try access.url(path: "/v1/chat/completions"))
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        access.authorize(&request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -266,14 +270,8 @@ final class OpenAIService: AIServiceProtocol {
         return transport.serverSentEvents(
             for: request,
             provider: provider,
-            redacting: [apiKey]
+            redacting: access.secrets,
+            viaCadenza: access.viaCadenza
         )
-    }
-
-    private func endpointURL() throws -> URL {
-        guard let url = URL(string: baseURL) else {
-            throw AITransportError.unsafeEndpoint
-        }
-        return url
     }
 }

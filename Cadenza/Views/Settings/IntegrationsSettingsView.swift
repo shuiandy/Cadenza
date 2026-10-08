@@ -47,8 +47,18 @@ struct IntegrationsSettingsView: View {
                 CadenzaAccountInline()
             }
 
-            SettingsSectionCard(title: "AI Providers") {
+            SettingsSectionCard(
+                title: "AI Providers",
+                subtitle: appState.aiCredentials.usesCloudKeys
+                    ? "Keys are stored in your Cadenza account and used on all your devices."
+                    : nil
+            ) {
                 VStack(spacing: 0) {
+                    ForEach(appState.aiCredentials.localKeysToOffer(), id: \.provider) { offer in
+                        LocalKeyUploadOffer(provider: offer.provider, suffix: offer.suffix, refreshToken: $apiKeyRefreshToken)
+                        Divider()
+                            .padding(.leading, 38)
+                    }
                     let cloudProviders = AIProvider.allCases.filter { $0.requiresAPIKey }
                     ForEach(Array(cloudProviders.enumerated()), id: \.element) { index, provider in
                         ProviderRow(provider: provider,
@@ -878,6 +888,75 @@ private struct DefaultProviderSwitch {
     let to: AIProvider
 }
 
+/// Offers to store a key this Mac already has in the signed-in account, so
+/// the account's other devices can use it. The Mac keeps its copy.
+private struct LocalKeyUploadOffer: View {
+    let provider: AIProvider
+    let suffix: String
+    @Binding var refreshToken: Int
+
+    @Environment(AppState.self) private var appState
+    @Environment(\.uiScale) private var uiScale: CGFloat
+    @State private var isUploading = false
+    @State private var error: String?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "icloud.and.arrow.up")
+                .font(.cadenza(16, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Use this Mac's \(provider.displayName) key (ending \(suffix)) on all your devices?")
+                    .font(.cadenza(13, weight: .medium, scale: uiScale))
+                Text("It will be stored in your Cadenza account. The copy on this Mac is kept.")
+                    .font(.cadenza(12, scale: uiScale))
+                    .foregroundStyle(.secondary)
+                if let error {
+                    Text(error)
+                        .font(.cadenza(.caption, scale: uiScale))
+                        .foregroundStyle(.red)
+                }
+            }
+            Spacer(minLength: 8)
+            Button("Not now") {
+                appState.aiCredentials.declineUpload(for: provider)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isUploading)
+            Button {
+                upload()
+            } label: {
+                if isUploading {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Upload")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(isUploading || !appState.startupPolicy.externalAccessEnabled)
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func upload() {
+        guard appState.startupPolicy.externalAccessEnabled else { return }
+        error = nil
+        isUploading = true
+        Task {
+            do {
+                try await appState.aiCredentials.uploadLocalKey(for: provider)
+                refreshToken += 1
+            } catch {
+                self.error = ProviderRow.accountKeyMessage(for: error, saving: true)
+            }
+            isUploading = false
+        }
+    }
+}
+
 private struct ProviderRow: View {
     private static let apiKeyMutationCoordinator = AIProviderAPIKeyMutationCoordinator()
 
@@ -904,8 +983,21 @@ private struct ProviderRow: View {
     @State private var mutationError: String?
     @State private var apiKeyPresentation: AIProviderAPIKeyPresentationState
 
+    private var credentials: AICredentialResolver { appState.aiCredentials }
+
+    /// Signed in to an account that serves cloud keys: this row shows and
+    /// edits the account's key, not the one in this Mac's Keychain.
+    private var usesCloudKeys: Bool { credentials.usesCloudKeys }
+
+    private var cloudKey: CloudAIKey? { credentials.cloudKeys[provider] }
+
     private var isConnected: Bool {
-        apiKeyPresentation.isConnected
+        usesCloudKeys ? cloudKey != nil : apiKeyPresentation.isConnected
+    }
+
+    /// The account's key was rejected by the provider and needs replacing.
+    private var needsReplacement: Bool {
+        usesCloudKeys && cloudKey?.isValid == false
     }
 
     init(
@@ -931,9 +1023,7 @@ private struct ProviderRow: View {
                 HStack(spacing: 12) {
                     rowHeader
                     Spacer(minLength: 8)
-                    if isConnected, let existingKey = apiKeyPresentation.currentAPIKey {
-                        apiKeyPill(existingKey)
-                    }
+                    keyChip
                     rowAction
                 }
                 .padding(.vertical, 10)
@@ -944,10 +1034,8 @@ private struct ProviderRow: View {
                         Spacer(minLength: 8)
                         rowAction
                     }
-                    if isConnected, let existingKey = apiKeyPresentation.currentAPIKey {
-                        apiKeyPill(existingKey)
-                            .padding(.leading, 40)
-                    }
+                    keyChip
+                        .padding(.leading, 40)
                 }
                 .padding(.vertical, 10)
             }
@@ -961,7 +1049,7 @@ private struct ProviderRow: View {
             }
 
             // Inline connect form
-            if isExpanded && !isConnected {
+            if isExpanded && (!isConnected || needsReplacement) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("API Key")
                         .font(.cadenza(.caption, weight: .bold, scale: uiScale))
@@ -1001,6 +1089,25 @@ private struct ProviderRow: View {
                             Task {
                                 guard appState.startupPolicy.externalAccessEnabled else {
                                     isValidating = false
+                                    return
+                                }
+                                if usesCloudKeys {
+                                    // The server checks the key with the provider
+                                    // before storing it.
+                                    do {
+                                        try await credentials.storeCloudKey(trimmed, for: provider)
+                                        isValidating = false
+                                        apiKey = ""
+                                        showKey = false
+                                        validationError = nil
+                                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                                            isExpanded = false
+                                            refreshToken += 1
+                                        }
+                                    } catch {
+                                        isValidating = false
+                                        validationError = Self.accountKeyMessage(for: error, saving: true)
+                                    }
                                     return
                                 }
                                 let credentialValidator = AIProviderCredentialValidator()
@@ -1099,10 +1206,7 @@ private struct ProviderRow: View {
                 HStack(spacing: 6) {
                     Text(provider.displayName)
                         .font(.cadenza(14, weight: .medium, scale: uiScale))
-                    SettingsStatusCapsule(
-                        kind: isConnected ? .connected : .disconnected,
-                        label: isConnected ? "Connected" : "Not Connected"
-                    )
+                    SettingsStatusCapsule(kind: statusKind, label: statusLabel)
                 }
                 Text(
                     isDefaultProvider
@@ -1115,14 +1219,48 @@ private struct ProviderRow: View {
         }
     }
 
+    private var statusKind: SettingsStatusCapsule.Kind {
+        if needsReplacement { return .attention }
+        return isConnected ? .connected : .disconnected
+    }
+
+    private var statusLabel: LocalizedStringKey {
+        if needsReplacement { return "Key rejected" }
+        return isConnected ? "Connected" : "Not Connected"
+    }
+
+    @ViewBuilder
+    private var keyChip: some View {
+        if usesCloudKeys {
+            if let cloudKey {
+                accountKeyPill(cloudKey)
+            }
+        } else if isConnected, let existingKey = apiKeyPresentation.currentAPIKey {
+            apiKeyPill(existingKey)
+        }
+    }
+
     @ViewBuilder
     private var rowAction: some View {
         if isConnected {
-            Button("Disconnect", role: .destructive) {
-                disconnect()
+            HStack(spacing: 6) {
+                if needsReplacement {
+                    Button("Replace") {
+                        guard appState.startupPolicy.externalAccessEnabled else { return }
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                            isExpanded = true
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(!appState.startupPolicy.externalAccessEnabled)
+                }
+                Button("Disconnect", role: .destructive) {
+                    disconnect()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
         } else {
             Button("Connect") {
                 guard appState.startupPolicy.externalAccessEnabled else { return }
@@ -1138,6 +1276,45 @@ private struct ProviderRow: View {
 
     private var isDefaultProvider: Bool {
         UserDefaults.standard.string(forKey: "defaultAIProvider") == provider.rawValue
+    }
+
+    /// The account's key never reaches this Mac, so there is nothing to
+    /// reveal or copy; the suffix identifies which key is stored.
+    private func accountKeyPill(_ key: CloudAIKey) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "icloud")
+                .font(.cadenza(10, scale: uiScale))
+                .foregroundStyle(.secondary)
+            Text(verbatim: "\u{2022}\u{2022}\u{2022}\u{2022}" + key.keySuffix)
+                .font(.cadenza(11, design: .monospaced, scale: uiScale))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 9)
+        .frame(minHeight: 22)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .help(Text("Stored in your Cadenza account"))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text("Stored in your Cadenza account"))
+    }
+
+    static func accountKeyMessage(for error: Error, saving: Bool) -> String {
+        if case CadenzaAPIError.backend(let envelope, _) = error {
+            switch envelope.code {
+            case "provider_key_invalid":
+                return String(localized: "The provider rejected this key.")
+            case "provider_unreachable":
+                return String(localized: "Couldn't reach the provider to check this key. Try again.")
+            default:
+                break
+            }
+        }
+        if let apiError = error as? CadenzaAPIError, apiError == .notSignedIn || apiError == .unauthorized {
+            return String(localized: "Sign in to your Cadenza account again, then try again.")
+        }
+        return saving
+            ? String(localized: "The key couldn't be saved to your Cadenza account. Try again.")
+            : String(localized: "The key couldn't be removed from your Cadenza account. Try again.")
     }
 
     @ViewBuilder
@@ -1187,6 +1364,28 @@ private struct ProviderRow: View {
         let currentDefault = UserDefaults.standard
             .string(forKey: "defaultAIProvider")
             .flatMap(AIProvider.init(rawValue:))
+
+        if usesCloudKeys {
+            Task {
+                do {
+                    try await credentials.deleteCloudKey(for: provider)
+                } catch {
+                    mutationError = Self.accountKeyMessage(for: error, saving: false)
+                    return
+                }
+                if currentDefault == provider {
+                    let replacement = AIProvider.allCases.first {
+                        $0 != provider && $0.requiresAPIKey && credentials.hasUsableKey(for: $0)
+                    } ?? .apple
+                    UserDefaults.standard.set(replacement.rawValue, forKey: "defaultAIProvider")
+                    defaultProviderSwitch = DefaultProviderSwitch(from: provider, to: replacement)
+                }
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                    refreshToken += 1
+                }
+            }
+            return
+        }
 
         let mutationResult = Self.apiKeyMutationCoordinator.disconnect(
             provider: provider,

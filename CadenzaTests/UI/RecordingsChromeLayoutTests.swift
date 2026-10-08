@@ -266,7 +266,7 @@ struct RecordingsChromeLayoutTests {
             in: project,
             scope: "RecordingsContentGenerationBoundary.constructService(",
             guardText: "startupPolicy: appState.startupPolicy",
-            sink: "provider.makeChatService(apiKey: apiKey)"
+            sink: "provider.makeChatService(access: access)"
         ))
 
         #expect(detail.contains(".disabled(!appState.startupPolicy.allowsContentGeneration)"))
@@ -280,7 +280,7 @@ struct RecordingsChromeLayoutTests {
             in: detail,
             scope: "RecordingsContentGenerationBoundary.constructService(",
             guardText: "startupPolicy: appState.startupPolicy",
-            sink: "createAIService(provider: provider, apiKey: apiKey)"
+            sink: "createAIService(provider: provider, access: access)"
         ))
         #expect(textPrecedes(
             in: detail,
@@ -648,6 +648,41 @@ struct RecordingsChromeLayoutTests {
         #expect(
             mainWindow.contains(".navigationBarBackButtonHidden(true)"),
             "The existing toolbar close button should remain the only detail close affordance."
+        )
+    }
+
+    @Test func processingErrorsAlertAboveThePushedRecordingDetail() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let mainWindow = try String(
+            contentsOf: repoRoot.appendingPathComponent("Cadenza/Views/Main/MainWindow.swift"),
+            encoding: .utf8
+        )
+        let tabContent = try String(
+            contentsOf: repoRoot.appendingPathComponent("Cadenza/Views/TabBar/TabContentView.swift"),
+            encoding: .utf8
+        )
+
+        // ContentView is the NavigationStack root; a pushed recording detail
+        // covers it, so an alert attached there stays hidden while a retry
+        // started from the detail fails.
+        #expect(
+            mainWindow.contains(".alert(\"Processing Error\""),
+            "Post-processing errors should alert at window level, like recording errors."
+        )
+        #expect(
+            !tabContent.contains(".alert(\"Processing Error\""),
+            "The NavigationStack root cannot present over a pushed recording detail."
+        )
+        // MainWindow.body attaches its alerts to MainWorkspaceView, which owns
+        // the detail NavigationStack and is declared after it.
+        let processingAlert = try #require(mainWindow.range(of: ".alert(\"Processing Error\""))
+        let workspace = try #require(mainWindow.range(of: "private struct MainWorkspaceView"))
+        #expect(
+            processingAlert.lowerBound < workspace.lowerBound,
+            "The alert belongs in MainWindow.body, outside the workspace that pushes recording details."
         )
     }
 

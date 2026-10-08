@@ -572,10 +572,10 @@ private final class RecordingEngineBoundarySpy {
 
         return RecordingEngineDependencies(
             defaults: defaults,
-            apiKey: { [weak self] provider in
+            providerAccess: { [weak self] provider in
                 guard let self else { return nil }
                 self.keyLookups.append(provider)
-                return self.keys[provider]
+                return self.keys[provider].map { .direct(provider, apiKey: $0) }
             },
             supportsAppleLanguage: { [weak self] language in
                 guard let self else { return false }
@@ -802,7 +802,7 @@ struct RecordingEngineProviderBoundaryTests {
             store: store,
             transcriptionDependencies: PostProcessingTranscriptionDependencies(
                 defaults: isolated.defaults,
-                apiKey: { _ in nil },
+                providerAccess: { _ in nil },
                 supportsAppleLanguage: { _ in true },
                 localWhisperState: { LocalWhisperState(model: "base", isAvailable: true) }
             )
@@ -2116,7 +2116,7 @@ struct RecordingEngineProviderBoundaryTests {
             store: store,
             transcriptionDependencies: PostProcessingTranscriptionDependencies(
                 defaults: isolated.defaults,
-                apiKey: { _ in nil },
+                providerAccess: { _ in nil },
                 supportsAppleLanguage: { _ in true },
                 localWhisperState: { LocalWhisperState(model: "base", isAvailable: true) }
             ),
