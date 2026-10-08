@@ -334,17 +334,32 @@ enum GeminiTranscribeInteraction {
         return TimeInterval(trimmed)
     }
 
-    /// `spk_1` is the wire label; "Speaker 1" is what the rest of Cadenza
-    /// (SpeakerDiarizer, SpeakerLabelFormatter, speaker memory) speaks.
+    /// The wire label is `spk:0`, `spk:1`, …: zero-based, numbered in order
+    /// of first appearance. The rest of Cadenza (SpeakerDiarizer,
+    /// SpeakerLabelFormatter, speaker memory) speaks one-based "Speaker N"
+    /// with "Speaker 1" as the first voice, and has no "Speaker 0", so the
+    /// index is shifted by one. The underscore and bare forms (`spk_0`,
+    /// `spk0`, `speaker_0`) are read with the same zero-based index, so a
+    /// separator change on the wire cannot renumber anyone. Anything else is
+    /// passed through rather than guessed at.
     static func speakerLabel(_ raw: String?) -> String? {
         guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let lowered = trimmed.lowercased()
-        for prefix in ["spk_", "spk", "speaker_"] where lowered.hasPrefix(prefix) {
-            let index = lowered.dropFirst(prefix.count)
-            if !index.isEmpty, index.allSatisfy(\.isNumber) {
-                return "Speaker \(Int(index) ?? 0)"
+        for prefix in ["speaker", "spk"] where lowered.hasPrefix(prefix) {
+            var digits = lowered.dropFirst(prefix.count)
+            if digits.first == ":" || digits.first == "_" {
+                digits = digits.dropFirst()
+            }
+            // ASCII digits only, so a sign or a non-decimal numeral cannot
+            // slip through, and Int.max is refused so `+ 1` cannot trap on
+            // hostile input.
+            if !digits.isEmpty,
+               digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+               let index = Int(digits),
+               index < Int.max {
+                return "Speaker \(index + 1)"
             }
         }
         return trimmed

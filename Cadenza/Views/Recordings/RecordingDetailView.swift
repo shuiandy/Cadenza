@@ -159,15 +159,11 @@ enum SpeakerTimelineBuilder {
         if speakerKey == unknownSpeakerKey {
             return unknownSpeakerColorIndex
         }
-        let uppercased = speakerKey.uppercased()
-        if uppercased.hasPrefix("SPEAKER_"),
-           let value = Int(uppercased.dropFirst(8)) {
-            return value % speakerTimelineColorPalette.count
-        }
-        if uppercased.count == 1,
-           let scalar = uppercased.unicodeScalars.first,
-           scalar >= "A" && scalar <= "Z" {
-            return Int(scalar.value - Unicode.Scalar("A").value) % speakerTimelineColorPalette.count
+        // Read through the same formatter as the displayed name, so labels
+        // that read as the same "Speaker N" (SPEAKER_00, A, spk:0, Speaker 1)
+        // share a color.
+        if let index = SpeakerLabelFormatter.speakerIndex(forRawLabel: speakerKey) {
+            return (index - 1) % speakerTimelineColorPalette.count
         }
         let stableHash = speakerKey.unicodeScalars.reduce(UInt64(14_695_981_039_346_656_037)) { result, scalar in
             (result ^ UInt64(scalar.value)) &* 1_099_511_628_211
@@ -447,7 +443,7 @@ struct RecordingDetailView: View {
             }
         } message: {
             if let label = speakerMappingLabel {
-                Text("Create a speaker for \"\(label)\" and assign it.")
+                Text("Create a speaker for \"\(Self.friendlySpeakerLabel(label))\" and assign it.")
             }
         }
     }
@@ -3518,7 +3514,7 @@ struct RecordingDetailView: View {
                     appState.removeSpeakerMapping(recordingID: recordingID, rawLabel: rawLabel)
                     // removeSpeakerMapping triggers refreshRecordings → onChange → loadDetail
                 } label: {
-                    Label("Reset to \"\(rawLabel)\"", systemImage: "arrow.uturn.backward")
+                    Label("Reset to \"\(Self.friendlySpeakerLabel(rawLabel))\"", systemImage: "arrow.uturn.backward")
                 }
                 Divider()
             }

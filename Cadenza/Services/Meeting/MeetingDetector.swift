@@ -17,6 +17,11 @@ import os
 /// 4. **Window heuristic** (+1): the meeting app has windows consistent with an active call
 ///
 /// A meeting is considered active when the combined confidence score ≥ 3.
+///
+/// Google Meet runs in a browser, so it has no app to score. A Meet session
+/// starts from the browser's audio helper holding the microphone plus a Meet
+/// window or Meet event (`BrowserMeetingEvaluator`) and ends when that helper
+/// releases the microphone.
 @Observable @MainActor
 final class MeetingDetector {
     /// Lifecycle / transition logging. macOS 26 drops default-level NSLog from
@@ -142,6 +147,7 @@ final class MeetingDetector {
     @ObservationIgnored private var systemMicActivityOverride: Bool?
     @ObservationIgnored private var windowSnapshotOverride: [CGWindowEnumerator.EnumeratedWindow]?
     @ObservationIgnored private var workspaceMeetingAppsOverride: [DetectedMeetingApp]?
+    @ObservationIgnored private var workspaceBrowsersOverride: [RunningBrowser]?
 #endif
 
     // Callbacks set once during setup; never need to drive view invalidations.
@@ -214,6 +220,32 @@ final class MeetingDetector {
     /// cooldown only delays such a restart).
     @ObservationIgnored private var userStopHold: UserStopHold?
 
+    /// Browser that owns the current `.googleMeet` session. Browsers are never
+    /// added to `runningMeetingApps`: one is almost always running, which would
+    /// make every calendar event and stray window count as meeting evidence.
+    @ObservationIgnored private var browserMeetingSession: BrowserMeetingFamily?
+    @ObservationIgnored private var browserStartRecheckWorkItem: DispatchWorkItem?
+    /// When the current wait for Meet evidence began. Kept until the browser
+    /// releases the microphone (or detection resets), so the recheck pace
+    /// follows how long the microphone has been held.
+    @ObservationIgnored private var browserStartRecheckWaitingSince: Date?
+
+    /// Meet opens the microphone before it titles the tab, so the audio event
+    /// that should start a session often sees no Meet window yet. Measured
+    /// 2026-10-02: 1.4 to 2.4 s on the preview page, about 40 s when `/new`
+    /// joins the call directly, and never while the Meet tab is not the
+    /// window's active tab. While a browser holds the microphone without Meet
+    /// evidence, re-evaluate until the evidence appears or the microphone is
+    /// released: every 2 s for the first two minutes, then every 5 s.
+    private static let browserStartRecheckFastInterval: TimeInterval = 2
+    private static let browserStartRecheckSlowInterval: TimeInterval = 5
+    private static let browserStartRecheckFastWindow: TimeInterval = 120
+
+    /// Meet opens the microphone on its preview page, before the user joins.
+    /// A shorter Meet session is treated as an abandoned preview, so its end
+    /// does not retire the calendar event the real call still needs.
+    private static let googleMeetCalendarConclusionMinimumDuration: TimeInterval = 60
+
     // MARK: - Types
 
     struct DetectedMeetingApp: Identifiable, Sendable {
@@ -251,6 +283,13 @@ final class MeetingDetector {
         /// The session's calendar event, retired if the app later reports the
         /// call over (the session itself was reset by the stop).
         let calendarOccurrence: CalendarOccurrence?
+        /// The browser hosting a `.googleMeet` session.
+        let browser: BrowserMeetingFamily?
+    }
+
+    struct RunningBrowser: Sendable {
+        let family: BrowserMeetingFamily
+        let pid: pid_t
     }
 
     // MARK: - Init
@@ -283,6 +322,9 @@ final class MeetingDetector {
 
     /// Get the bundle ID of the active meeting app (for audio targeting).
     var activeBundleID: String? {
+        if sessionState.currentApp == .googleMeet {
+            return browserMeetingSession?.bundleID
+        }
         if let active = sessionState.currentApp ?? activeMeetingApp {
             return runningMeetingApps.first(where: { $0.app == active })?.id
         }
@@ -366,6 +408,8 @@ final class MeetingDetector {
         detectedConfirmationWorkItem = nil
         teamsAdHocStartConfirmationWorkItem?.cancel()
         teamsAdHocStartConfirmationWorkItem = nil
+        resetBrowserStartRecheck()
+        browserMeetingSession = nil
         graceTimer?.cancel()
         graceTimer = nil
         audioListener.stopListening()
@@ -482,6 +526,10 @@ final class MeetingDetector {
         if let idx = runningMeetingApps.firstIndex(where: { $0.id == bundleID }) {
             let terminated = runningMeetingApps.remove(at: idx)
             NSLog("[MeetingDetector] event: meeting app terminated %@ (%@)", terminated.name, terminated.id)
+            onMeetingAppTerminated?(bundleID)
+            scheduleEventEvaluation()
+        } else if browserMeetingSession?.bundleID == bundleID {
+            NSLog("[MeetingDetector] event: Google Meet browser terminated (%@)", bundleID)
             onMeetingAppTerminated?(bundleID)
             scheduleEventEvaluation()
         }
@@ -618,7 +666,11 @@ final class MeetingDetector {
         // per-process mic check plus the Teams continuity / startup / output
         // probes, instead of re-walking the process list once per query.
         let audioUsage = audioQuery.audioUsage(
-            bundleIDs: Array(Set(allAudioBundleIDs).union(teamsHelperBundleIDs))
+            bundleIDs: Array(
+                Set(allAudioBundleIDs)
+                    .union(teamsHelperBundleIDs)
+                    .union(BrowserMeetingFamily.allAudioBundleIDs)
+            )
         )
 
         let systemMicActive: Bool
@@ -649,10 +701,23 @@ final class MeetingDetector {
             teamsWindowsNeedCallActivity: teamsWindowsNeedCallActivity
         )
 
+        // Google Meet runs in a browser. Its evidence is the browser's audio
+        // helper holding the microphone plus a Meet window or Meet event, and
+        // a Meet session's "own mic input" is that helper's input.
+        let browserOwnsSession = sessionState.currentApp == .googleMeet
+        let browserObservations = browserMeetingObservations(windows: windows, usage: audioUsage)
+        let calendarIsGoogleMeet = hasCalendarMatch(for: .googleMeet)
+        let browserStartCandidate = BrowserMeetingEvaluator.startingBrowser(
+            browserObservations,
+            calendarIsGoogleMeet: calendarIsGoogleMeet
+        )
+        let browserSessionInputActive = browserMeetingSession?.isMicrophoneInputActive(in: audioUsage) ?? false
+        let nativeProcessUsingMicInput = allAudioBundleIDs.contains { audioUsage[$0]?.isRunningInput == true }
+
         let signals = MeetingSignals(
             meetingAppRunning: !runningMeetingApps.isEmpty,
             meetingApp: activeMeetingApp,
-            processUsingMicInput: allAudioBundleIDs.contains { audioUsage[$0]?.isRunningInput == true },
+            processUsingMicInput: browserOwnsSession ? browserSessionInputActive : nativeProcessUsingMicInput,
             systemMicActive: systemMicActive,
             calendarMatch: hasCalendarMatch(),
             hasMeetingWindow: windowEvidence.hasMeetingWindow
@@ -819,8 +884,17 @@ final class MeetingDetector {
         // let a sticky Teams `modulehost` helper pin the meeting active forever
         // whenever the keepalive candidate was false for a non-expiry reason
         // (e.g. the calendar explicitly named a different app), defeating the cap.
-        let score: Int
-        if teamsCallAssertionReleased {
+        var score: Int
+        if browserOwnsSession {
+            // Native keep-alives and the minimum-active hold do not apply: a
+            // detected Meet candidate must keep its start evidence through the
+            // debounce, and an active one lasts exactly while its browser holds
+            // the microphone (muting keeps it; leaving releases it).
+            let browserEvidence = sessionState.isDetected
+                ? browserStartCandidate == browserMeetingSession
+                : browserSessionInputActive
+            score = browserEvidence ? scoreThreshold : 0
+        } else if teamsCallAssertionReleased {
             score = 0
         } else if processMicReleased {
             score = 0
@@ -833,6 +907,29 @@ final class MeetingDetector {
             score = effectiveRawScore
         }
 
+        // A browser holding the microphone also sets `systemMicActive`, which
+        // native heuristics read as their own call (system mic plus a call-shaped
+        // window, Teams' calendar and ad-hoc fallbacks). Before a session starts,
+        // a native app needs app-owned evidence (its own mic input or Teams' call
+        // assertion) to outrank a browser that explains the microphone, or a
+        // background Zoom or Teams would claim the Meet call and the recording
+        // would tap the wrong app.
+        var browserStartActive = false
+        let nativeAppOwnedEvidence = nativeProcessUsingMicInput || teamsCallAssertionState == .active
+        let browserExplainsMicrophone = browserStartCandidate != nil
+            || browserObservations.contains { !$0.browser.audioProcessIsShared }
+        if !browserOwnsSession,
+           sessionState.isIdle || sessionState.isDetected,
+           browserExplainsMicrophone,
+           !nativeAppOwnedEvidence {
+            if sessionState.isIdle, browserStartCandidate != nil {
+                score = scoreThreshold
+                browserStartActive = true
+            } else {
+                score = min(score, scoreThreshold - 1)
+            }
+        }
+
         // Evaluated after every start fallback has floored the score: a user
         // stop outranks all of them.
         let userStopHoldActive = isUserStopHoldActive(
@@ -842,19 +939,24 @@ final class MeetingDetector {
         )
 
         writeMeetingDiagnostic(
-            "eval state=\(stateLabel(sessionState)) activeApp=\(activeMeetingApp?.rawValue ?? "nil") running=\(runningMeetingApps.map(\.id).joined(separator: ",")) score=\(score) raw=\(rawScore) thr=\(scoreThreshold) pmic=\(signals.processUsingMicInput ? 1 : 0) ever=\(perProcessMicEverDetected ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) toutExp=\(teamsHelperOutputKeepAliveExpired ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) calDone=\(isConcludedCalendarMeeting(currentCalendarMeeting) ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) twinHeld=\(windowEvidence.heldTeamsWindow ? 1 : 0) stopHold=\(userStopHoldActive ? 1 : 0) screen=\(screenCaptureAvailable ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) windows=\(diagnosticWindowSummary(windows))"
+            "eval state=\(stateLabel(sessionState)) activeApp=\(activeMeetingApp?.rawValue ?? "nil") running=\(runningMeetingApps.map(\.id).joined(separator: ",")) score=\(score) raw=\(rawScore) thr=\(scoreThreshold) pmic=\(signals.processUsingMicInput ? 1 : 0) ever=\(perProcessMicEverDetected ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) toutExp=\(teamsHelperOutputKeepAliveExpired ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) calDone=\(isConcludedCalendarMeeting(currentCalendarMeeting) ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) twinHeld=\(windowEvidence.heldTeamsWindow ? 1 : 0) stopHold=\(userStopHoldActive ? 1 : 0) screen=\(screenCaptureAvailable ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) bmeet=\(browserMeetingDiagnostic(observations: browserObservations, calendarIsGoogleMeet: calendarIsGoogleMeet, startCandidate: browserStartCandidate)) windows=\(diagnosticWindowSummary(windows))"
         )
 
         let previousState = sessionState
         // Once a session is active, its owning app must remain stable. Merely
         // bringing another meeting app to the foreground cannot transfer the
         // recording (or its app-specific end signals) to that app.
-        let transitionApp = sessionState.currentApp ?? activeMeetingApp
+        let transitionApp: MeetingApp? = browserStartActive
+            ? .googleMeet
+            : (sessionState.currentApp ?? activeMeetingApp)
         let newState: MeetingSessionState
         if userStopHoldActive && (sessionState.isIdle || sessionState.isDetected) {
             newState = .idle
         } else {
             newState = sessionState.next(score: score, app: transitionApp, now: now, threshold: scoreThreshold)
+        }
+        if browserStartActive, newState.currentApp == .googleMeet {
+            browserMeetingSession = browserStartCandidate
         }
 
         // Preserve an assertion observed on the exact idle → detected tick.
@@ -880,7 +982,7 @@ final class MeetingDetector {
 
             log.notice("evaluate: score=\(score, privacy: .public) pmic=\(signals.processUsingMicInput ? 1 : 0, privacy: .public) cont=\(continuityAudioActive ? 1 : 0, privacy: .public) tout=\(teamsHelperOutputActive ? 1 : 0, privacy: .public) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0, privacy: .public) minHold=\(minimumActiveHoldActive ? 1 : 0, privacy: .public) smic=\(signals.systemMicActive ? 1 : 0, privacy: .public) cal=\(signals.calendarMatch ? 1 : 0, privacy: .public) win=\(signals.hasMeetingWindow ? 1 : 0, privacy: .public) state=\(self.stateLabel(previousState), privacy: .public)->\(self.stateLabel(newState), privacy: .public)")
             writeMeetingDiagnostic(
-                "transition \(stateLabel(previousState))->\(stateLabel(newState)) score=\(score) raw=\(rawScore) pmic=\(signals.processUsingMicInput ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0)"
+                "transition \(stateLabel(previousState))->\(stateLabel(newState)) score=\(score) raw=\(rawScore) pmic=\(signals.processUsingMicInput ? 1 : 0) teamsAssert=\(teamsCallAssertionState.rawValue) teamsAssertEver=\(teamsCallAssertionEverDetected ? 1 : 0) teamsAssertReleased=\(teamsCallAssertionReleased ? 1 : 0) cont=\(continuityAudioActive ? 1 : 0) startAudio=\(teamsStartupAudioActive ? 1 : 0) tHelperOut=\(teamsHelperOutputActive ? 1 : 0) toutKeep=\(teamsHelperOutputKeepAliveActive ? 1 : 0) minHold=\(minimumActiveHoldActive ? 1 : 0) tcalKeep=\(teamsCalendarKeepAliveActive ? 1 : 0) tblackout=\(teamsUncorroboratedKeepAliveActive ? 1 : 0) texp=\(teamsUncorroboratedKeepAliveExpired ? 1 : 0) smic=\(signals.systemMicActive ? 1 : 0) smicKeep=\(systemMicKeepAliveActive ? 1 : 0) smicExp=\(systemMicKeepAliveExpired ? 1 : 0) cal=\(signals.calendarMatch ? 1 : 0) win=\(signals.hasMeetingWindow ? 1 : 0) sfallback=\(screenPermissionFallbackActive ? 1 : 0) teamsCalStart=\(teamsCalendarStartFallbackActive ? 1 : 0) teamsAdhocStart=\(teamsAdHocStartFallbackActive ? 1 : 0) bmeet=\(browserMeetingDiagnostic(observations: browserObservations, calendarIsGoogleMeet: calendarIsGoogleMeet, startCandidate: browserStartCandidate))"
             )
 
             maybeLogWindowDump(
@@ -908,6 +1010,14 @@ final class MeetingDetector {
                 activityReason: activityReason
             )
         }
+
+        // A user-stop hold keeps every start path idle, so rechecking during
+        // it cannot start anything.
+        scheduleBrowserStartRecheckIfNeeded(
+            browserMicrophoneActive: !browserObservations.isEmpty,
+            waitingForEvidence: sessionState.isIdle && browserStartCandidate == nil && userStopHold == nil,
+            now: now
+        )
     }
 
     /// Check if a calendar event matching any running meeting app is happening now.
@@ -1045,6 +1155,10 @@ final class MeetingDetector {
     /// hand the active slot to it).
     private func isWithinMinimumActiveHold(now: Date) -> Bool {
         guard sessionState.isActive else { return false }
+        // A Meet session ends exactly when its browser releases the microphone.
+        // Holding an abandoned preview page would keep it past the auto-discard
+        // threshold and save an empty recording.
+        guard sessionState.currentApp != .googleMeet else { return false }
         guard let activeSince else { return false }
         let sessionApp = sessionState.currentApp ?? activeMeetingApp
         guard let sessionApp, runningMeetingApps.contains(where: { $0.app == sessionApp }) else {
@@ -1176,6 +1290,12 @@ final class MeetingDetector {
             return true
         }
 
+        if app == .googleMeet,
+           let meetingURL = meeting.meetingURL?.lowercased(),
+           meetingURL.contains("meet.google.com") {
+            return true
+        }
+
         return false
     }
 
@@ -1303,6 +1423,12 @@ final class MeetingDetector {
         // into a later call attempt.
         if current.isIdle && !previous.isIdle {
             teamsCallAssertionEverDetected = false
+            // Same for the browser's mic latch: a later Teams session never
+            // sets its own mic input, so a leaked latch would read as released.
+            if previous.currentApp == .googleMeet {
+                perProcessMicEverDetected = false
+            }
+            browserMeetingSession = nil
         }
 
         // Adaptive poll: faster during active/ending for quicker stop detection
@@ -1321,7 +1447,8 @@ final class MeetingDetector {
             sessionEndedByApp = false
             captureCalendarMeetingForActiveSession(app: current.currentApp)
             updateActiveMeetingApp()
-            log.notice("meeting STARTED (app=\(self.activeMeetingApp?.displayName ?? "unknown", privacy: .public))")
+            let startedApp = current.currentApp ?? activeMeetingApp
+            log.notice("meeting STARTED (app=\(startedApp?.displayName ?? "unknown", privacy: .public))")
             onMeetingActivityDetected?(activityReason)
         } else if previous.isEnding && current.isActive {
             // ending → active: signals recovered during grace period. Keep the
@@ -1343,7 +1470,8 @@ final class MeetingDetector {
 
         // active/ending → idle: meeting ended
         if (previous.isActive || previous.isEnding) && current.isIdle {
-            if sessionEndedByApp || endingEvent.reason.isAppOwnedCallEnd {
+            if sessionEndedByApp || endingEvent.reason.isAppOwnedCallEnd,
+               appOwnedEndConcludesCalendar(app: previous.currentApp) {
                 concludeSessionCalendarMeeting(app: previous.currentApp)
             }
             sessionEndedByApp = false
@@ -1357,6 +1485,60 @@ final class MeetingDetector {
             log.notice("meeting ENDED")
             onMicrophoneDeactivated?()
         }
+    }
+
+    /// Whether an app-owned call end retires the session's calendar event.
+    /// Meet opens the microphone on its preview page, so a short Meet session
+    /// is usually a preview the user left without joining.
+    private func appOwnedEndConcludesCalendar(app: MeetingApp?, now: Date = Date()) -> Bool {
+        guard app == .googleMeet else { return true }
+        guard let activeSince else { return false }
+        return now.timeIntervalSince(activeSince) >= Self.googleMeetCalendarConclusionMinimumDuration
+    }
+
+    private func scheduleBrowserStartRecheckIfNeeded(
+        browserMicrophoneActive: Bool,
+        waitingForEvidence: Bool,
+        now: Date
+    ) {
+        guard browserMicrophoneActive else {
+            resetBrowserStartRecheck()
+            return
+        }
+        guard waitingForEvidence, browserStartRecheckWorkItem == nil else { return }
+        let waitingSince = browserStartRecheckWaitingSince ?? now
+        browserStartRecheckWaitingSince = waitingSince
+        let delay = Self.browserStartRecheckDelay(afterWaiting: now.timeIntervalSince(waitingSince))
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.browserStartRecheckWorkItem = nil
+            // The chain has no attempt limit, so it must not outlive monitoring.
+            guard self.isMonitoring else { return }
+            self.runBrowserStartRecheck()
+        }
+        browserStartRecheckWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Delay before the next recheck, given how long the browser has held the
+    /// microphone without Meet evidence. Each recheck reads the window list
+    /// and the audio process list, about 5 ms in all (2026-10-02), so the
+    /// slow tail costs about 0.1% of a core while it lasts.
+    static func browserStartRecheckDelay(afterWaiting waited: TimeInterval) -> TimeInterval {
+        waited < browserStartRecheckFastWindow
+            ? browserStartRecheckFastInterval
+            : browserStartRecheckSlowInterval
+    }
+
+    private func runBrowserStartRecheck() {
+        let waited = browserStartRecheckWaitingSince.map { Int(Date().timeIntervalSince($0)) } ?? 0
+        evaluateWithFreshWindowSnapshot(reason: "browserStartRecheck waited=\(waited)s")
+    }
+
+    private func resetBrowserStartRecheck() {
+        browserStartRecheckWorkItem?.cancel()
+        browserStartRecheckWorkItem = nil
+        browserStartRecheckWaitingSince = nil
     }
 
     private func scheduleDetectedConfirmation() {
@@ -1438,6 +1620,8 @@ final class MeetingDetector {
         concludedCalendarOccurrence = nil
         sessionEndedByApp = false
         userStopHold = nil
+        browserMeetingSession = nil
+        resetBrowserStartRecheck()
     }
 
     /// Called when the user stops a recording by hand. While a session is
@@ -1458,7 +1642,8 @@ final class MeetingDetector {
         userStopHold = UserStopHold(
             app: app,
             release: release,
-            calendarOccurrence: sessionCalendarOccurrence(app: app)
+            calendarOccurrence: sessionCalendarOccurrence(app: app),
+            browser: app == .googleMeet ? browserMeetingSession : nil
         )
         writeMeetingDiagnostic("userStopHold armed app=\(app.rawValue) release=\(release.rawValue)")
     }
@@ -1475,7 +1660,11 @@ final class MeetingDetector {
         // The app itself said the call ended, which retires the event exactly
         // as an app-owned end of a recorded session does.
         var endedByApp = false
-        if !runningMeetingApps.contains(where: { $0.app == hold.app }) {
+        // A browser is not tracked as a running meeting app; quitting it
+        // releases its microphone, which the `.processMicReleased` check sees.
+        let holdAppRunning = hold.browser != nil
+            || runningMeetingApps.contains(where: { $0.app == hold.app })
+        if !holdAppRunning {
             released = true
         } else {
             switch hold.release {
@@ -1487,7 +1676,8 @@ final class MeetingDetector {
                 released = endedByApp
                     || (teamsCallAssertionState == .unavailable && score < scoreThreshold)
             case .processMicReleased:
-                endedByApp = !hold.app.audioBundleIdentifiers.contains { audioUsage[$0]?.isRunningInput == true }
+                let audioBundleIDs = hold.browser?.audioBundleIDs ?? hold.app.audioBundleIdentifiers
+                endedByApp = !audioBundleIDs.contains { audioUsage[$0]?.isRunningInput == true }
                 released = endedByApp
             case .signalsClear:
                 released = score < scoreThreshold
@@ -1521,7 +1711,8 @@ final class MeetingDetector {
             let wasFastPoll = sessionState.isActive || sessionState.isEnding
             // An auto-stop can land while the detector is still in its grace
             // period, so the idle transition that concludes the event never runs.
-            if sessionState.isEnding && sessionEndedByApp {
+            if sessionState.isEnding && sessionEndedByApp,
+               appOwnedEndConcludesCalendar(app: sessionState.currentApp) {
                 concludeSessionCalendarMeeting(app: sessionState.currentApp)
             }
             sessionEndedByApp = false
@@ -1536,6 +1727,7 @@ final class MeetingDetector {
             systemMicKeepAliveSince = nil
             activeSince = nil
             activeSessionCalendarMeeting = nil
+            browserMeetingSession = nil
             if wasFastPoll {
                 rescheduleAppPollTimer(fastPoll: false)
             }
@@ -1644,7 +1836,7 @@ final class MeetingDetector {
     /// broke other SCK clients (Microsoft Teams screen sharing) just by Cadenza
     /// being open. Skip work entirely when no meeting app is running.
     private func enumerateAppWindows() -> [CGWindowEnumerator.EnumeratedWindow] {
-        guard !runningMeetingApps.isEmpty else { return [] }
+        guard !runningMeetingApps.isEmpty || isAnyBrowserMicrophoneInputActive() else { return [] }
 #if DEBUG
         if let windowSnapshotOverride {
             return windowSnapshotOverride
@@ -1653,6 +1845,68 @@ final class MeetingDetector {
         return CGWindowEnumerator.snapshotOnScreenWindows(
             screenCaptureAccessAvailable: screenCaptureAccessAvailable()
         )
+    }
+
+    // MARK: - Browser Meetings
+
+    private func currentWorkspaceBrowsers() -> [RunningBrowser] {
+#if DEBUG
+        if let workspaceBrowsersOverride {
+            return workspaceBrowsersOverride
+        }
+#endif
+        return NSWorkspace.shared.runningApplications.compactMap { app in
+            guard let bundleID = app.bundleIdentifier,
+                  let family = BrowserMeetingFamily.family(forBundleID: bundleID) else { return nil }
+            return RunningBrowser(family: family, pid: app.processIdentifier)
+        }
+    }
+
+    /// Browser windows are read only while a browser holds the microphone,
+    /// the only time a Meet window can start a session.
+    private func isAnyBrowserMicrophoneInputActive() -> Bool {
+        audioQuery.audioUsage(bundleIDs: BrowserMeetingFamily.allAudioBundleIDs)
+            .values
+            .contains { $0.isRunningInput }
+    }
+
+    /// One observation per running browser whose audio process holds the
+    /// microphone. Input only counts for a browser that is running: Arc and Dia
+    /// share a helper, and WebKit's GPU process serves every WebKit app.
+    private func browserMeetingObservations(
+        windows: [CGWindowEnumerator.EnumeratedWindow],
+        usage: [String: AudioProcessUsage]
+    ) -> [BrowserMeetingObservation] {
+        let families = BrowserMeetingFamily.all.filter { $0.isMicrophoneInputActive(in: usage) }
+        guard !families.isEmpty else { return [] }
+        let running = currentWorkspaceBrowsers()
+        return families.compactMap { family in
+            let pids = Set(running.filter { $0.family == family }.map(\.pid))
+            guard !pids.isEmpty else { return nil }
+            let hasMeetCallWindow = windows.contains { window in
+                pids.contains(window.pid) && GoogleMeetWindowTitle.isCallPage(window.snapshot.title)
+            }
+            return BrowserMeetingObservation(
+                browser: family,
+                microphoneInputActive: true,
+                hasMeetCallWindow: hasMeetCallWindow
+            )
+        }
+    }
+
+    /// Browser evidence for the diagnostic log. Never includes window titles:
+    /// a browser window shows whatever page the user has open.
+    private func browserMeetingDiagnostic(
+        observations: [BrowserMeetingObservation],
+        calendarIsGoogleMeet: Bool,
+        startCandidate: BrowserMeetingFamily?
+    ) -> String {
+        let browsers = observations
+            .map { "\($0.browser.bundleID):win=\($0.hasMeetCallWindow ? 1 : 0)" }
+            .joined(separator: ",")
+        return "[\(browsers)] mcal=\(calendarIsGoogleMeet ? 1 : 0) "
+            + "start=\(startCandidate?.bundleID ?? "nil") "
+            + "session=\(browserMeetingSession?.bundleID ?? "nil")"
     }
 
     private func mapToMeetingApp(_ app: NSRunningApplication) -> DetectedMeetingApp? {
@@ -1976,8 +2230,19 @@ extension MeetingDetector {
     func _test_setSystemMicActivity(_ value: Bool?) { systemMicActivityOverride = value }
     func _test_setWindowSnapshot(_ value: [CGWindowEnumerator.EnumeratedWindow]?) { windowSnapshotOverride = value }
     func _test_setWorkspaceMeetingApps(_ value: [DetectedMeetingApp]?) { workspaceMeetingAppsOverride = value }
+    func _test_setWorkspaceBrowsers(_ value: [RunningBrowser]?) { workspaceBrowsersOverride = value }
+    func _test_setBrowserMeetingSession(_ value: BrowserMeetingFamily?) { browserMeetingSession = value }
     func _test_evaluateConfidence(windows: [CGWindowEnumerator.EnumeratedWindow]) { evaluateConfidence(windows: windows) }
     func _test_evaluateWithFreshWindowSnapshot() { evaluateWithFreshWindowSnapshot(reason: "test") }
+    var _test_hasPendingBrowserStartRecheck: Bool { browserStartRecheckWorkItem != nil }
+    /// Runs the pending browser start recheck now instead of after its delay.
+    func _test_runPendingBrowserStartRecheck() {
+        guard let item = browserStartRecheckWorkItem else { return }
+        item.cancel()
+        browserStartRecheckWorkItem = nil
+        runBrowserStartRecheck()
+    }
+    func _test_setBrowserStartRecheckWaitingSince(_ date: Date?) { browserStartRecheckWaitingSince = date }
     func _test_setTeamsUncorroboratedKeepAliveSince(_ date: Date?) {
         teamsUncorroboratedKeepAliveSince = date
     }

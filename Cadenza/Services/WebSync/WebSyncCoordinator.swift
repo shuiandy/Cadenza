@@ -55,6 +55,11 @@ final class WebSyncCoordinator {
     /// Nil unless the app opts in, so a coordinator built for a test issues
     /// only the recording sync traffic that test scripts.
     private let speakerProfileSync: SpeakerProfileSync?
+    /// The Settings provider pickers, shared with the account. Nil unless the
+    /// app opts in, like speaker sync.
+    @ObservationIgnored private let aiProviderPrefsSync: AIProviderPrefsSync?
+    @ObservationIgnored private var aiProviderPrefsTask: Task<Void, Never>?
+    @ObservationIgnored private var aiProviderPrefsObserver: DefaultsChangeObservation?
 
     init(
         store: RecordingsStore,
@@ -66,7 +71,8 @@ final class WebSyncCoordinator {
         migrationGate: StorageMigrationGate = .shared,
         historicalConsent: (@MainActor () -> HistoricalSyncConsent)? = nil,
         entitlementsRefreshPolicy: EntitlementsRefreshPolicy = .onSessionBoundaries,
-        syncsSpeakerProfiles: Bool = false
+        syncsSpeakerProfiles: Bool = false,
+        syncsAIProviderPrefs: Bool = false
     ) {
         self.entitlementsRefreshPolicy = entitlementsRefreshPolicy
         self.migrationGate = migrationGate
@@ -83,6 +89,16 @@ final class WebSyncCoordinator {
         self.speakerProfileSync = syncsSpeakerProfiles
             ? SpeakerProfileSync(store: store, transport: api, defaults: defaults)
             : nil
+        self.aiProviderPrefsSync = syncsAIProviderPrefs
+            ? AIProviderPrefsSync(transport: api, defaults: defaults)
+            : nil
+        if syncsAIProviderPrefs {
+            // A picker moved (in Settings, or a removed key switched the
+            // default): push it now rather than at the next sync pass.
+            aiProviderPrefsObserver = DefaultsChangeObservation(defaults: defaults) { [weak self] in
+                self?.aiProviderPrefsDidChangeLocally()
+            }
+        }
         auth.onSessionChanged = { [weak self] state, user in
             self?.sessionChanged(state: state, user: user)
         }
@@ -102,6 +118,8 @@ final class WebSyncCoordinator {
         recoveryTask = nil
         entitlementsTask?.cancel()
         entitlementsTask = nil
+        aiProviderPrefsTask?.cancel()
+        aiProviderPrefsTask = nil
         // A signed-in user is only an active sync user when it is the account
         // this profile is frozen to. A session naming anyone else activates
         // nothing: no store column, no worker, no request.
@@ -125,6 +143,7 @@ final class WebSyncCoordinator {
         }
         sessionStateTask = Task { [store] in await store.setActiveWebSyncUserID(user.id) }
         refreshEntitlements()
+        syncAIProviderPrefs(userID: user.id, force: true)
         recoverRolloutFailuresAndReconcile(userID: user.id)
     }
 
@@ -135,6 +154,8 @@ final class WebSyncCoordinator {
         recoveryTask = nil
         entitlementsTask?.cancel()
         entitlementsTask = nil
+        aiProviderPrefsTask?.cancel()
+        aiProviderPrefsTask = nil
         isSyncing = false
     }
 
@@ -144,7 +165,7 @@ final class WebSyncCoordinator {
     /// transition cannot spawn a fresh store write behind the drain.
     func stopAndWait(timeout: Duration = .seconds(3)) async -> Bool {
         isSuspended = true
-        let tasks = [worker, recoveryTask, sessionStateTask, entitlementsTask].compactMap { $0 }
+        let tasks = [worker, recoveryTask, sessionStateTask, entitlementsTask, aiProviderPrefsTask].compactMap { $0 }
         stop()
         sessionStateTask?.cancel()
         sessionStateTask = nil
@@ -166,6 +187,7 @@ final class WebSyncCoordinator {
             return
         }
         refreshEntitlements()
+        syncAIProviderPrefs(userID: user.id, force: true)
         recoverRolloutFailuresAndReconcile(userID: user.id)
     }
 
@@ -569,6 +591,7 @@ final class WebSyncCoordinator {
             errorRevisionBeforePass: errorRevisionBeforePass
         )
         await runSpeakerProfileSyncIfDue(userID: userID)
+        syncAIProviderPrefs(userID: userID, force: false)
     }
 
     /// Speaker profiles ride the identity switch the recording payload's
@@ -583,6 +606,51 @@ final class WebSyncCoordinator {
         }
         _ = await speakerProfileSync.runPassIfDue(ledgerKey: ledgerKey) { [weak self] in
             self?.isActiveUser(userID) == true
+        }
+    }
+
+    /// Reconciles the Settings provider pickers with the account. Forced at
+    /// session boundaries and after a local edit; otherwise at most every few
+    /// minutes from the sync pass, which is how an edit made on the web
+    /// reaches a Mac that stays signed in.
+    private func syncAIProviderPrefs(userID: String, force: Bool) {
+        guard let aiProviderPrefsSync, !isSuspended, isActiveUser(userID),
+              aiProviderPrefsTask == nil || force,
+              let ledgerKey = accountScopedPreferenceKey(base: "webSync.aiProviderPrefs", userID: userID) else {
+            return
+        }
+        aiProviderPrefsTask?.cancel()
+        aiProviderPrefsTask = Task { [weak self] in
+            let result = await aiProviderPrefsSync.runPassIfDue(ledgerKey: ledgerKey, force: force) { [weak self] in
+                self?.isActiveUser(userID) == true
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.aiProviderPrefsTask = nil
+            // A picker that moved while this pass was in flight was dropped by
+            // the busy guard. Only after a pass that reached the server: after
+            // a failure this would retry every second.
+            switch result {
+            case .pushed, .pulled, .unchanged: self.aiProviderPrefsDidChangeLocally()
+            case .notDue, .unavailable, .abandoned, .failed: break
+            }
+        }
+    }
+
+    /// Defaults change notifications fire for every key; only a picker that
+    /// moved away from the last agreed value schedules a push, after a short
+    /// pause so a burst of writes becomes one request.
+    private func aiProviderPrefsDidChangeLocally() {
+        guard let aiProviderPrefsSync, aiProviderPrefsTask == nil, !isSuspended,
+              let userID = currentUserID,
+              let ledgerKey = accountScopedPreferenceKey(base: "webSync.aiProviderPrefs", userID: userID),
+              aiProviderPrefsSync.hasLocalEdits(ledgerKey: ledgerKey) else {
+            return
+        }
+        aiProviderPrefsTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard let self, !Task.isCancelled else { return }
+            self.aiProviderPrefsTask = nil
+            self.syncAIProviderPrefs(userID: userID, force: true)
         }
     }
 
@@ -1708,5 +1776,25 @@ final class WebSyncCoordinator {
         chunkSize: Int64
     ) -> String {
         "\(userID):\(recordingID.uuidString.lowercased()):audio:\(fingerprintValue):\(chunkSize):\(remoteRecordingID)"
+    }
+}
+
+/// Calls `onChange` on the main actor whenever the given defaults change, and
+/// stops when released.
+final class DefaultsChangeObservation {
+    private let token: NSObjectProtocol
+
+    init(defaults: UserDefaults, onChange: @escaping @MainActor () -> Void) {
+        token = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: defaults,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { onChange() }
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(token)
     }
 }

@@ -271,13 +271,6 @@ struct ViewLayerLocalizationTests {
                 ]
             ),
             (
-                "Cadenza/Services/Meeting/AutoRecordScheduler.swift",
-                [
-                    "content.title = String(localized: \"Auto-recording started\")",
-                    "content.body = String(localized: \"Recording “\\(meeting.title)”\")",
-                ]
-            ),
-            (
                 "Cadenza/Views/Chat/AIChatView.swift",
                 [
                     "localized: \"No AI provider configured. Add an API key in Settings.\"",

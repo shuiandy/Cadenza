@@ -483,7 +483,7 @@ per-process mic（Zoom/FaceTime 受保护；Teams 永远探不到 pmic，watchdo
 当前行为：
 
 - duration 读取失败但文件很大时，会按文件大小估算时长，避免错误退回单请求路径
-- 分块转录时丢弃 provider 的 `spk_N` 标签（chunk 之间不通用），交给本地 diarization
+- 分块转录时丢弃 provider 的 `spk:N` 标签（chunk 之间不通用），交给本地 diarization
 - chunk 导出会压成 16kHz mono AAC 32kbps，减小上传体积
 - 通过 `onProgress(done, total)` 回传 chunk 级进度，toolbar 显示 `Transcribing 0/7...` → `Transcribing 3/7`
 - Prompt 要求按说话人切换分段，同一说话人连续发言合成一段
@@ -1358,7 +1358,7 @@ tap 这一格没有收口不是疏漏：它只有一个构造点（已在工厂�
 **真要降 deployment target，剩余工作（收口没有降低这部分成本）**：
 
 1. **UI material fallback** —— `PlatformCompatibility.swift` 的 `else` 分支写实（`.background(.regularMaterial, in: shape)` 一类），外加 `MainWindow` 的 window chrome：现在刻意不设 `backgroundColor`/`isOpaque` 是为了配合 26 的 Liquid Glass 自动管理，旧系统要补回来。
-2. **Core Audio process tap** —— `CATapDescription` 的 `bundleIDs` / `isProcessRestoreEnabled` 都是 26 新增。15 的等价路径是用 `[AudioObjectID]`（`stereoMixdownOfProcesses:`，14.2+），bundleID → AudioObjectID 的解析可复用 `AudioProcessMonitor` 的 `readProcessList` + `readBundleID`。**`isProcessRestoreEnabled` 没有替代**：目标 app 重启后 tap 失效，需自行监听进程列表变化重建。这是唯一动核心录音管线的改动。
+2. **Core Audio process tap**：`CATapDescription` 的 `bundleIDs` / `isProcessRestoreEnabled` 都是 26 新增。15 的等价路径是用 `[AudioObjectID]`（`stereoMixdownOfProcesses:`，14.2+），bundleID → AudioObjectID 的解析可复用 `AudioProcessMonitor.swift` 里 `SystemAudioHardware` 的 `processObjectIDs()` + `bundleID(ofProcess:)`。**`isProcessRestoreEnabled` 没有替代**：目标 app 重启后 tap 失效，需自行监听进程列表变化重建。这是唯一动核心录音管线的改动。
 3. **真机验证** —— 开发机是 26，tap + TCC 在 VM 里的行为不等同真机，这块比写代码更花时间。
 
 功能面影响：15 上 Apple 本地模型与 Apple 转录不可用，退到云端 provider 或 WhisperKit 本地
@@ -1595,10 +1595,11 @@ aiAssistant 忽略 `initialQuery`），**不要用同步标志位**：标志在�
 - system-mic keep-alive（sustain-only，只补 1 分缺口，见下）
 - minimum active hold 90s
 - user-stop hold（手动停止后压住自动开录，见下）
+- Google Meet 浏览器会话（独立判定，不走打分，见下）
 - debounce 1s
 - grace 3s
 - active/ending poll 5s
-- idle/detected poll 10s（事件驱动负责低延迟，poll 只是兜底）
+- idle/detected poll 10s（事件驱动负责低延迟，poll 只是兜底；事件源见下文"事件驱动的麦克风监听"）
 
 #### Teams 窗口结构识别（2026-06-10，Town Hall 事故修复）
 
@@ -1663,6 +1664,39 @@ Teams 在通话中开启屏幕分享时会重新组织窗口（call 主窗口和
 
 可见性配套：post-processing 把录音移入废纸篓时（太短/空转录），`AppState.onRecordingDiscarded` 现在同时发系统通知（此前只有主窗口 toolbar banner，自动录音场景窗口根本没开，用户无感知）。
 
+#### Google Meet 浏览器会话（2026-10-02）
+
+Meet 跑在浏览器里，没有可匹配的 app 进程，`ConfidenceScorer` 的 `meetingAppRunning` 门直接给 0 分，所以单独判定（`BrowserMeeting.swift` 的 `BrowserMeetingEvaluator`）。浏览器**不进** `runningMeetingApps`：Chrome 几乎一直开着，放进去会让所有日历事件和窗口都开始加分。
+
+实测（Chrome，2026-10-02，两轮探针加两次签名版端到端）：
+
+- 麦克风在音频 helper 上（`com.google.Chrome.helper`），主进程永远 in=0；窗口属于主进程 pid。Safari 走所有 WebKit 应用共用的 `com.apple.WebKit.GPU`；Arc 与 Dia 共用 `company.thebrowser.browser.helper`。
+- 预览页加载后不到 1 秒就占麦；静音不释放；挂断后 1 到 2 秒释放。helper 的 output 不开会时也常为 1，不能当信号。
+- 标题 `Meet - abc-defg-hij`（有时带 ` 🔊`）在预览页、会中和"已退出会议"页都一样，首页是 `Google Meet`。预览页流程里标题比麦克风晚 1.4 到 2.4 秒出现；`/new` 直接入会（弹"会议已准备就绪"，没有预览页）时，标签页标题停在 `Meet` 约 40 秒才带上会议代码。切标签页时的画中画窗口在 layer 3，被 `CGWindowEnumerator` 过滤。
+- 窗口名（CGWindowList 的 `kCGWindowName`）是该窗口**活动标签页**的标题。每 50 ms 采样一次窗口列表：可见的活动标签页改 `document.title` 后 0.22 到 0.28 秒进窗口名，基本就是 Chrome 200 ms 的 UI 合并更新。不是活动标签页的标签页（复现时用浏览器自动化扩展打开，`visibilityState=hidden`）改标题，30 秒里任何窗口名都没出现过它，`.optionAll` 列出的屏幕外窗口也没有。隐藏标签页的定时器被节流到约 2 秒一次，标签页标题照常更新，所以节流解释不了上面的 40 秒。` 🔊` 是 Chrome 加在窗口名上的，不是 Meet 的标题：实测时活动标签页是不出声的测试页，窗口名照样带着它，`isCallPage` 容忍这个尾缀。
+- `CGWindowEnumerator` 和 `enumerateAppWindows` 每次都现读窗口列表，没有缓存，也没有节流；唯一的缓存是 Screen Recording 预检，60 秒。
+
+规则：
+
+- **开始**（只从 idle）：浏览器 helper 占麦，且（该浏览器主进程有 Meet 通话页窗口，或当前日历事件是 Meet）。Safari 的音频进程是共享的，必须有窗口。
+- **与本地 app 仲裁**：浏览器占麦也会让 `systemMicActive` 为真，后台 Zoom 的大窗口或 Teams 的 fallback 会把这当成自己的通话。idle/detected 阶段，本地 app 没有 app-owned 证据（自己的 per-process mic 或 Teams assertion）时，不能压过一个能解释麦克风的浏览器：有 Meet 证据就开 `.googleMeet`，标题还没出来时把本地分数压到阈值以下等它。
+- **维持**：只看该浏览器 helper 是否还占麦。不受 90s min-hold、system-mic keep-alive 等影响。
+- **结束**：麦克风释放，`processMicReleased`。会话不足 60 秒时不退役日历事件（多半是放弃的预览页，之后真正入会还要靠日历）；放弃的预览页录音约 10 秒，被 30 秒的 auto-discard 丢弃。
+- 麦克风事件来时标题往往还是 `Meet`，所以浏览器占麦但没有 Meet 证据时一直复查，直到出现证据或麦克风释放，没有次数上限（`browserStartRecheckDelay`）：前 2 分钟每 2 秒一次，之后每 5 秒一次。2 分钟是给实测的 40 秒留的余量。每次复查读一次窗口列表（21 个窗口约 0.26 ms），再读一到两次音频进程列表（60 个对象每次约 1.8 ms），合计约 5 ms；5 秒一次的尾段约占一个核的 0.1%，而且只在浏览器占麦时才有。尾段不停而是放慢：Meet 标签页晚些才切到前台时，最多晚 5 秒发现，而不是等 10 秒的 idle poll。Safari 的 `com.apple.WebKit.GPU` 是共用的，Safari 开着时任何 WebKit 应用占麦都会让尾段一直跑，成本就是上面这个数。user-stop hold 期间不复查，那时任何启动路径都离不开 idle。停止监听会取消复查，复查任务执行前也检查 `isMonitoring`。诊断行是 `fresh reason=browserStartRecheck waited=<秒>s`。
+- 会话归属的浏览器存在 `browserMeetingSession`，`activeBundleID` 返回它，录音 tap 经 `captureBundleIDs(for:)` 映射到主进程加 helper。user-stop hold 按 helper 释放麦克风来放开。
+- 浏览器窗口标题只在有浏览器占麦时才检查。没有本地会议 app 在跑时，这也是唯一会枚举窗口的情形；有本地会议 app 时窗口列表本来就会枚举，但浏览器标题不参与它们的判断。诊断日志的 `bmeet=` 只记 bundle ID 和是否匹配，**从不写浏览器窗口标题**。
+
+启动延迟：后台 Teams 的 `modulehost` 一直占着输入设备时，设备级 `DeviceIsRunningSomewhere` 不再变化，所以浏览器 helper 也在进程级麦克风监听里（见"事件驱动的麦克风监听"），Chrome 开麦后约 0.1 秒就评估一次。这一次评估通常还没有 Meet 证据，启动落在随后的复查里：预览页的标题晚 1.4 到 2.4 秒，落在开麦后 2 或 4 秒那一轮；直接入会要等约 40 秒的标题。当前日历事件是 Meet 时第一次评估就够。此前这里要等 10 秒的 idle poll。
+
+直接入会那次的时间线（2026-10-02，签名 Release 候选版 abe4e9c，后台开着 Teams，诊断日志 UTC 时间）：标签页由浏览器自动化扩展打开。Chrome helper 18:47:31 占麦，同一秒 `fresh reason=event`；当时复查最多 5 次，到 18:47:42 用完，每次都是 `bmeet=[com.google.Chrome:win=0]`。之后只剩 10 秒的 idle poll，18:48:29 仍是 `win=0`，18:48:39 第一次 `win=1` 并 `idle->detected`，18:48:40 转 active，离开麦约 68 秒。扩展在约 18:48:10 已读到 `Meet - <code>` 这个标签页标题，可 18:48:10（`reason=event`）、18:48:19、18:48:29 三次评估都是 `win=0`。窗口列表没有缓存，可见标签页的标题 0.3 秒内就进窗口名，所以最可能的解释是这个扩展打开的标签页当时不是窗口的活动标签页，直到 18:48:29 之后才到前台。按现在不设上限的复查，那一场最多早 10 秒发现；大头是 Meet 自己约 40 秒的标题延迟，加上标签页不在前台。
+
+已知限制：
+
+- Teams web、Zoom web 等其他浏览器会议不识别，而且浏览器占麦时本地 app 的启发式启动会被压住。
+- Meet 标签页不是窗口的活动标签页时（在后台标签页入会，或由自动化扩展打开），窗口名里没有 Meet 标题。没有 Meet 日历事件时，要等它切到前台才开始。切走标签页时出现的画中画窗口（layer 3，标题同为 `Meet - <code>`）被过滤，不算证据。
+
+回归测试：`CadenzaTests/Meeting/BrowserMeetingTests.swift`、`MeetingDetectorGoogleMeetTests.swift`（含 `backgroundNativeAppsDoNotClaimMeetCall`、`abandonedPreviewKeepsMeetEventForRealJoin`、`meetTitleArrivingAfterTenSecondsStartsMeet`、`userStopHoldPausesStartRechecks`）。
+
 #### 日历同步与 `reevaluateNow`
 
 `AppState.calendarStateSyncTimer` 每 5 秒同步一次 calendar cache（不打 provider，只重算 `currentMeeting`）。**只有在 `meetingDetector.currentCalendarMeeting?.id` 实际变化（进入或退出一个会议窗口）时才调 `reevaluateNow(reason: "calendarSync")`** 触发一次 fresh window enumeration；否则跳过，把检测压力留给 detector 自己的 3s poll。
@@ -1670,6 +1704,28 @@ Teams 在通话中开启屏幕分享时会重新组织窗口（call 主窗口和
 历史上这里是 30s 同步无条件 reevaluate，再激进改成 2s 无条件 reevaluate 一度让录音期间 main actor 长时间被 `CGWindowListCopyWindowInfo` + 后续 SwiftUI commit 占满。当前 5s + 条件触发是性能与"会议刚开始时检测能在几秒内启动"之间的折中。
 
 外部 calendar provider（EventKit / Google）的轮询保持在 60s（`CalendarManager.startMonitoring`），所以新增/修改的 event 最久 60s 才进 cache，不是 5s 同步能加速的。
+
+#### 事件驱动的麦克风监听（2026-10-02）
+
+`SystemAudioStateListener`（`AudioProcessMonitor.swift`）有两路事件源，任一路变化都走 `scheduleEventEvaluation()`（0.1s debounce 后 fresh 评估）：
+
+- **设备级**：每个输入设备的 `kAudioDevicePropertyDeviceIsRunningSomewhere`。它只在第一个客户端打开设备、最后一个客户端关闭设备时变化。后台 Teams 的 `modulehost` 常驻占着默认输入设备时它恒为 1，之后 Chrome 或 Zoom 开麦都不会再触发。2026-10-02 签名 Release 版实测：Chrome helper 12:03:09 占麦，检测器 12:03:19 才由 10s idle poll 发现，期间诊断日志每行都是 `smic=1`。
+  - **scope 坑**：macOS 27 的 HAL 只在 global scope 发这个属性的通知，按 input scope 注册的 listener 永远收不到（值按 input scope 读是对的，`smic` 一直正常）。2026-10-02 前这里就是按 input scope 注册的，所以设备级监听在 macOS 27 上从没触发过，上面那次 10 秒延迟其实两个原因都在。现在按通配 scope 注册，回调里读 input scope 的值，只在它变化时唤醒 detector：global scope 在带输出的设备（耳机、`Microsoft Teams Audio` 虚拟设备）起停放音时也会通知。
+- **进程级**：对 bundle ID 属于 `MeetingApp.processInputListenerBundleIdentifiers` 的每个 process object 监听 `kAudioProcessPropertyDevices`（input scope），并监听 `kAudioHardwarePropertyProcessObjectList`，进程出现或消失时增删。这个集合必须覆盖 `MeetingDetector` 经 `audioUsage(bundleIDs:)` 读输入状态的所有 bundle ID，目前是各 app 的 `audioBundleIdentifiers`、Teams 的 `continuityAudioBundleIdentifiers` 和浏览器音频 helper（`BrowserMeetingFamily.allAudioBundleIDs`）。Safari 的 `com.apple.WebKit.GPU` 由所有 WebKit 应用共用，别的 WebKit 应用开麦也会触发评估，但 Safari 开会必须有 Meet 窗口，多出的评估不会误开录音。
+
+为什么不直接监听 `kAudioProcessPropertyIsRunningInput`：macOS 27 上它和 `IsRunningOutput` 的值会变，但**从不发通知**。2026-10-02 用探针进程（AUHAL 与 VoiceProcessingIO 两种客户端）实测：
+
+- 进程已有输出 IO 时再开麦或停麦，`kAudioProcessPropertyIsRunning` 不变、不通知；`Devices` 的 input scope 会通知。
+- 只起停输出时 `Devices` 的 input scope 也会通知，所以回调里读一次 `IsRunningInput`，与上次记下的值相同就忽略。Chrome helper 不开会时也常放音，没有这层过滤就会反复触发窗口枚举。
+- 进程列表每次变化通知两次，刷新逻辑是幂等的。新出现的被监听进程先注册 listener 再读初始状态，已经在用麦就立即触发一次；正在用麦的被监听进程消失（崩溃或退出）也触发一次。
+- bundle ID 按 object ID 缓存，只读新对象：全量读 59 个对象要 4 到 6 ms，而进程列表随任何进程起停音频都会变化。读不到的不缓存，下次重试。
+- 用 AudioQueue 录音的客户端在输出仍运行时停止输入，不发任何通知（`IsRunningInput` 已经变 0）。这类停止仍靠 poll 或下一次通知补上。
+
+效果：用真实 `SystemAudioStateListener` 加一个带 bundle ID 的探针进程验证（默认输入设备当时已被别的进程占着），开麦或停麦到回调约 20 ms；设备从空闲到被占用、再到释放，设备级回调同样立即到达。签名 Release 候选版（abe4e9c）在后台 Teams 下复测：先用不在名单里的探针打开空闲麦克风并一直占着，再用冒充 `com.apple.WebKit.GPU` 的探针在其上开麦、停麦。四次变化的同一秒诊断日志都有 `fresh reason=event`（首次打开和最终释放走设备级，中间两次走进程级），浏览器 helper 开麦 2 秒后还有一轮 `browserStartRecheck`，全程 idle、没有误开录音。之前的 c7c3c0b 只有进程级在响，设备级 scope 的坑就是这样发现的。加上 0.1s debounce 和 1s 确认，idle→detected 约 0.2s，到 active 约 1.2s，此前最多要等 10s。10s idle poll 保留为兜底。Teams 主进程在屏幕共享时输入可能抖动，会多触发几次评估，判定逻辑本来就不依赖评估时机。所有调用都只是 HAL 属性读和 listener 注册，不打开音频流，不会触发麦克风权限弹窗。
+
+尚未在签名 Release 版上用后台 Teams 加 Chrome Meet 或 Zoom 复测：开 `AIRECORDER_MEETING_DIAGNOSTICS=1`，占麦后 1 秒内诊断日志应出现 `fresh reason=event` 并转为 detected。listener 另用 NSLog 记 `audio listener: <bundle> input started/stopped`，但 macOS 27 上 NSLog 只到 stderr、不进统一日志，`open` 启动的 app 看不到，取证以诊断日志文件为准。
+
+回归测试：`CadenzaTests/Meeting/SystemAudioStateListenerTests.swift`（`watchedProcessStartsInput_onRunningDevice_notifies`、`deviceListChangeWithoutInputFlip_doesNotNotify` 等）。
 
 #### Observable 收紧（重要）
 
@@ -2222,6 +2278,7 @@ MeetingPrepScheduler.tick(events:now:)          — 每场会一次
 
 - 不做服务商 host 钉扎（例如 MiniMax 的），请求的目标是账户绑定的源。
 - 带 `X-Cadenza-Proxy-Error` 的响应是服务器自己产生的错误，映射为 `CadenzaAIAccessError`，有独立文案：key 缺失、key 被拒、会话过期、限流、今日用量上限、功能暂停。其余服务商错误照旧是 `AIServiceError.httpError`。
+- 504 且没有 `X-Cadenza-Proxy` 头，说明请求没到代理，是服务器前端（Caddy）等不到后端而超时。客户端把它映射为 `CadenzaAIAccessError(code: "gateway_timeout")`（这个 code 服务器不会发），文案是服务器响应超时。这类错误不归为服务商 5xx，所以转录不会重试，重试只会再等一轮同样的超时。代理透传的服务商 504 带 `X-Cadenza-Proxy`，仍是 `AIServiceError.httpError(504)`，照常重试。
 - 经服务器时，下列情况会发 `.cadenzaAIAccessDidFail` 通知，让 resolver 刷新 key 状态：
   - key 缺失、key 被拒、会话过期；
   - 服务商原样返回 401/403，说明 vault key 被拒。

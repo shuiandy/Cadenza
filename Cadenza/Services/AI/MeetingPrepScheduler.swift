@@ -133,7 +133,7 @@ final class MeetingPrepScheduler {
 
     /// 会前提醒(仅 auto 路径,见 tick → generateAndCommit)。manual generateNow 时用户已在看
     /// 卡片,MCP 写入是 agent 驱动、agent 会话本身就是 surface——两者都不发通知。
-    /// 照 `AutoRecordScheduler.sendNotification` 先例,复用已有权限流(无新 request)。
+    /// 复用已有的通知权限流(无新 request)。
     private func sendPrepReadyNotification(for event: MeetingEvent) {
         guard event.startDate > Date() else { return }   // 会已开始就不打扰
         let content = UNMutableNotificationContent()

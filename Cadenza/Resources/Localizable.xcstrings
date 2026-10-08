@@ -5161,6 +5161,86 @@
         }
       }
     },
+    "The %@ daily transcription quota has been reached. The recording is saved; transcribe it again after the quota resets, or choose another transcription provider in Settings." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das tägliche %@-Transkriptionskontingent ist aufgebraucht. Die Aufnahme bleibt gespeichert. Transkribieren Sie sie erneut, sobald das Kontingent zurückgesetzt wurde, oder wählen Sie in den Einstellungen einen anderen Transkriptionsanbieter."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se alcanzó la cuota diaria de transcripción de %@. La grabación está guardada; vuelve a transcribirla cuando se restablezca la cuota o elige otro proveedor de transcripción en Ajustes."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le quota quotidien de transcription %@ est atteint. L’enregistrement est conservé. Relancez la transcription une fois le quota réinitialisé, ou choisissez un autre fournisseur de transcription dans Réglages."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@の1日あたりの文字起こし上限に達しました。録音は保存されています。上限がリセットされた後にもう一度文字起こしするか、「設定」で別の文字起こしプロバイダーを選択してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 일일 전사 할당량에 도달했습니다. 녹음은 저장되어 있습니다. 할당량이 초기화된 후 다시 전사하거나 설정에서 다른 전사 제공자를 선택하세요."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 的每日转录配额已用完。录音已保存，配额重置后可重新转录，也可以在“设置”中选择其他转录服务商。"
+          }
+        }
+      }
+    },
+    "The %@ account for this API key has run out of credit or reached its spending limit. The recording is saved; check the account's billing, then transcribe it again, or choose another transcription provider in Settings." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das %@-Konto zu diesem API-Schlüssel hat kein Guthaben mehr oder sein Ausgabenlimit erreicht. Die Aufnahme bleibt gespeichert. Prüfen Sie die Abrechnung des Kontos und transkribieren Sie sie dann erneut, oder wählen Sie in den Einstellungen einen anderen Transkriptionsanbieter."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La cuenta de %@ de esta clave API se quedó sin saldo o alcanzó su límite de gasto. La grabación está guardada; revisa la facturación de la cuenta y vuelve a transcribirla, o elige otro proveedor de transcripción en Ajustes."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le compte %@ associé à cette clé API n’a plus de crédit ou a atteint sa limite de dépenses. L’enregistrement est conservé. Vérifiez la facturation du compte, puis relancez la transcription, ou choisissez un autre fournisseur de transcription dans Réglages."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このAPIキーの%@アカウントは、残高がなくなったか利用上限に達しています。録音は保存されています。アカウントの請求情報を確認してからもう一度文字起こしするか、「設定」で別の文字起こしプロバイダーを選択してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 API 키의 %@ 계정 잔액이 소진되었거나 지출 한도에 도달했습니다. 녹음은 저장되어 있습니다. 계정의 결제 정보를 확인한 후 다시 전사하거나 설정에서 다른 전사 제공자를 선택하세요."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 API 密钥对应的 %@ 账户余额已用完或已达到消费上限。录音已保存，请检查该账户的账单后重新转录，也可以在“设置”中选择其他转录服务商。"
+          }
+        }
+      }
+    },
     "The AI provider request failed (HTTP %lld). Check your API key, provider status, and network connection." : {
       "localizations" : {
         "de" : {
@@ -11880,6 +11960,7 @@
       }
     },
     "Auto-recording started" : {
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -36282,6 +36363,7 @@
       }
     },
     "Recording “%@”" : {
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -52503,6 +52585,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Cadenza 无法使用你账户中保存的 API 密钥连接 AI 服务商。请稍后再试。"
+          }
+        }
+      }
+    },
+    "The Cadenza server took too long to respond. Try again later." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Cadenza-Server hat zu lange nicht geantwortet. Versuchen Sie es später erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El servidor de Cadenza tardó demasiado en responder. Inténtalo más tarde."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le serveur Cadenza a mis trop de temps à répondre. Réessayez plus tard."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenzaサーバーの応答に時間がかかりすぎました。後でもう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza 서버의 응답 시간이 너무 오래 걸렸습니다. 나중에 다시 시도하세요."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadenza 服务器响应超时。请稍后再试。"
           }
         }
       }

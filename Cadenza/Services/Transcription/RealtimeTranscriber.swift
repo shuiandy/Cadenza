@@ -494,6 +494,13 @@ enum TranscriptionError: Error, LocalizedError {
     case fileNotFound
     case fileTooLarge
     case permissionDenied
+    /// The provider refused the request because a daily (or similarly
+    /// long-window) cap is spent. Retrying cannot succeed until it resets, so
+    /// the message tells the user the recording is kept for a later retry.
+    case dailyQuotaReached(AIProvider)
+    /// The provider account behind the key is out of credit or over its
+    /// spending limit. Waiting does not help; billing has to change.
+    case accountQuotaExhausted(AIProvider)
 
     // Transcription errors cross into alerts, the recording overlay, and
     // detail views as Text(String). Localize at this boundary and keep raw
@@ -537,6 +544,26 @@ enum TranscriptionError: Error, LocalizedError {
                 "Speech Recognition access is required. Enable Cadenza in System Settings → Privacy & Security → Speech Recognition.",
                 locale: locale
             )
+        case .dailyQuotaReached(let provider):
+            let name = Self.quotaProviderName(provider)
+            return LocalizedBundle.string(
+                "The \(name) daily transcription quota has been reached. The recording is saved; transcribe it again after the quota resets, or choose another transcription provider in Settings.",
+                locale: locale
+            )
+        case .accountQuotaExhausted(let provider):
+            let name = Self.quotaProviderName(provider)
+            return LocalizedBundle.string(
+                "The \(name) account for this API key has run out of credit or reached its spending limit. The recording is saved; check the account's billing, then transcribe it again, or choose another transcription provider in Settings.",
+                locale: locale
+            )
+        }
+    }
+
+    /// The brand alone reads better mid-sentence than "Gemini (Google)".
+    private static func quotaProviderName(_ provider: AIProvider) -> String {
+        switch provider {
+        case .gemini: "Gemini"
+        default: provider.displayName
         }
     }
 }

@@ -336,7 +336,8 @@ struct CadenzaApp: App {
                     state?.isRecording == true
                         || state?.coordinator?.hasActiveWork == true
                 },
-                syncsSpeakerProfiles: true
+                syncsSpeakerProfiles: true,
+                syncsAIProviderPrefs: true
             )
             state.recordingEngine.store = store
             state.recordingEngine.coordinator = coordinator

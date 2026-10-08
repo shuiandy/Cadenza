@@ -1013,6 +1013,120 @@ struct MCPToolsTests {
         #expect(result.text.contains("Speaker 1"))  // lists what IS present
     }
 
+    // MARK: - Stored provider labels (Gemini spk:N)
+
+    /// A recording transcribed before ingest mapped Gemini's wire labels, so
+    /// its segments still store them raw.
+    private func seedStoredLabels(_ store: RecordingsStore, _ labels: [String]) async -> UUID {
+        let id = UUID()
+        await store.createRecording(id: id, title: "Garden club planning", startDate: Date(), segmentsDirURL: nil)
+        let segments = (0..<4).map { index in
+            TranscriptEntry(startTime: Double(index) * 10, endTime: Double(index) * 10 + 9,
+                            text: "Line \(index) about the seed order.",
+                            speaker: labels[index % labels.count])
+        }
+        await store.saveTranscript(recordingID: id, fullText: segments.map(\.text).joined(separator: " "),
+                                   segments: segments, language: "en", tags: ["wiz"])
+        return id
+    }
+
+    @Test @MainActor
+    func storedGeminiLabelsReadAsSpeakerNumbers() async throws {
+        let store = try await makeStore()
+        let id = await seedStoredLabels(store, ["spk:0", "spk:1"])
+        let registry = makeRegistry(store)
+
+        let text = try payload(await registry.call(
+            name: "get_transcript", arguments: ["recordingId": .string(id.uuidString)]))
+        let roster = text["speakers"]?.asArray ?? []
+        #expect(roster.compactMap { $0["label"]?.asString } == ["Speaker 1", "Speaker 2"])
+        #expect(roster.allSatisfy { $0["resolvedName"] == .null })
+        let body = try #require(text["text"]?.asString)
+        #expect(body.contains("Speaker 1: Line 0"))
+        #expect(body.contains("Speaker 2: Line 1"))
+        #expect(!body.contains("spk:"))
+
+        let segments = try payload(await registry.call(name: "get_transcript", arguments: [
+            "recordingId": .string(id.uuidString), "format": "segments",
+        ]))["segments"]?.asArray ?? []
+        #expect(segments.compactMap { $0["speaker"]?.asString } == ["Speaker 1", "Speaker 2", "Speaker 1", "Speaker 2"])
+    }
+
+    // The round trip that matters: a client names "Speaker 1" because that
+    // is what it was shown, and the mapping must land on the stored spk:0.
+    // Keyed on "Speaker 1" it would resolve nowhere else in the app.
+    @Test @MainActor
+    func namingAShownLabelMapsTheStoredLabel() async throws {
+        let store = try await makeStore()
+        let id = await seedStoredLabels(store, ["spk:0", "spk:1"])
+        let registry = makeRegistry(store)
+
+        let result = await registry.call(name: "set_speaker_name", arguments: [
+            "recordingId": .string(id.uuidString), "speakerLabel": "Speaker 1", "name": "Wren Halloway",
+        ])
+        #expect(result.isError == false)
+
+        let detail = try #require(await store.fetchRecordingDetail(recordingID: id))
+        #expect(detail.speakerMappings.map(\.rawLabel) == ["spk:0"])
+        #expect(ExportContentRenderer.speakerDisplayName(rawLabel: "spk:0", mappings: detail.speakerMappings)
+            == "Wren Halloway")
+
+        let json = try payload(await registry.call(
+            name: "get_transcript", arguments: ["recordingId": .string(id.uuidString)]))
+        #expect(json["text"]?.asString?.contains("Wren Halloway: Line 0") == true)
+        #expect(json["text"]?.asString?.contains("Speaker 2: Line 1") == true)
+        let roster = json["speakers"]?.asArray ?? []
+        #expect(roster.first { $0["label"]?.asString == "Speaker 1" }?["resolvedName"]?.asString == "Wren Halloway")
+    }
+
+    @Test @MainActor
+    func namingTheStoredLabelDirectlyStillWorks() async throws {
+        let store = try await makeStore()
+        let id = await seedStoredLabels(store, ["spk:0", "spk:1"])
+
+        let result = await makeRegistry(store).call(name: "set_speaker_name", arguments: [
+            "recordingId": .string(id.uuidString), "speakerLabel": "spk:1", "name": "Ossian Pike",
+        ])
+
+        #expect(result.isError == false)
+        let detail = try #require(await store.fetchRecordingDetail(recordingID: id))
+        #expect(detail.speakerMappings.map(\.rawLabel) == ["spk:1"])
+    }
+
+    // spk:0 next to a diarized "Speaker 1" would both read "Speaker 1", so
+    // both stay as stored, and naming "Speaker 1" means that exact label.
+    @Test @MainActor
+    func labelsThatWouldReadAlikeStayDistinctAndExact() async throws {
+        let store = try await makeStore()
+        let id = await seedStoredLabels(store, ["spk:0", "Speaker 1"])
+        let registry = makeRegistry(store)
+
+        let json = try payload(await registry.call(
+            name: "get_transcript", arguments: ["recordingId": .string(id.uuidString)]))
+        #expect(json["speakers"]?.asArray?.compactMap { $0["label"]?.asString } == ["spk:0", "Speaker 1"])
+
+        let result = await registry.call(name: "set_speaker_name", arguments: [
+            "recordingId": .string(id.uuidString), "speakerLabel": "Speaker 1", "name": "Wren Halloway",
+        ])
+        #expect(result.isError == false)
+        let detail = try #require(await store.fetchRecordingDetail(recordingID: id))
+        #expect(detail.speakerMappings.map(\.rawLabel) == ["Speaker 1"])
+    }
+
+    @Test @MainActor
+    func unknownLabelListsTheLabelsAClientCanSee() async throws {
+        let store = try await makeStore()
+        let id = await seedStoredLabels(store, ["spk:0", "spk:1"])
+
+        let result = await makeRegistry(store).call(name: "set_speaker_name", arguments: [
+            "recordingId": .string(id.uuidString), "speakerLabel": "Speaker 9", "name": "Ghost",
+        ])
+
+        #expect(result.isError)
+        #expect(result.text.contains("Labels present: Speaker 1, Speaker 2"))
+        #expect(!result.text.contains("spk:"))
+    }
+
     // MARK: - RecordingsStore.addTag (store-level)
 
     @Test @MainActor

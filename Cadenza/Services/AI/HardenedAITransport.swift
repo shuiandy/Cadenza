@@ -527,6 +527,11 @@ struct HardenedAITransport: Sendable {
     /// errors carry a code header; a provider 401/403 means the vault key was
     /// rejected. Either way the account's key status may have changed, so the
     /// credential resolver is told to refresh it.
+    ///
+    /// A 504 through Cadenza without the proxy's marker never reached the
+    /// proxy: the server's front end gave up waiting. It is the server's
+    /// error, not a provider 5xx, so callers do not retry it into the same
+    /// timeout. A provider's own 504 arrives marked and stays a provider error.
     private static func failure(
         for http: HTTPURLResponse,
         errorData: Data,
@@ -539,6 +544,10 @@ struct HardenedAITransport: Sendable {
                 NotificationCenter.default.post(name: .cadenzaAIAccessDidFail, object: nil)
             }
             return error
+        }
+        if viaCadenza, http.statusCode == 504,
+           http.value(forHTTPHeaderField: CadenzaAIAccessError.proxyHeaderName) == nil {
+            return CadenzaAIAccessError(code: CadenzaAIAccessError.gatewayTimeoutCode)
         }
         if viaCadenza, http.statusCode == 401 || http.statusCode == 403 {
             NotificationCenter.default.post(name: .cadenzaAIAccessDidFail, object: nil)

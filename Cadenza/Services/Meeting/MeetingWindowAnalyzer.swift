@@ -9,7 +9,7 @@ import Foundation
 /// - FaceTime: Large video window appears during calls
 /// - Webex: Similar to Zoom (large meeting window)
 /// - Slack: Huddle overlay window appears
-/// - Google Meet: Browser-based — cannot be detected via native windows
+/// - Google Meet: Browser-based; `BrowserMeetingEvaluator` reads browser windows instead
 ///
 /// Window detection is a Tier 2 (supporting) signal worth +1 confidence point.
 /// It is NOT relied upon as the sole trigger — per-process audio and calendar are primary.
@@ -33,7 +33,7 @@ enum MeetingWindowAnalyzer {
         case .facetime:  return facetimeInMeeting(onScreen)
         case .webex:     return webexInMeeting(onScreen)
         case .slack:     return slackInMeeting(onScreen)
-        case .googleMeet: return false // Browser-based, not detectable
+        case .googleMeet: return false // Browser-based; see GoogleMeetWindowTitle
         }
     }
 

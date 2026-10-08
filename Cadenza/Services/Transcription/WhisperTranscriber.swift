@@ -224,6 +224,13 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
                 if error is CancellationError || Task.isCancelled {
                     throw CancellationError()
                 }
+                if let limit = ProviderRateLimit(error: error),
+                   let quotaError = limit.transcriptionError(provider: .openai) {
+                    transcriberLog.error(
+                        "429 is \(String(describing: limit), privacy: .public); not retrying"
+                    )
+                    throw quotaError
+                }
                 lastError = error
                 if Self.isRetryableRequestError(error), attempt < Self.maxRetries - 1 {
                     continue
@@ -238,8 +245,11 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
         if case AITransportError.requestFailed = error {
             return true
         }
-        if case AIServiceError.httpError(let statusCode, _) = error {
-            return statusCode == 429 || (500...599).contains(statusCode)
+        if case AIServiceError.httpError(let statusCode, let body) = error {
+            if statusCode == 429 {
+                return ProviderRateLimit(body: body) == .shortWindow
+            }
+            return (500...599).contains(statusCode)
         }
         return false
     }
@@ -330,6 +340,9 @@ final class WhisperTranscriber: TranscriptionService, Sendable {
                     return (info.index, info.start, info.duration, result)
                 }
             }
+            // The first failure, a spent quota included, leaves this loop; the
+            // group then cancels the remaining chunks, and those still waiting
+            // for an upload permit never send a request.
             var results: [(Int, TimeInterval, TimeInterval, TranscriptResult)] = []
             var progressReporter = WhisperChunkProgressReporter(
                 total: chunkInfos.count,

@@ -286,3 +286,15 @@ extension WebSyncAPIClient: SpeakerProfileSyncTransport {
         return try decoder.decode(SpeakerSyncPushResponse.self, from: data)
     }
 }
+
+extension WebSyncAPIClient: AIProviderPrefsTransport {
+    func fetchAIProviderPrefs() async throws -> AIProviderPrefsSnapshot {
+        let data = try await auth.request(path: "me/ai-prefs")
+        return try decoder.decode(AIProviderPrefsSnapshot.self, from: data)
+    }
+
+    func patchAIProviderPrefs(_ patch: AIProviderPrefsPatch) async throws -> AIProviderPrefsSnapshot {
+        let data = try await auth.request(path: "me/ai-prefs", method: "PATCH", body: try encoder.encode(patch))
+        return try decoder.decode(AIProviderPrefsSnapshot.self, from: data)
+    }
+}

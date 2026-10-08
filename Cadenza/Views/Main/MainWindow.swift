@@ -236,6 +236,17 @@ struct MainWindow: View {
             } message: {
                 Text(appState.recordingError ?? "")
             }
+            // Window level, like the alerts above: a recording detail pushed
+            // onto the NavigationStack covers its root, and an alert attached
+            // there never appears while a re-transcribe from the detail fails.
+            .alert("Processing Error", isPresented: Binding(
+                get: { appState.postProcessingError != nil },
+                set: { if !$0 { appState.postProcessingError = nil } }
+            )) {
+                Button("OK") { appState.postProcessingError = nil }
+            } message: {
+                Text(appState.postProcessingError ?? "")
+            }
             .task {
                 await appState.setup()
             }

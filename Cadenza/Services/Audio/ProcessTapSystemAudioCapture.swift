@@ -144,7 +144,11 @@ final class ProcessTapSystemAudioCapture {
         return description
     }
 
-    private static func captureBundleIDs(for bundleID: String) -> [String] {
+    static func captureBundleIDs(for bundleID: String) -> [String] {
+        if let browser = BrowserMeetingFamily.family(forBundleID: bundleID) {
+            // A browser plays call audio from its helper, not the main process.
+            return [bundleID] + browser.audioBundleIDs
+        }
         switch bundleID {
         case "com.microsoft.teams2":
             return ["com.microsoft.teams2", "com.microsoft.teams2.modulehost"]

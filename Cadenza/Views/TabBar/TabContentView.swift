@@ -22,14 +22,6 @@ struct ContentView: View {
             destinationContent(for: dest)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .alert("Processing Error", isPresented: Binding(
-            get: { appState.postProcessingError != nil },
-            set: { if !$0 { appState.postProcessingError = nil } }
-        )) {
-            Button("OK") { appState.postProcessingError = nil }
-        } message: {
-            Text(appState.postProcessingError ?? "")
-        }
     }
 
     static func rootDestination(

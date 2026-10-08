@@ -114,6 +114,26 @@ struct ExportContentRendererTests {
         ])
     }
 
+    // Older Gemini recordings can store the wire label `spk:0` raw. It
+    // exports under the same name as "Speaker 1", and a rename saved against
+    // the raw label still wins.
+    @Test func storedGeminiWireLabelsExportAsSpeakerNames() {
+        let transcript = makeTranscript(entries: [
+            makeEntry(start: 0, end: 5, text: "Morning all.", speaker: "spk:0"),
+            makeEntry(start: 5, end: 9, text: "Hi.", speaker: "spk:1"),
+        ], language: "en")
+        let mappings = [mapping("spk:1", to: "Marisol")]
+        let fallback = SpeakerLabelFormatter.displayName(forRawLabel: "Speaker 1")
+
+        let text = ExportContentRenderer.transcriptText(transcript, mappings: mappings)
+        #expect(text.components(separatedBy: "\n") == [
+            "[0:00] \(fallback): Morning all.",
+            "[0:05] Marisol: Hi.",
+        ])
+        let detail = makeDetail(transcript: transcript, mappings: mappings)
+        #expect(ExportContentRenderer.orderedUniqueSpeakers(detail) == [fallback, "Marisol"])
+    }
+
     @Test func transcriptTextTreatsBlankSpeakerAsNone() {
         let transcript = makeTranscript(entries: [
             makeEntry(start: 0, end: 1, text: "无人声", speaker: "   ")

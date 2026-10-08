@@ -244,7 +244,53 @@ struct AIProviderAccessTests {
         #expect(counter.value == 1)
     }
 
-    @Test(arguments: ["ai_key_missing", "ai_key_invalid", "unauthenticated", "ai_usage_limit", "rate_limited", "ai_proxy_disabled", "provider_unreachable"])
+    @Test func gatewayTimeoutBeforeTheProxyIsTheServersError() async throws {
+        let counter = CadenzaAccessFailureCounter()
+        let transport = AIAccessStubURLProtocol.transport()
+        let access = AIProviderAccess(provider: .openai, route: .cadenza(apiBase: testCadenzaAPIBase, sessionToken: "session-token-4f9a2c"))
+        var request = URLRequest(url: try access.url(path: "/v1/audio/transcriptions"))
+        request.httpMethod = "POST"
+        access.authorize(&request)
+
+        // The server's front end timed out; the proxy never answered, so the
+        // response carries no proxy marker.
+        AIAccessStubURLProtocol.install { _ in .init(status: 504, headers: [:], body: Data()) }
+        await #expect(throws: CadenzaAIAccessError(code: "gateway_timeout")) {
+            _ = try await transport.data(for: request, provider: .openai, redacting: access.secrets, viaCadenza: true)
+        }
+        let stream = transport.serverSentEvents(for: request, provider: .openai, redacting: access.secrets, viaCadenza: true)
+        await #expect(throws: CadenzaAIAccessError(code: "gateway_timeout")) {
+            for try await _ in stream {}
+        }
+        // A timeout says nothing about the account's keys.
+        #expect(counter.value == 0)
+
+        // The provider's own 504, passed through by the proxy, stays a provider error.
+        AIAccessStubURLProtocol.install { _ in
+            .init(status: 504, headers: ["X-Cadenza-Proxy": "1"], body: Data(#"{"error":{"message":"upstream timeout"}}"#.utf8))
+        }
+        do {
+            _ = try await transport.data(for: request, provider: .openai, redacting: access.secrets, viaCadenza: true)
+            Issue.record("expected a provider error")
+        } catch AIServiceError.httpError(let status, _) {
+            #expect(status == 504)
+        }
+
+        // So does a 504 on a direct call, marked or not.
+        AIAccessStubURLProtocol.install { _ in .init(status: 504, headers: [:], body: Data()) }
+        let direct = AIProviderAccess.direct(.openai, apiKey: "sk-device")
+        var directRequest = URLRequest(url: try direct.url(path: "/v1/audio/transcriptions"))
+        directRequest.httpMethod = "POST"
+        direct.authorize(&directRequest)
+        do {
+            _ = try await transport.data(for: directRequest, provider: .openai, redacting: direct.secrets)
+            Issue.record("expected a provider error")
+        } catch AIServiceError.httpError(let status, _) {
+            #expect(status == 504)
+        }
+    }
+
+    @Test(arguments: ["ai_key_missing", "ai_key_invalid", "unauthenticated", "ai_usage_limit", "rate_limited", "ai_proxy_disabled", "provider_unreachable", "gateway_timeout"])
     func accessErrorsHaveMessages(code: String) {
         let message = CadenzaAIAccessError(code: code).localizedMessage()
         #expect(!message.isEmpty)
@@ -329,6 +375,29 @@ struct FileTranscriptionThroughCadenzaTests {
         #expect(captured.url.absoluteString == "https://cadenzapp.com/api/v1/ai/proxy/openai/v1/audio/transcriptions")
         #expect(captured.headers["authorization"] == "Bearer session-token-4f9a2c")
         #expect(captured.headers["content-type"] == "multipart/form-data; boundary=b")
+    }
+
+    @Test func gatewayTimeoutFailsTheUploadWithoutRetrying() async throws {
+        AIAccessStubURLProtocol.install { _ in .init(status: 504, headers: [:], body: Data()) }
+        let client = OpenAITranscriptionAPIClient(access: cadenza(.openai), transport: AIAccessStubURLProtocol.transport(limits: .transcription))
+        let sleeps = OSAllocatedUnfairLock(initialState: 0)
+        let transcriber = WhisperTranscriber(
+            model: "gpt-4o-transcribe-diarize",
+            apiClient: client,
+            retrySleep: { _ in sleeps.withLock { $0 += 1 } }
+        )
+
+        // Each retry would wait out the same front-end timeout again.
+        await #expect(throws: CadenzaAIAccessError(code: "gateway_timeout")) {
+            _ = try await transcriber.uploadWithRetry(body: WhisperMultipartBody(boundary: "b", data: Data("--b\r\n".utf8)))
+        }
+        #expect(AIAccessStubURLProtocol.captured.count == 1)
+        #expect(sleeps.withLock { $0 } == 0)
+
+        let timeout = CadenzaAIAccessError(code: "gateway_timeout")
+        #expect(!WhisperTranscriber.isRetryableRequestError(timeout))
+        #expect(!GeminiTranscriber.isRetryableRequestError(timeout))
+        #expect(WhisperTranscriber.isRetryableRequestError(AIServiceError.httpError(504, "upstream timeout")))
     }
 
     @Test func geminiTranscriptionGoesThroughTheProxy() async throws {

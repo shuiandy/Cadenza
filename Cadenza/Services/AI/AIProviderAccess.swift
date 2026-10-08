@@ -129,6 +129,12 @@ struct CadenzaAIAccessError: Error, LocalizedError, Equatable {
     let code: String
 
     static let headerName = "X-Cadenza-Proxy-Error"
+    /// Set by the server on every response that reached the proxy: its own
+    /// errors and the provider's responses it passed through.
+    static let proxyHeaderName = "X-Cadenza-Proxy"
+    /// The client's code, never sent by the server, for a 504 that carries no
+    /// `proxyHeaderName`: the server's front end timed out on the request.
+    static let gatewayTimeoutCode = "gateway_timeout"
 
     /// The account's vault state behind this error may have changed, so the
     /// key status shown to the user should be refreshed.
@@ -168,6 +174,11 @@ struct CadenzaAIAccessError: Error, LocalizedError, Equatable {
         case "ai_proxy_disabled":
             return LocalizedBundle.string(
                 "API keys stored in your Cadenza account are temporarily unavailable. Try again later.",
+                locale: locale
+            )
+        case Self.gatewayTimeoutCode:
+            return LocalizedBundle.string(
+                "The Cadenza server took too long to respond. Try again later.",
                 locale: locale
             )
         default:
