@@ -1,9 +1,15 @@
 name: CI
 
+# Manual only: tests run locally (macOS runners are expensive), so this
+# workflow never starts on push or pull request.
 on:
-  push:
-    branches: [master, main]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test runs the checks, tests and analyzer; archive builds and verifies the release archive"
+        type: choice
+        options: [test, archive]
+        default: test
 
 permissions:
   contents: read
@@ -33,12 +39,10 @@ jobs:
           xcodegen generate
           git diff --exit-code -- Cadenza.xcodeproj/project.pbxproj
 
-      # Pull requests run the checks, tests and static analyzer. Pushes to the
-      # default branch only build and verify the release archive, the slowest
-      # step, since the merged change already passed the rest on its pull
-      # request.
+      # The test mode runs the checks, tests and static analyzer. The archive
+      # mode only builds and verifies the release archive, the slowest step.
       - name: Validate localization catalog
-        if: github.event_name == 'pull_request'
+        if: inputs.mode == 'test'
         run: |
           python3 scripts/check_repository_hygiene.py
           python3 -m json.tool Cadenza/Resources/Localizable.xcstrings >/dev/null
@@ -47,7 +51,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests
 
       - name: Build and run tests
-        if: github.event_name == 'pull_request'
+        if: inputs.mode == 'test'
         run: |
           xcodebuild test \
             -project Cadenza.xcodeproj \
@@ -57,7 +61,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO
 
       - name: Run static analyzer
-        if: github.event_name == 'pull_request'
+        if: inputs.mode == 'test'
         run: |
           xcodebuild analyze \
             -project Cadenza.xcodeproj \
@@ -67,7 +71,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO
 
       - name: Archive unsigned release candidate
-        if: github.event_name == 'push'
+        if: inputs.mode == 'archive'
         run: |
           xcodebuild archive \
             -project Cadenza.xcodeproj \
@@ -80,7 +84,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO
 
       - name: Verify archived third-party notices
-        if: github.event_name == 'push'
+        if: inputs.mode == 'archive'
         shell: bash
         run: |
           set -euo pipefail
